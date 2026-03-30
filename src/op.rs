@@ -1,6 +1,6 @@
 #![allow(clippy::cast_sign_loss)]
 
-use crate::types::{IoUringSqe, IoVec, Opcode, OpenFlags};
+use crate::types::{IoUringSqe, IoVec, Opcode, OpenFlags, SqeFlags};
 
 /// A prepared submission queue entry, ready to be pushed onto the ring.
 ///
@@ -115,8 +115,33 @@ impl Sqe {
 
     /// Set SQE flags (e.g., for linked operations).
     #[must_use]
-    pub const fn flags(mut self, flags: u8) -> Self {
-        self.0.flags = flags;
+    pub const fn flags(mut self, flags: SqeFlags) -> Self {
+        self.0.flags = flags.bits();
+        self
+    }
+
+    /// Link this SQE to the next one in the submission queue.
+    ///
+    /// If this operation fails, the linked successor is cancelled.
+    #[must_use]
+    pub const fn link(mut self) -> Self {
+        self.0.flags |= SqeFlags::IO_LINK.bits();
+        self
+    }
+
+    /// Hard-link this SQE to the next one.
+    ///
+    /// Like `link()`, but the chain continues executing even if this op fails.
+    #[must_use]
+    pub const fn hardlink(mut self) -> Self {
+        self.0.flags |= SqeFlags::IO_HARDLINK.bits();
+        self
+    }
+
+    /// Drain all prior submissions before executing this SQE.
+    #[must_use]
+    pub const fn drain(mut self) -> Self {
+        self.0.flags |= SqeFlags::IO_DRAIN.bits();
         self
     }
 }

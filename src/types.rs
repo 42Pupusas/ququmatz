@@ -60,6 +60,49 @@ impl BitOr for EnterFlags {
 }
 
 // ---------------------------------------------------------------------------
+// SQE flags (for linking, drain, async)
+// ---------------------------------------------------------------------------
+
+/// Flags set on individual SQEs to control execution ordering and behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SqeFlags(u8);
+
+impl SqeFlags {
+    /// Drain the submission queue before executing this SQE.
+    pub const IO_DRAIN: Self = Self(1 << 1);
+    /// Link this SQE to the next one — if this fails, the next is cancelled.
+    pub const IO_LINK: Self = Self(1 << 2);
+    /// Hard-link: like `IO_LINK` but the chain continues even on failure.
+    pub const IO_HARDLINK: Self = Self(1 << 3);
+    /// Force async execution even if the op could complete inline.
+    pub const IO_ASYNC: Self = Self(1 << 4);
+
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+}
+
+impl PartialEq<u8> for SqeFlags {
+    fn eq(&self, other: &u8) -> bool {
+        self.0 == *other
+    }
+}
+
+impl From<SqeFlags> for u8 {
+    fn from(f: SqeFlags) -> Self {
+        f.0
+    }
+}
+
+impl BitOr for SqeFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // mmap protection flags
 // ---------------------------------------------------------------------------
 

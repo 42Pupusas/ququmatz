@@ -8,7 +8,7 @@ mod ring;
 pub use error::Error;
 pub use op::Sqe;
 pub use ring::{Completion, Completions, IoUring};
-pub use types::IoVec;
+pub use types::{IoVec, SqeFlags};
 
 #[cfg(test)]
 #[allow(
@@ -18,7 +18,9 @@ pub use types::IoVec;
 )]
 mod tests {
     use super::*;
-    use crate::types::{FileMode, IoUringCqe, IoUringParams, IoUringSqe, Opcode, OpenFlags};
+    use crate::types::{
+        FileMode, IoUringCqe, IoUringParams, IoUringSqe, Opcode, OpenFlags, SqeFlags,
+    };
     use core::mem;
 
     // ---------------------------------------------------------------
@@ -170,12 +172,12 @@ mod tests {
 
     #[test]
     fn sqe_builder_nop_places_fields_correctly() {
-        let sqe = Sqe::nop().user_data(123).flags(0x04);
+        let sqe = Sqe::nop().user_data(123).flags(SqeFlags::IO_LINK);
         let inner = sqe.0;
 
         assert_eq!(Opcode::Nop, inner.opcode);
         assert_eq!(inner.user_data, 123);
-        assert_eq!(inner.flags, 0x04);
+        assert_eq!(SqeFlags::IO_LINK, inner.flags);
     }
 
     // ---------------------------------------------------------------
@@ -248,6 +250,48 @@ mod tests {
     // ---------------------------------------------------------------
     // Kernel integration tests — skipped under Miri (they need syscalls).
     // ---------------------------------------------------------------
+
+    #[test]
+    fn sqe_link_chain_flags() {
+        let sqe = Sqe::nop().user_data(1).link();
+        assert_eq!(SqeFlags::IO_LINK, sqe.0.flags);
+
+        let sqe = Sqe::nop().user_data(2).hardlink();
+        assert_eq!(SqeFlags::IO_HARDLINK, sqe.0.flags);
+
+        let sqe = Sqe::nop().user_data(3).drain();
+        assert_eq!(SqeFlags::IO_DRAIN, sqe.0.flags);
+
+        // Combining flags
+        let sqe = Sqe::nop().user_data(4).link().drain();
+        assert_eq!((SqeFlags::IO_LINK | SqeFlags::IO_DRAIN).bits(), sqe.0.flags);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn linked_nop_chain() {
+        let mut ring = IoUring::new(8).expect("failed to create io_uring");
+
+        // Submit 3 linked NOPs — they must complete in order
+        ring.push(Sqe::nop().user_data(1).link()).expect("push 1");
+        ring.push(Sqe::nop().user_data(2).link()).expect("push 2");
+        ring.push(Sqe::nop().user_data(3)).expect("push 3");
+
+        ring.submit_and_wait(3).expect("submit");
+
+        // Linked ops complete in submission order
+        let cqes: Vec<_> = ring.completions().collect();
+        assert_eq!(cqes.len(), 3);
+        for cqe in &cqes {
+            assert_eq!(cqe.result, 0);
+        }
+        // All three user_data values present
+        let mut seen = [false; 4];
+        for cqe in &cqes {
+            seen[cqe.user_data as usize] = true;
+        }
+        assert!(seen[1] && seen[2] && seen[3]);
+    }
 
     #[cfg(not(miri))]
     #[test]
