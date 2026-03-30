@@ -5,16 +5,15 @@
 )]
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use ququmatz::types::{AT_FDCWD, O_RDWR, O_TMPFILE, S_IRUSR, S_IWUSR};
+use ququmatz::types::{AT_FDCWD, FileMode, OpenFlags};
 use ququmatz::{IoUring, IoVec, Sqe};
 
 fn open_tmpfile() -> i32 {
-    // Use the raw syscall to get an fd without going through io_uring
     ququmatz::syscall::openat(
         AT_FDCWD,
         c"/tmp".as_ptr().cast(),
-        O_TMPFILE | O_RDWR,
-        S_IRUSR | S_IWUSR,
+        OpenFlags::TMPFILE | OpenFlags::RDWR,
+        FileMode::OWNER_READ | FileMode::OWNER_WRITE,
     )
     .expect("failed to open tmpfile") as i32
 }

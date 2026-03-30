@@ -18,7 +18,7 @@ pub use types::IoVec;
 )]
 mod tests {
     use super::*;
-    use crate::types::{IoUringCqe, IoUringParams, IoUringSqe};
+    use crate::types::{FileMode, IoUringCqe, IoUringParams, IoUringSqe, Opcode, OpenFlags};
     use core::mem;
 
     // ---------------------------------------------------------------
@@ -77,7 +77,6 @@ mod tests {
 
     #[test]
     fn sqe_field_offsets() {
-        // Verify field offsets match the kernel's io_uring_sqe layout.
         assert_eq!(mem::offset_of!(IoUringSqe, opcode), 0);
         assert_eq!(mem::offset_of!(IoUringSqe, flags), 1);
         assert_eq!(mem::offset_of!(IoUringSqe, ioprio), 2);
@@ -99,7 +98,7 @@ mod tests {
         let sqe = Sqe::read(42, buf.as_mut_ptr(), 32, 100).user_data(99);
         let inner = sqe.0;
 
-        assert_eq!(inner.opcode, types::IORING_OP_READ);
+        assert_eq!(Opcode::Read, inner.opcode);
         assert_eq!(inner.fd, 42);
         assert_eq!(inner.addr, buf.as_mut_ptr() as u64);
         assert_eq!(inner.len, 32);
@@ -113,7 +112,7 @@ mod tests {
         let sqe = Sqe::write(7, buf.as_ptr(), 16, 0).user_data(55);
         let inner = sqe.0;
 
-        assert_eq!(inner.opcode, types::IORING_OP_WRITE);
+        assert_eq!(Opcode::Write, inner.opcode);
         assert_eq!(inner.fd, 7);
         assert_eq!(inner.addr, buf.as_ptr() as u64);
         assert_eq!(inner.len, 16);
@@ -131,7 +130,7 @@ mod tests {
         let sqe = Sqe::readv(3, vecs.as_ptr(), 1, 50).user_data(10);
         let inner = sqe.0;
 
-        assert_eq!(inner.opcode, types::IORING_OP_READV);
+        assert_eq!(Opcode::Readv, inner.opcode);
         assert_eq!(inner.fd, 3);
         assert_eq!(inner.addr, vecs.as_ptr() as u64);
         assert_eq!(inner.len, 1);
@@ -145,17 +144,17 @@ mod tests {
         let sqe = Sqe::openat(
             types::AT_FDCWD,
             path.as_ptr().cast(),
-            types::O_RDONLY,
+            OpenFlags::RDONLY,
             0o644,
         )
         .user_data(77);
         let inner = sqe.0;
 
-        assert_eq!(inner.opcode, types::IORING_OP_OPENAT);
+        assert_eq!(Opcode::Openat, inner.opcode);
         assert_eq!(inner.fd, types::AT_FDCWD);
         assert_eq!(inner.addr, path.as_ptr() as u64);
         assert_eq!(inner.len, 0o644);
-        assert_eq!(inner.op_flags, types::O_RDONLY as u32);
+        assert_eq!(inner.op_flags, OpenFlags::RDONLY.bits() as u32);
         assert_eq!(inner.user_data, 77);
     }
 
@@ -164,7 +163,7 @@ mod tests {
         let sqe = Sqe::close(5).user_data(88);
         let inner = sqe.0;
 
-        assert_eq!(inner.opcode, types::IORING_OP_CLOSE);
+        assert_eq!(Opcode::Close, inner.opcode);
         assert_eq!(inner.fd, 5);
         assert_eq!(inner.user_data, 88);
     }
@@ -174,7 +173,7 @@ mod tests {
         let sqe = Sqe::nop().user_data(123).flags(0x04);
         let inner = sqe.0;
 
-        assert_eq!(inner.opcode, types::IORING_OP_NOP);
+        assert_eq!(Opcode::Nop, inner.opcode);
         assert_eq!(inner.user_data, 123);
         assert_eq!(inner.flags, 0x04);
     }
@@ -186,30 +185,26 @@ mod tests {
 
     #[test]
     fn ring_index_wrapping() {
-        // Simulate a 4-entry ring (mask = 3)
         let mask: u32 = 3;
         let mut sqes = [IoUringSqe::default(); 4];
         let mut sq_array = [0u32; 4];
 
-        // Fill all 4 slots, wrapping the tail
         for i in 0u32..4 {
             let idx = i & mask;
             sqes[idx as usize] = IoUringSqe {
-                opcode: types::IORING_OP_NOP,
+                opcode: Opcode::Nop.into(),
                 user_data: u64::from(i),
                 ..IoUringSqe::default()
             };
             sq_array[idx as usize] = idx;
         }
 
-        // Verify each slot
         for i in 0u32..4 {
             let idx = i & mask;
             assert_eq!(sqes[idx as usize].user_data, u64::from(i));
             assert_eq!(sq_array[idx as usize], idx);
         }
 
-        // Wrap around: slot 4 maps to index 0
         let wrap_idx = 4u32 & mask;
         assert_eq!(wrap_idx, 0);
         sqes[wrap_idx as usize].user_data = 999;
@@ -218,7 +213,6 @@ mod tests {
 
     #[test]
     fn cq_index_wrapping() {
-        // Simulate a 4-entry CQ ring
         let mask: u32 = 3;
         let cqes = [
             IoUringCqe {
@@ -243,13 +237,11 @@ mod tests {
             },
         ];
 
-        // Read in order with wrapping
         for i in 0u32..4 {
             let idx = i & mask;
             assert_eq!(cqes[idx as usize].user_data, u64::from(10 + i));
         }
 
-        // Wrap: index 4 maps back to 0
         assert_eq!(cqes[(4u32 & mask) as usize].user_data, 10);
     }
 
@@ -314,8 +306,8 @@ mod tests {
         syscall::openat(
             types::AT_FDCWD,
             c"/tmp".as_ptr().cast(),
-            types::O_TMPFILE | types::O_RDWR,
-            types::S_IRUSR | types::S_IWUSR,
+            OpenFlags::TMPFILE | OpenFlags::RDWR,
+            FileMode::OWNER_READ | FileMode::OWNER_WRITE,
         )
         .expect("failed to open tmpfile") as i32
     }
@@ -326,7 +318,6 @@ mod tests {
         let mut ring = IoUring::new(4).expect("failed to create io_uring");
         let fd = open_tmpfile();
 
-        // Write data
         let write_buf = b"hello io_uring!";
         ring.push(Sqe::write(fd, write_buf.as_ptr(), write_buf.len() as u32, 0).user_data(1))
             .expect("failed to push write");
@@ -336,7 +327,6 @@ mod tests {
         assert_eq!(cqe.user_data, 1);
         assert_eq!(cqe.result, write_buf.len() as i32);
 
-        // Read it back
         let mut read_buf = [0u8; 64];
         ring.push(Sqe::read(fd, read_buf.as_mut_ptr(), read_buf.len() as u32, 0).user_data(2))
             .expect("failed to push read");
@@ -347,7 +337,6 @@ mod tests {
         assert_eq!(cqe.result, write_buf.len() as i32);
         assert_eq!(&read_buf[..write_buf.len()], write_buf);
 
-        // Close via io_uring
         ring.push(Sqe::close(fd).user_data(3))
             .expect("failed to push close");
         ring.submit_and_wait(1).expect("failed to submit close");
@@ -363,7 +352,6 @@ mod tests {
         let mut ring = IoUring::new(4).expect("failed to create io_uring");
         let fd = open_tmpfile();
 
-        // Vectored write: two buffers
         let mut buf_a = *b"hello ";
         let mut buf_b = *b"world!";
         let write_vecs = [
@@ -384,7 +372,6 @@ mod tests {
         assert_eq!(cqe.user_data, 1);
         assert_eq!(cqe.result as usize, buf_a.len() + buf_b.len());
 
-        // Vectored read into a single buffer
         let mut read_buf = [0u8; 64];
         let read_vecs = [IoVec {
             base: read_buf.as_mut_ptr(),

@@ -1,9 +1,6 @@
 #![allow(clippy::cast_sign_loss)]
 
-use crate::types::{
-    IORING_OP_CLOSE, IORING_OP_NOP, IORING_OP_OPENAT, IORING_OP_READ, IORING_OP_READV,
-    IORING_OP_WRITE, IORING_OP_WRITEV, IoUringSqe, IoVec,
-};
+use crate::types::{IoUringSqe, IoVec, Opcode, OpenFlags};
 
 /// A prepared submission queue entry, ready to be pushed onto the ring.
 ///
@@ -16,7 +13,7 @@ impl Sqe {
     #[must_use]
     pub fn nop() -> Self {
         Self(IoUringSqe {
-            opcode: IORING_OP_NOP,
+            opcode: Opcode::Nop.into(),
             ..IoUringSqe::default()
         })
     }
@@ -28,7 +25,7 @@ impl Sqe {
     #[must_use]
     pub fn read(fd: i32, buf: *mut u8, len: u32, offset: u64) -> Self {
         Self(IoUringSqe {
-            opcode: IORING_OP_READ,
+            opcode: Opcode::Read.into(),
             fd,
             addr: buf as u64,
             len,
@@ -44,7 +41,7 @@ impl Sqe {
     #[must_use]
     pub fn write(fd: i32, buf: *const u8, len: u32, offset: u64) -> Self {
         Self(IoUringSqe {
-            opcode: IORING_OP_WRITE,
+            opcode: Opcode::Write.into(),
             fd,
             addr: buf as u64,
             len,
@@ -59,7 +56,7 @@ impl Sqe {
     #[must_use]
     pub fn readv(fd: i32, iovecs: *const IoVec, nr_vecs: u32, offset: u64) -> Self {
         Self(IoUringSqe {
-            opcode: IORING_OP_READV,
+            opcode: Opcode::Readv.into(),
             fd,
             addr: iovecs as u64,
             len: nr_vecs,
@@ -74,7 +71,7 @@ impl Sqe {
     #[must_use]
     pub fn writev(fd: i32, iovecs: *const IoVec, nr_vecs: u32, offset: u64) -> Self {
         Self(IoUringSqe {
-            opcode: IORING_OP_WRITEV,
+            opcode: Opcode::Writev.into(),
             fd,
             addr: iovecs as u64,
             len: nr_vecs,
@@ -88,13 +85,13 @@ impl Sqe {
     /// Opens a file relative to directory fd `dfd`. Use `AT_FDCWD` for the
     /// current working directory. `path` must be a null-terminated C string.
     #[must_use]
-    pub fn openat(dfd: i32, path: *const u8, flags: i32, mode: u32) -> Self {
+    pub fn openat(dfd: i32, path: *const u8, flags: OpenFlags, mode: u32) -> Self {
         Self(IoUringSqe {
-            opcode: IORING_OP_OPENAT,
+            opcode: Opcode::Openat.into(),
             fd: dfd,
             addr: path as u64,
             len: mode,
-            op_flags: flags as u32,
+            op_flags: flags.bits() as u32,
             ..IoUringSqe::default()
         })
     }
@@ -103,7 +100,7 @@ impl Sqe {
     #[must_use]
     pub fn close(fd: i32) -> Self {
         Self(IoUringSqe {
-            opcode: IORING_OP_CLOSE,
+            opcode: Opcode::Close.into(),
             fd,
             ..IoUringSqe::default()
         })

@@ -97,7 +97,7 @@ pub fn io_uring_enter(
     fd: usize,
     to_submit: u32,
     min_complete: u32,
-    flags: u32,
+    flags: crate::types::EnterFlags,
 ) -> Result<usize, Error> {
     check(unsafe {
         syscall6(
@@ -105,7 +105,7 @@ pub fn io_uring_enter(
             fd,
             to_submit as usize,
             min_complete as usize,
-            flags as usize,
+            flags.bits() as usize,
             0, // sig
             0, // sigsz
         )
@@ -115,8 +115,8 @@ pub fn io_uring_enter(
 pub fn mmap(
     addr: usize,
     len: usize,
-    prot: i32,
-    flags: i32,
+    prot: crate::types::Prot,
+    flags: crate::types::MapFlags,
     fd: usize,
     offset: u64,
 ) -> Result<usize, Error> {
@@ -125,8 +125,8 @@ pub fn mmap(
             SYS_MMAP,
             addr,
             len,
-            prot as usize,
-            flags as usize,
+            prot.bits() as usize,
+            flags.bits() as usize,
             fd,
             offset as usize,
         )
@@ -138,14 +138,19 @@ pub fn munmap(addr: usize, len: usize) -> Result<(), Error> {
     Ok(())
 }
 
-pub fn openat(dfd: i32, path: *const u8, flags: i32, mode: u32) -> Result<usize, Error> {
+pub fn openat(
+    dfd: i32,
+    path: *const u8,
+    flags: crate::types::OpenFlags,
+    mode: crate::types::FileMode,
+) -> Result<usize, Error> {
     check(unsafe {
         syscall6(
             SYS_OPENAT,
             dfd as usize,
             path as usize,
-            flags as usize,
-            mode as usize,
+            flags.bits() as usize,
+            mode.bits() as usize,
             0,
             0,
         )

@@ -1,40 +1,223 @@
+use core::ops::BitOr;
+
+// ---------------------------------------------------------------------------
 // io_uring opcodes
-pub const IORING_OP_NOP: u8 = 0;
-pub const IORING_OP_READV: u8 = 1;
-pub const IORING_OP_WRITEV: u8 = 2;
-pub const IORING_OP_OPENAT: u8 = 18;
-pub const IORING_OP_CLOSE: u8 = 19;
-pub const IORING_OP_READ: u8 = 22;
-pub const IORING_OP_WRITE: u8 = 23;
+// ---------------------------------------------------------------------------
 
+/// `io_uring` submission queue operation codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Opcode {
+    Nop = 0,
+    Readv = 1,
+    Writev = 2,
+    Openat = 18,
+    Close = 19,
+    Read = 22,
+    Write = 23,
+}
+
+impl PartialEq<u8> for Opcode {
+    fn eq(&self, other: &u8) -> bool {
+        *self as u8 == *other
+    }
+}
+
+impl From<Opcode> for u8 {
+    fn from(op: Opcode) -> Self {
+        op as Self
+    }
+}
+
+// ---------------------------------------------------------------------------
 // io_uring_enter flags
-pub const IORING_ENTER_GETEVENTS: u32 = 1 << 0;
+// ---------------------------------------------------------------------------
 
-// mmap prot flags
-pub const PROT_READ: i32 = 0x1;
-pub const PROT_WRITE: i32 = 0x2;
+/// Flags for `io_uring_enter`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EnterFlags(u32);
 
-// mmap map flags
-pub const MAP_SHARED: i32 = 0x01;
-pub const MAP_POPULATE: i32 = 0x0000_8000;
+impl EnterFlags {
+    pub const GETEVENTS: Self = Self(1 << 0);
 
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+impl PartialEq<u32> for EnterFlags {
+    fn eq(&self, other: &u32) -> bool {
+        self.0 == *other
+    }
+}
+
+impl BitOr for EnterFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mmap protection flags
+// ---------------------------------------------------------------------------
+
+/// Memory protection flags for `mmap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Prot(i32);
+
+impl Prot {
+    pub const READ: Self = Self(0x1);
+    pub const WRITE: Self = Self(0x2);
+
+    #[must_use]
+    pub const fn bits(self) -> i32 {
+        self.0
+    }
+}
+
+impl PartialEq<i32> for Prot {
+    fn eq(&self, other: &i32) -> bool {
+        self.0 == *other
+    }
+}
+
+impl BitOr for Prot {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mmap mapping flags
+// ---------------------------------------------------------------------------
+
+/// Mapping flags for `mmap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MapFlags(i32);
+
+impl MapFlags {
+    pub const SHARED: Self = Self(0x01);
+    pub const POPULATE: Self = Self(0x0000_8000);
+
+    #[must_use]
+    pub const fn bits(self) -> i32 {
+        self.0
+    }
+}
+
+impl PartialEq<i32> for MapFlags {
+    fn eq(&self, other: &i32) -> bool {
+        self.0 == *other
+    }
+}
+
+impl BitOr for MapFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // io_uring mmap offsets
-pub const IORING_OFF_SQ_RING: u64 = 0;
-pub const IORING_OFF_CQ_RING: u64 = 0x0800_0000;
-pub const IORING_OFF_SQES: u64 = 0x1000_0000;
+// ---------------------------------------------------------------------------
 
-// openat constants
+/// Magic offsets for `mmap`ing `io_uring` ring regions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub enum RingOffset {
+    SqRing = 0,
+    CqRing = 0x0800_0000,
+    Sqes = 0x1000_0000,
+}
+
+impl PartialEq<u64> for RingOffset {
+    fn eq(&self, other: &u64) -> bool {
+        *self as u64 == *other
+    }
+}
+
+impl From<RingOffset> for u64 {
+    fn from(off: RingOffset) -> Self {
+        off as Self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// openat flags
+// ---------------------------------------------------------------------------
+
+/// File open flags for `openat`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OpenFlags(i32);
+
+impl OpenFlags {
+    pub const RDONLY: Self = Self(0);
+    pub const WRONLY: Self = Self(1);
+    pub const RDWR: Self = Self(2);
+    pub const CREAT: Self = Self(0o100);
+    pub const TRUNC: Self = Self(0o1000);
+    pub const TMPFILE: Self = Self(0o20_200_000);
+
+    #[must_use]
+    pub const fn bits(self) -> i32 {
+        self.0
+    }
+}
+
+impl PartialEq<i32> for OpenFlags {
+    fn eq(&self, other: &i32) -> bool {
+        self.0 == *other
+    }
+}
+
+impl BitOr for OpenFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+/// Special directory fd meaning "current working directory".
 pub const AT_FDCWD: i32 = -100;
-pub const O_RDONLY: i32 = 0;
-pub const O_WRONLY: i32 = 1;
-pub const O_RDWR: i32 = 2;
-pub const O_CREAT: i32 = 0o100;
-pub const O_TRUNC: i32 = 0o1000;
-pub const O_TMPFILE: i32 = 0o20_200_000;
 
-// file mode
-pub const S_IRUSR: u32 = 0o400;
-pub const S_IWUSR: u32 = 0o200;
+// ---------------------------------------------------------------------------
+// File mode bits
+// ---------------------------------------------------------------------------
+
+/// File permission mode bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FileMode(u32);
+
+impl FileMode {
+    pub const OWNER_READ: Self = Self(0o400);
+    pub const OWNER_WRITE: Self = Self(0o200);
+
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+impl PartialEq<u32> for FileMode {
+    fn eq(&self, other: &u32) -> bool {
+        self.0 == *other
+    }
+}
+
+impl BitOr for FileMode {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel structs
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]

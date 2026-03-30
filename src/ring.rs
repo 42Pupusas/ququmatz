@@ -1,10 +1,7 @@
 use crate::error::Error;
 use crate::op::Sqe;
 use crate::syscall;
-use crate::types::{
-    IORING_ENTER_GETEVENTS, IORING_OFF_CQ_RING, IORING_OFF_SQ_RING, IORING_OFF_SQES, IoUringCqe,
-    IoUringParams, IoUringSqe, MAP_POPULATE, MAP_SHARED, PROT_READ, PROT_WRITE,
-};
+use crate::types::{EnterFlags, IoUringCqe, IoUringParams, IoUringSqe, MapFlags, Prot, RingOffset};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 /// A completed `io_uring` operation.
@@ -66,43 +63,24 @@ impl IoUring {
     #[allow(clippy::cast_ptr_alignment)]
     pub fn new(entries: u32) -> Result<Self, Error> {
         let mut params = IoUringParams::default();
+        let prot = Prot::READ | Prot::WRITE;
+        let map = MapFlags::SHARED | MapFlags::POPULATE;
 
         let fd = syscall::io_uring_setup(entries, &raw mut params)?;
 
         // Map the SQ ring
         let sq_ring_sz =
             params.sq_off.array as usize + params.sq_entries as usize * core::mem::size_of::<u32>();
-        let sq_ring_ptr = syscall::mmap(
-            0,
-            sq_ring_sz,
-            PROT_READ | PROT_WRITE,
-            MAP_SHARED | MAP_POPULATE,
-            fd,
-            IORING_OFF_SQ_RING,
-        )?;
+        let sq_ring_ptr = syscall::mmap(0, sq_ring_sz, prot, map, fd, RingOffset::SqRing.into())?;
 
         // Map the CQ ring
         let cq_ring_sz = params.cq_off.cqes as usize
             + params.cq_entries as usize * core::mem::size_of::<IoUringCqe>();
-        let cq_ring_ptr = syscall::mmap(
-            0,
-            cq_ring_sz,
-            PROT_READ | PROT_WRITE,
-            MAP_SHARED | MAP_POPULATE,
-            fd,
-            IORING_OFF_CQ_RING,
-        )?;
+        let cq_ring_ptr = syscall::mmap(0, cq_ring_sz, prot, map, fd, RingOffset::CqRing.into())?;
 
         // Map the SQE array
         let sqes_sz = params.sq_entries as usize * core::mem::size_of::<IoUringSqe>();
-        let sqes_ptr = syscall::mmap(
-            0,
-            sqes_sz,
-            PROT_READ | PROT_WRITE,
-            MAP_SHARED | MAP_POPULATE,
-            fd,
-            IORING_OFF_SQES,
-        )?;
+        let sqes_ptr = syscall::mmap(0, sqes_sz, prot, map, fd, RingOffset::Sqes.into())?;
 
         let sq_base = sq_ring_ptr as *const u8;
         let sq_head = unsafe { sq_base.add(params.sq_off.head as usize) }.cast::<AtomicU32>();
@@ -188,7 +166,7 @@ impl IoUring {
         if to_submit == 0 {
             return Ok(0);
         }
-        let ret = syscall::io_uring_enter(self.fd, to_submit, 0, 0)?;
+        let ret = syscall::io_uring_enter(self.fd, to_submit, 0, EnterFlags::default())?;
         Ok(ret as u32)
     }
 
@@ -203,8 +181,7 @@ impl IoUring {
     pub fn submit_and_wait(&mut self, min_complete: u32) -> Result<u32, Error> {
         let head = unsafe { &*self.sq_head }.load(Ordering::Acquire);
         let to_submit = self.sq_tail_local.wrapping_sub(head);
-        let ret =
-            syscall::io_uring_enter(self.fd, to_submit, min_complete, IORING_ENTER_GETEVENTS)?;
+        let ret = syscall::io_uring_enter(self.fd, to_submit, min_complete, EnterFlags::GETEVENTS)?;
         Ok(ret as u32)
     }
 
