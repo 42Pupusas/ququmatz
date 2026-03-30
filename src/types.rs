@@ -184,6 +184,8 @@ impl SqeFlags {
     pub const IO_HARDLINK: Self = Self(1 << 3);
     /// Force async execution even if the op could complete inline.
     pub const IO_ASYNC: Self = Self(1 << 4);
+    /// Use a registered/fixed file descriptor.
+    pub const FIXED_FILE: Self = Self(1 << 0);
 
     #[must_use]
     pub const fn bits(self) -> u8 {
@@ -207,6 +209,27 @@ impl BitOr for SqeFlags {
     type Output = Self;
     fn bitor(self, rhs: Self) -> Self {
         Self(self.0 | rhs.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// io_uring_register opcodes
+// ---------------------------------------------------------------------------
+
+/// Opcodes for `io_uring_register`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum RegisterOp {
+    RegisterBuffers = 0,
+    UnregisterBuffers = 1,
+    RegisterFiles = 2,
+    UnregisterFiles = 3,
+    RegisterFilesUpdate = 6,
+}
+
+impl From<RegisterOp> for u32 {
+    fn from(op: RegisterOp) -> Self {
+        op as Self
     }
 }
 

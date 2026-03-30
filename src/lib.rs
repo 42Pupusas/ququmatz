@@ -595,6 +595,56 @@ mod tests {
     }
 
     #[cfg(not(miri))]
+    #[test]
+    fn registered_buffers_read_write() {
+        let mut ring = IoUring::new(4).expect("setup");
+        let fd = open_tmpfile();
+
+        // Create and register a buffer
+        let mut buf = vec![0u8; 4096];
+        let iov = [IoVec {
+            base: buf.as_mut_ptr(),
+            len: buf.len(),
+        }];
+        ring.register_buffers(&iov).expect("register_buffers");
+
+        // Write via fixed buffer
+        let msg = b"fixed buffer write!";
+        buf[..msg.len()].copy_from_slice(msg);
+        ring.push(Sqe::write_fixed(fd, buf.as_ptr(), msg.len() as u32, 0, 0).user_data(1))
+            .expect("push write_fixed");
+        ring.submit_and_wait(1).expect("submit");
+        let cqe = ring.complete().expect("write cqe");
+        assert_eq!(cqe.user_data, 1);
+        assert_eq!(cqe.result, msg.len() as i32);
+
+        // Read back via fixed buffer
+        buf.fill(0);
+        ring.push(Sqe::read_fixed(fd, buf.as_mut_ptr(), msg.len() as u32, 0, 0).user_data(2))
+            .expect("push read_fixed");
+        ring.submit_and_wait(1).expect("submit");
+        let cqe = ring.complete().expect("read cqe");
+        assert_eq!(cqe.user_data, 2);
+        assert_eq!(cqe.result, msg.len() as i32);
+        assert_eq!(&buf[..msg.len()], msg);
+
+        ring.unregister_buffers().expect("unregister");
+        let _ = syscall::close(fd as usize);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn registered_files() {
+        let ring = IoUring::new(4).expect("setup");
+        let fd = open_tmpfile();
+
+        ring.register_files(&[fd]).expect("register_files");
+        ring.unregister_files().expect("unregister_files");
+
+        let _ = syscall::close(fd as usize);
+    }
+
+    #[cfg(not(miri))]
     fn setup_tcp_listener(port: u16) -> i32 {
         let fd = syscall::socket(types::AF_INET, types::SOCK_STREAM | types::SOCK_NONBLOCK, 0)
             .expect("socket") as i32;

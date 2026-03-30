@@ -110,6 +110,38 @@ impl Sqe {
         })
     }
 
+    /// Prepare a fixed-buffer read operation.
+    ///
+    /// Like `read`, but uses a pre-registered buffer identified by `buf_index`.
+    #[must_use]
+    pub fn read_fixed(fd: i32, buf: *mut u8, len: u32, offset: u64, buf_index: u16) -> Self {
+        Self(IoUringSqe {
+            opcode: Opcode::ReadFixed.into(),
+            fd,
+            addr: buf as u64,
+            len,
+            off: offset,
+            buf_index,
+            ..IoUringSqe::default()
+        })
+    }
+
+    /// Prepare a fixed-buffer write operation.
+    ///
+    /// Like `write`, but uses a pre-registered buffer identified by `buf_index`.
+    #[must_use]
+    pub fn write_fixed(fd: i32, buf: *const u8, len: u32, offset: u64, buf_index: u16) -> Self {
+        Self(IoUringSqe {
+            opcode: Opcode::WriteFixed.into(),
+            fd,
+            addr: buf as u64,
+            len,
+            off: offset,
+            buf_index,
+            ..IoUringSqe::default()
+        })
+    }
+
     /// Prepare a timeout operation.
     ///
     /// Completes when either `count` completions have occurred or the timeout
@@ -433,6 +465,15 @@ impl Sqe {
     #[must_use]
     pub const fn hardlink(mut self) -> Self {
         self.0.flags |= SqeFlags::IO_HARDLINK.bits();
+        self
+    }
+
+    /// Use a registered/fixed file descriptor for this SQE.
+    ///
+    /// The `fd` field is interpreted as an index into the registered file table.
+    #[must_use]
+    pub const fn fixed_file(mut self) -> Self {
+        self.0.flags |= SqeFlags::FIXED_FILE.bits();
         self
     }
 

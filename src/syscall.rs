@@ -19,6 +19,7 @@ const SYS_SETSOCKOPT: usize = 54;
 const SYS_OPENAT: usize = 257;
 const SYS_IO_URING_SETUP: usize = 425;
 const SYS_IO_URING_ENTER: usize = 426;
+const SYS_IO_URING_REGISTER: usize = 427;
 
 #[inline]
 unsafe fn syscall1(nr: usize, a1: usize) -> isize {
@@ -204,6 +205,20 @@ pub fn setsockopt(
         )
     })?;
     Ok(())
+}
+
+pub fn io_uring_register(fd: usize, opcode: u32, arg: usize, nr_args: u32) -> Result<usize, Error> {
+    check(unsafe {
+        syscall6(
+            SYS_IO_URING_REGISTER,
+            fd,
+            opcode as usize,
+            arg,
+            nr_args as usize,
+            0,
+            0,
+        )
+    })
 }
 
 pub fn close(fd: usize) -> Result<(), Error> {

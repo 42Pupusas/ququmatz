@@ -2,8 +2,8 @@ use crate::error::Error;
 use crate::op::Sqe;
 use crate::syscall;
 use crate::types::{
-    EnterFlags, Features, IoUringCqe, IoUringParams, IoUringSqe, MapFlags, Prot, RingOffset,
-    SetupFlags,
+    EnterFlags, Features, IoUringCqe, IoUringParams, IoUringSqe, IoVec, MapFlags, Prot, RegisterOp,
+    RingOffset, SetupFlags,
 };
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -228,6 +228,58 @@ impl IoUring {
         unsafe { &*self.cq_head }.store(self.cq_head_local, Ordering::Release);
 
         Some(completion)
+    }
+
+    /// Register buffers for zero-copy I/O with `read_fixed`/`write_fixed`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if registration fails (e.g., too many buffers, already registered).
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn register_buffers(&self, bufs: &[IoVec]) -> Result<(), Error> {
+        syscall::io_uring_register(
+            self.fd,
+            RegisterOp::RegisterBuffers.into(),
+            bufs.as_ptr() as usize,
+            bufs.len() as u32,
+        )?;
+        Ok(())
+    }
+
+    /// Unregister previously registered buffers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no buffers are registered.
+    pub fn unregister_buffers(&self) -> Result<(), Error> {
+        syscall::io_uring_register(self.fd, RegisterOp::UnregisterBuffers.into(), 0, 0)?;
+        Ok(())
+    }
+
+    /// Register file descriptors for use with `IOSQE_FIXED_FILE`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if registration fails.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn register_files(&self, fds: &[i32]) -> Result<(), Error> {
+        syscall::io_uring_register(
+            self.fd,
+            RegisterOp::RegisterFiles.into(),
+            fds.as_ptr() as usize,
+            fds.len() as u32,
+        )?;
+        Ok(())
+    }
+
+    /// Unregister previously registered file descriptors.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no files are registered.
+    pub fn unregister_files(&self) -> Result<(), Error> {
+        syscall::io_uring_register(self.fd, RegisterOp::UnregisterFiles.into(), 0, 0)?;
+        Ok(())
     }
 
     /// Return an iterator that drains all available completions.
