@@ -11,9 +11,14 @@ pedantic = { level = "warn", priority = -1 }
 
 [dev-dependencies]
 criterion = "0.5"
+io-uring = "0.7"
 
 [[bench]]
 name = "io_uring"
+harness = false
+
+[[bench]]
+name = "comparison"
 harness = false
 
 [dependencies]
