@@ -44,7 +44,6 @@ pub struct IoUring {
     sq_tail: *const AtomicU32,
     sq_mask: u32,
     sq_flags: *const AtomicU32,
-    sq_array: *mut u32,
 
     // SQE array
     sqes: *mut IoUringSqe,
@@ -146,6 +145,13 @@ impl IoUring {
         let sq_flags = unsafe { sq_base.add(params.sq_off.flags as usize) }.cast::<AtomicU32>();
         let sq_array = unsafe { sq_base.add(params.sq_off.array as usize) } as *mut u32;
 
+        // Pre-fill sq_array with identity mapping (sqe[i] -> slot i).
+        // The kernel reads sq_array to find which SQE slot each submission
+        // refers to. With identity mapping we never need to update it again.
+        for i in 0..params.sq_entries {
+            unsafe { sq_array.add(i as usize).write_volatile(i) };
+        }
+
         let cq_base = cq_ring_ptr as *const u8;
         let cq_head = unsafe { cq_base.add(params.cq_off.head as usize) }.cast::<AtomicU32>();
         let cq_tail = unsafe { cq_base.add(params.cq_off.tail as usize) }.cast::<AtomicU32>();
@@ -161,7 +167,6 @@ impl IoUring {
             sq_tail,
             sq_mask,
             sq_flags,
-            sq_array,
             sqes: sqes_ptr as *mut IoUringSqe,
             sq_tail_local,
             cq_head,
@@ -181,6 +186,7 @@ impl IoUring {
     /// # Errors
     ///
     /// Returns `EAGAIN` if the submission queue is full.
+    #[inline]
     #[allow(clippy::needless_pass_by_value)]
     pub fn push(&mut self, sqe: Sqe) -> Result<(), Error> {
         let head = unsafe { &*self.sq_head }.load(Ordering::Acquire);
@@ -193,7 +199,6 @@ impl IoUring {
         let idx = self.sq_tail_local & self.sq_mask;
 
         unsafe { *self.sqes.add(idx as usize) = sqe.0 };
-        unsafe { *self.sq_array.add(idx as usize) = idx };
 
         self.sq_tail_local = next_tail;
 
@@ -215,6 +220,7 @@ impl IoUring {
     ///
     /// Called automatically by `submit` and `submit_and_wait`; only needed
     /// directly when using SQPOLL mode without explicit submission.
+    #[inline]
     fn flush_sq_tail(&self) {
         unsafe { &*self.sq_tail }.store(self.sq_tail_local, Ordering::Release);
     }
@@ -226,8 +232,10 @@ impl IoUring {
     /// # Errors
     ///
     /// Returns an error if the kernel rejects the submission.
+    #[inline]
     #[allow(clippy::cast_possible_truncation)]
     pub fn submit(&mut self) -> Result<u32, Error> {
+        self.flush_cq_head();
         self.flush_sq_tail();
         let head = unsafe { &*self.sq_head }.load(Ordering::Acquire);
         let to_submit = self.sq_tail_local.wrapping_sub(head);
@@ -245,8 +253,10 @@ impl IoUring {
     /// # Errors
     ///
     /// Returns an error if the kernel rejects the submission.
+    #[inline]
     #[allow(clippy::cast_possible_truncation)]
     pub fn submit_and_wait(&mut self, min_complete: u32) -> Result<u32, Error> {
+        self.flush_cq_head();
         self.flush_sq_tail();
         let head = unsafe { &*self.sq_head }.load(Ordering::Acquire);
         let to_submit = self.sq_tail_local.wrapping_sub(head);
@@ -254,7 +264,22 @@ impl IoUring {
         Ok(ret as u32)
     }
 
+    /// Publish the local CQ head to the kernel-visible atomic head.
+    ///
+    /// Called automatically by `submit`, `submit_and_wait`, and `Drop`.
+    /// Call explicitly after draining completions if you need the kernel to
+    /// see freed CQ slots before the next submission.
+    #[inline]
+    fn flush_cq_head(&self) {
+        unsafe { &*self.cq_head }.store(self.cq_head_local, Ordering::Release);
+    }
+
     /// Reap one completion from the completion queue, if available.
+    ///
+    /// The CQ head is not published to the kernel until the next `submit`,
+    /// `submit_and_wait`, or when the ring is dropped. This avoids a
+    /// costly Release store on every completion.
+    #[inline]
     #[must_use]
     pub fn complete(&mut self) -> Option<Completion> {
         let tail = unsafe { &*self.cq_tail }.load(Ordering::Acquire);
@@ -271,7 +296,6 @@ impl IoUring {
         };
 
         self.cq_head_local += 1;
-        unsafe { &*self.cq_head }.store(self.cq_head_local, Ordering::Release);
 
         Some(completion)
     }
@@ -349,6 +373,7 @@ impl Iterator for Completions<'_> {
 
 impl Drop for IoUring {
     fn drop(&mut self) {
+        self.flush_cq_head();
         let _ = syscall::munmap(self.sqes_region.addr, self.sqes_region.len);
         if self.cq_ring.len > 0 {
             let _ = syscall::munmap(self.cq_ring.addr, self.cq_ring.len);
