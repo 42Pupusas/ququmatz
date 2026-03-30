@@ -9,4 +9,11 @@ nursery = { level = "warn", priority = -1 }
 style = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "io_uring"
+harness = false
+
 [dependencies]

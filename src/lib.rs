@@ -1,6 +1,6 @@
 mod error;
 pub mod op;
-pub(crate) mod syscall;
+pub mod syscall;
 pub mod types;
 
 mod ring;

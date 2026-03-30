@@ -2,7 +2,8 @@
     dead_code,
     clippy::cast_possible_wrap,
     clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
+    clippy::cast_sign_loss,
+    clippy::missing_errors_doc
 )]
 
 use crate::error::Error;
