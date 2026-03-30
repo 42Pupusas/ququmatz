@@ -1,0 +1,12 @@
+[package]
+name = "ququmatz"
+version = "0.1.0"
+edition = "2024"
+
+[lints.clippy]
+perf = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+[dependencies]
