@@ -12,14 +12,17 @@ use crate::types::{
 /// then chain modifiers like `user_data()` before pushing.
 pub struct Sqe(pub(crate) IoUringSqe);
 
+/// Create a zeroed SQE. This is a single `const` value that the compiler can
+/// inline as an immediate, avoiding a runtime `memset` on every builder call.
+const ZEROED: IoUringSqe = unsafe { core::mem::zeroed() };
+
 impl Sqe {
     /// Prepare a no-op operation.
     #[must_use]
     pub fn nop() -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::Nop.into(),
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Nop.into();
+        Self(sqe)
     }
 
     /// Prepare a read operation.
@@ -33,14 +36,13 @@ impl Sqe {
     /// writable memory that remains valid until the operation completes.
     #[must_use]
     pub fn read(fd: i32, buf: *mut u8, len: u32, offset: u64) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::Read.into(),
-            fd,
-            addr: buf as u64,
-            len,
-            off: offset,
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Read.into();
+        sqe.fd = fd;
+        sqe.addr = buf as u64;
+        sqe.len = len;
+        sqe.off = offset;
+        Self(sqe)
     }
 
     /// Prepare a write operation.
@@ -54,14 +56,13 @@ impl Sqe {
     /// readable memory that remains valid until the operation completes.
     #[must_use]
     pub fn write(fd: i32, buf: *const u8, len: u32, offset: u64) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::Write.into(),
-            fd,
-            addr: buf as u64,
-            len,
-            off: offset,
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Write.into();
+        sqe.fd = fd;
+        sqe.addr = buf as u64;
+        sqe.len = len;
+        sqe.off = offset;
+        Self(sqe)
     }
 
     /// Prepare a vectored read operation.
@@ -74,14 +75,13 @@ impl Sqe {
     /// until the operation completes.
     #[must_use]
     pub fn readv(fd: i32, iovecs: *const IoVec, nr_vecs: u32, offset: u64) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::Readv.into(),
-            fd,
-            addr: iovecs as u64,
-            len: nr_vecs,
-            off: offset,
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Readv.into();
+        sqe.fd = fd;
+        sqe.addr = iovecs as u64;
+        sqe.len = nr_vecs;
+        sqe.off = offset;
+        Self(sqe)
     }
 
     /// Prepare a vectored write operation.
@@ -94,14 +94,13 @@ impl Sqe {
     /// until the operation completes.
     #[must_use]
     pub fn writev(fd: i32, iovecs: *const IoVec, nr_vecs: u32, offset: u64) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::Writev.into(),
-            fd,
-            addr: iovecs as u64,
-            len: nr_vecs,
-            off: offset,
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Writev.into();
+        sqe.fd = fd;
+        sqe.addr = iovecs as u64;
+        sqe.len = nr_vecs;
+        sqe.off = offset;
+        Self(sqe)
     }
 
     /// Prepare an `openat` operation.
@@ -110,24 +109,22 @@ impl Sqe {
     /// current working directory. `path` must be a null-terminated C string.
     #[must_use]
     pub fn openat(dfd: i32, path: *const u8, flags: OpenFlags, mode: u32) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::Openat.into(),
-            fd: dfd,
-            addr: path as u64,
-            len: mode,
-            op_flags: flags.bits() as u32,
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Openat.into();
+        sqe.fd = dfd;
+        sqe.addr = path as u64;
+        sqe.len = mode;
+        sqe.op_flags = flags.bits() as u32;
+        Self(sqe)
     }
 
     /// Prepare a close operation on a file descriptor.
     #[must_use]
     pub fn close(fd: i32) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::Close.into(),
-            fd,
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Close.into();
+        sqe.fd = fd;
+        Self(sqe)
     }
 
     /// Prepare a fixed-buffer read operation.
@@ -135,15 +132,14 @@ impl Sqe {
     /// Like `read`, but uses a pre-registered buffer identified by `buf_index`.
     #[must_use]
     pub fn read_fixed(fd: i32, buf: *mut u8, len: u32, offset: u64, buf_index: u16) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::ReadFixed.into(),
-            fd,
-            addr: buf as u64,
-            len,
-            off: offset,
-            buf_index,
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::ReadFixed.into();
+        sqe.fd = fd;
+        sqe.addr = buf as u64;
+        sqe.len = len;
+        sqe.off = offset;
+        sqe.buf_index = buf_index;
+        Self(sqe)
     }
 
     /// Prepare a fixed-buffer write operation.
@@ -151,15 +147,14 @@ impl Sqe {
     /// Like `write`, but uses a pre-registered buffer identified by `buf_index`.
     #[must_use]
     pub fn write_fixed(fd: i32, buf: *const u8, len: u32, offset: u64, buf_index: u16) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::WriteFixed.into(),
-            fd,
-            addr: buf as u64,
-            len,
-            off: offset,
-            buf_index,
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::WriteFixed.into();
+        sqe.fd = fd;
+        sqe.addr = buf as u64;
+        sqe.len = len;
+        sqe.off = offset;
+        sqe.buf_index = buf_index;
+        Self(sqe)
     }
 
     /// Prepare a timeout operation.
@@ -168,14 +163,13 @@ impl Sqe {
     /// expires, whichever comes first. Use `count = 0` for a pure timer.
     #[must_use]
     pub fn timeout(ts: *const Timespec, count: u32, flags: TimeoutFlags) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::Timeout.into(),
-            addr: ts as u64,
-            len: 1,
-            off: u64::from(count),
-            op_flags: flags.bits(),
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Timeout.into();
+        sqe.addr = ts as u64;
+        sqe.len = 1;
+        sqe.off = u64::from(count);
+        sqe.op_flags = flags.bits();
+        Self(sqe)
     }
 
     /// Prepare a linked timeout.
@@ -184,13 +178,12 @@ impl Sqe {
     /// before the linked operation completes, the linked operation is cancelled.
     #[must_use]
     pub fn link_timeout(ts: *const Timespec, flags: TimeoutFlags) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::LinkTimeout.into(),
-            addr: ts as u64,
-            len: 1,
-            op_flags: flags.bits(),
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::LinkTimeout.into();
+        sqe.addr = ts as u64;
+        sqe.len = 1;
+        sqe.op_flags = flags.bits();
+        Self(sqe)
     }
 
     /// Prepare a timeout removal.
@@ -198,11 +191,10 @@ impl Sqe {
     /// Cancels a previously submitted timeout identified by its `user_data`.
     #[must_use]
     pub fn timeout_remove(target_user_data: u64) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::TimeoutRemove.into(),
-            addr: target_user_data,
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::TimeoutRemove.into();
+        sqe.addr = target_user_data;
+        Self(sqe)
     }
 
     /// Prepare an async cancellation.
@@ -210,22 +202,20 @@ impl Sqe {
     /// Cancels a previously submitted operation identified by its `user_data`.
     #[must_use]
     pub fn cancel(target_user_data: u64) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::AsyncCancel.into(),
-            addr: target_user_data,
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::AsyncCancel.into();
+        sqe.addr = target_user_data;
+        Self(sqe)
     }
 
     /// Prepare an fsync operation.
     #[must_use]
     pub fn fsync(fd: i32, flags: FsyncFlags) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::Fsync.into(),
-            fd,
-            op_flags: flags.bits(),
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Fsync.into();
+        sqe.fd = fd;
+        sqe.op_flags = flags.bits();
+        Self(sqe)
     }
 
     /// Prepare an fdatasync operation (convenience for fsync + DATASYNC flag).
@@ -240,15 +230,11 @@ impl Sqe {
     #[must_use]
     #[allow(clippy::cast_sign_loss)]
     pub fn poll_add(fd: i32, mask: PollMask) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::PollAdd.into(),
-            fd,
-            // poll_events is stored in the lower 32 bits of op_flags,
-            // but io_uring expects it as __poll_t in a specific field.
-            // For io_uring, poll32_events goes in op_flags.
-            op_flags: mask.bits(),
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::PollAdd.into();
+        sqe.fd = fd;
+        sqe.op_flags = mask.bits();
+        Self(sqe)
     }
 
     /// Prepare a poll remove operation.
@@ -256,25 +242,23 @@ impl Sqe {
     /// Removes a previously added poll request identified by `user_data`.
     #[must_use]
     pub fn poll_remove(target_user_data: u64) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::PollRemove.into(),
-            addr: target_user_data,
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::PollRemove.into();
+        sqe.addr = target_user_data;
+        Self(sqe)
     }
 
     /// Prepare a fallocate operation.
     #[must_use]
     #[allow(clippy::cast_sign_loss)]
     pub fn fallocate(fd: i32, mode: FallocateMode, offset: u64, len: u64) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::Fallocate.into(),
-            fd,
-            off: offset,
-            addr: len,
-            len: mode.bits() as u32,
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Fallocate.into();
+        sqe.fd = fd;
+        sqe.off = offset;
+        sqe.addr = len;
+        sqe.len = mode.bits() as u32;
+        Self(sqe)
     }
 
     /// Prepare a statx operation.
@@ -290,15 +274,14 @@ impl Sqe {
         mask: StatxMask,
         statx_buf: *mut crate::types::Statx,
     ) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::Statx.into(),
-            fd: dfd,
-            off: statx_buf as u64,
-            addr: path as u64,
-            len: mask.bits(),
-            op_flags: flags.bits() as u32,
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Statx.into();
+        sqe.fd = dfd;
+        sqe.off = statx_buf as u64;
+        sqe.addr = path as u64;
+        sqe.len = mask.bits();
+        sqe.op_flags = flags.bits() as u32;
+        Self(sqe)
     }
 
     /// Prepare a renameat operation.
@@ -310,28 +293,26 @@ impl Sqe {
         new_path: *const u8,
         flags: RenameFlags,
     ) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::Renameat.into(),
-            fd: old_dfd,
-            addr: old_path as u64,
-            len: new_dfd as u32,
-            off: new_path as u64,
-            op_flags: flags.bits(),
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Renameat.into();
+        sqe.fd = old_dfd;
+        sqe.addr = old_path as u64;
+        sqe.len = new_dfd as u32;
+        sqe.off = new_path as u64;
+        sqe.op_flags = flags.bits();
+        Self(sqe)
     }
 
     /// Prepare an unlinkat operation.
     #[must_use]
     #[allow(clippy::cast_sign_loss)]
     pub fn unlinkat(dfd: i32, path: *const u8, flags: UnlinkFlags) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::Unlinkat.into(),
-            fd: dfd,
-            addr: path as u64,
-            op_flags: flags.bits() as u32,
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Unlinkat.into();
+        sqe.fd = dfd;
+        sqe.addr = path as u64;
+        sqe.op_flags = flags.bits() as u32;
+        Self(sqe)
     }
 
     /// Prepare an accept operation.
@@ -341,119 +322,110 @@ impl Sqe {
     #[must_use]
     #[allow(clippy::cast_sign_loss)]
     pub fn accept(fd: i32, addr: *mut u8, addrlen: *mut u32, flags: AcceptFlags) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::Accept.into(),
-            fd,
-            addr: addr as u64,
-            off: addrlen as u64,
-            op_flags: flags.bits() as u32,
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Accept.into();
+        sqe.fd = fd;
+        sqe.addr = addr as u64;
+        sqe.off = addrlen as u64;
+        sqe.op_flags = flags.bits() as u32;
+        Self(sqe)
     }
 
     /// Prepare a connect operation.
     #[must_use]
     pub fn connect(fd: i32, addr: *const u8, addrlen: u32) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::Connect.into(),
-            fd,
-            addr: addr as u64,
-            off: u64::from(addrlen),
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Connect.into();
+        sqe.fd = fd;
+        sqe.addr = addr as u64;
+        sqe.off = u64::from(addrlen);
+        Self(sqe)
     }
 
     /// Prepare a send operation.
     #[must_use]
     #[allow(clippy::cast_sign_loss)]
     pub fn send(fd: i32, buf: *const u8, len: u32, flags: MsgFlags) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::Send.into(),
-            fd,
-            addr: buf as u64,
-            len,
-            op_flags: flags.bits() as u32,
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Send.into();
+        sqe.fd = fd;
+        sqe.addr = buf as u64;
+        sqe.len = len;
+        sqe.op_flags = flags.bits() as u32;
+        Self(sqe)
     }
 
     /// Prepare a recv operation.
     #[must_use]
     #[allow(clippy::cast_sign_loss)]
     pub fn recv(fd: i32, buf: *mut u8, len: u32, flags: MsgFlags) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::Recv.into(),
-            fd,
-            addr: buf as u64,
-            len,
-            op_flags: flags.bits() as u32,
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Recv.into();
+        sqe.fd = fd;
+        sqe.addr = buf as u64;
+        sqe.len = len;
+        sqe.op_flags = flags.bits() as u32;
+        Self(sqe)
     }
 
     /// Prepare a sendmsg operation.
     #[must_use]
     #[allow(clippy::cast_sign_loss)]
     pub fn sendmsg(fd: i32, msg: *const MsgHdr, flags: MsgFlags) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::SendMsg.into(),
-            fd,
-            addr: msg as u64,
-            len: 1,
-            op_flags: flags.bits() as u32,
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::SendMsg.into();
+        sqe.fd = fd;
+        sqe.addr = msg as u64;
+        sqe.len = 1;
+        sqe.op_flags = flags.bits() as u32;
+        Self(sqe)
     }
 
     /// Prepare a recvmsg operation.
     #[must_use]
     #[allow(clippy::cast_sign_loss)]
     pub fn recvmsg(fd: i32, msg: *mut MsgHdr, flags: MsgFlags) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::RecvMsg.into(),
-            fd,
-            addr: msg as u64,
-            len: 1,
-            op_flags: flags.bits() as u32,
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::RecvMsg.into();
+        sqe.fd = fd;
+        sqe.addr = msg as u64;
+        sqe.len = 1;
+        sqe.op_flags = flags.bits() as u32;
+        Self(sqe)
     }
 
     /// Prepare a socket creation operation.
     #[must_use]
     #[allow(clippy::cast_sign_loss)]
     pub fn socket(domain: i32, sock_type: i32, protocol: i32, flags: u32) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::Socket.into(),
-            fd: domain,
-            off: sock_type as u64,
-            len: protocol as u32,
-            op_flags: flags,
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Socket.into();
+        sqe.fd = domain;
+        sqe.off = sock_type as u64;
+        sqe.len = protocol as u32;
+        sqe.op_flags = flags;
+        Self(sqe)
     }
 
     /// Prepare a shutdown operation.
     #[must_use]
     pub fn shutdown(fd: i32, how: ShutdownHow) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::Shutdown.into(),
-            fd,
-            len: how as u32,
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Shutdown.into();
+        sqe.fd = fd;
+        sqe.len = how as u32;
+        Self(sqe)
     }
 
     /// Prepare a mkdirat operation.
     #[must_use]
     pub fn mkdirat(dfd: i32, path: *const u8, mode: u32) -> Self {
-        Self(IoUringSqe {
-            opcode: Opcode::Mkdirat.into(),
-            fd: dfd,
-            addr: path as u64,
-            len: mode,
-            ..IoUringSqe::default()
-        })
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Mkdirat.into();
+        sqe.fd = dfd;
+        sqe.addr = path as u64;
+        sqe.len = mode;
+        Self(sqe)
     }
 
     /// Set the `user_data` field, used to correlate completions with submissions.
