@@ -110,15 +110,30 @@ impl IoUring {
 
         let fd = syscall::io_uring_setup(entries, &raw mut *params)?;
 
-        // Map the SQ ring
+        let features = Features(params.features);
+        let single_mmap = features.contains(Features::SINGLE_MMAP);
+
+        // Compute ring sizes
         let sq_ring_sz =
             params.sq_off.array as usize + params.sq_entries as usize * core::mem::size_of::<u32>();
-        let sq_ring_ptr = syscall::mmap(0, sq_ring_sz, prot, map, fd, RingOffset::SqRing.into())?;
-
-        // Map the CQ ring
         let cq_ring_sz = params.cq_off.cqes as usize
             + params.cq_entries as usize * core::mem::size_of::<IoUringCqe>();
-        let cq_ring_ptr = syscall::mmap(0, cq_ring_sz, prot, map, fd, RingOffset::CqRing.into())?;
+
+        // Map the SQ ring (and CQ ring too if SINGLE_MMAP)
+        let mmap_sz = if single_mmap {
+            sq_ring_sz.max(cq_ring_sz)
+        } else {
+            sq_ring_sz
+        };
+        let sq_ring_ptr = syscall::mmap(0, mmap_sz, prot, map, fd, RingOffset::SqRing.into())?;
+
+        // Map the CQ ring (reuse SQ mmap if SINGLE_MMAP)
+        let (cq_ring_ptr, cq_ring_region) = if single_mmap {
+            (sq_ring_ptr, MappedRegion::new(0, 0))
+        } else {
+            let ptr = syscall::mmap(0, cq_ring_sz, prot, map, fd, RingOffset::CqRing.into())?;
+            (ptr, MappedRegion::new(ptr, cq_ring_sz))
+        };
 
         // Map the SQE array
         let sqes_sz = params.sq_entries as usize * core::mem::size_of::<IoUringSqe>();
@@ -154,9 +169,9 @@ impl IoUring {
             cq_mask,
             cqes,
             cq_head_local,
-            features: Features(params.features),
-            sq_ring: MappedRegion::new(sq_ring_ptr, sq_ring_sz),
-            cq_ring: MappedRegion::new(cq_ring_ptr, cq_ring_sz),
+            features,
+            sq_ring: MappedRegion::new(sq_ring_ptr, mmap_sz),
+            cq_ring: cq_ring_region,
             sqes_region: MappedRegion::new(sqes_ptr, sqes_sz),
         })
     }
@@ -335,7 +350,9 @@ impl Iterator for Completions<'_> {
 impl Drop for IoUring {
     fn drop(&mut self) {
         let _ = syscall::munmap(self.sqes_region.addr, self.sqes_region.len);
-        let _ = syscall::munmap(self.cq_ring.addr, self.cq_ring.len);
+        if self.cq_ring.len > 0 {
+            let _ = syscall::munmap(self.cq_ring.addr, self.cq_ring.len);
+        }
         let _ = syscall::munmap(self.sq_ring.addr, self.sq_ring.len);
         let _ = syscall::close(self.fd);
     }
