@@ -12,6 +12,10 @@ use core::arch::asm;
 const SYS_CLOSE: usize = 3;
 const SYS_MMAP: usize = 9;
 const SYS_MUNMAP: usize = 11;
+const SYS_SOCKET: usize = 41;
+const SYS_BIND: usize = 49;
+const SYS_LISTEN: usize = 50;
+const SYS_SETSOCKOPT: usize = 54;
 const SYS_OPENAT: usize = 257;
 const SYS_IO_URING_SETUP: usize = 425;
 const SYS_IO_URING_ENTER: usize = 426;
@@ -155,6 +159,51 @@ pub fn openat(
             0,
         )
     })
+}
+
+pub fn socket(domain: i32, sock_type: i32, protocol: i32) -> Result<usize, Error> {
+    check(unsafe {
+        syscall6(
+            SYS_SOCKET,
+            domain as usize,
+            sock_type as usize,
+            protocol as usize,
+            0,
+            0,
+            0,
+        )
+    })
+}
+
+pub fn bind(fd: usize, addr: *const u8, addrlen: u32) -> Result<(), Error> {
+    check(unsafe { syscall6(SYS_BIND, fd, addr as usize, addrlen as usize, 0, 0, 0) })?;
+    Ok(())
+}
+
+pub fn listen(fd: usize, backlog: i32) -> Result<(), Error> {
+    check(unsafe { syscall6(SYS_LISTEN, fd, backlog as usize, 0, 0, 0, 0) })?;
+    Ok(())
+}
+
+pub fn setsockopt(
+    fd: usize,
+    level: i32,
+    optname: i32,
+    optval: *const u8,
+    optlen: u32,
+) -> Result<(), Error> {
+    check(unsafe {
+        syscall6(
+            SYS_SETSOCKOPT,
+            fd,
+            level as usize,
+            optname as usize,
+            optval as usize,
+            optlen as usize,
+            0,
+        )
+    })?;
+    Ok(())
 }
 
 pub fn close(fd: usize) -> Result<(), Error> {

@@ -1,8 +1,9 @@
 #![allow(clippy::cast_sign_loss)]
 
 use crate::types::{
-    FallocateMode, FsyncFlags, IoUringSqe, IoVec, Opcode, OpenFlags, PollMask, RenameFlags,
-    SqeFlags, StatxFlags, StatxMask, TimeoutFlags, Timespec, UnlinkFlags,
+    AcceptFlags, FallocateMode, FsyncFlags, IoUringSqe, IoVec, MsgFlags, MsgHdr, Opcode, OpenFlags,
+    PollMask, RenameFlags, ShutdownHow, SqeFlags, StatxFlags, StatxMask, TimeoutFlags, Timespec,
+    UnlinkFlags,
 };
 
 /// A prepared submission queue entry, ready to be pushed onto the ring.
@@ -277,6 +278,116 @@ impl Sqe {
             fd: dfd,
             addr: path as u64,
             op_flags: flags.bits() as u32,
+            ..IoUringSqe::default()
+        })
+    }
+
+    /// Prepare an accept operation.
+    ///
+    /// Accepts a connection on a listening socket. `addr` and `addrlen` can be
+    /// null/null if you don't need the peer address.
+    #[must_use]
+    #[allow(clippy::cast_sign_loss)]
+    pub fn accept(fd: i32, addr: *mut u8, addrlen: *mut u32, flags: AcceptFlags) -> Self {
+        Self(IoUringSqe {
+            opcode: Opcode::Accept.into(),
+            fd,
+            addr: addr as u64,
+            off: addrlen as u64,
+            op_flags: flags.bits() as u32,
+            ..IoUringSqe::default()
+        })
+    }
+
+    /// Prepare a connect operation.
+    #[must_use]
+    pub fn connect(fd: i32, addr: *const u8, addrlen: u32) -> Self {
+        Self(IoUringSqe {
+            opcode: Opcode::Connect.into(),
+            fd,
+            addr: addr as u64,
+            off: u64::from(addrlen),
+            ..IoUringSqe::default()
+        })
+    }
+
+    /// Prepare a send operation.
+    #[must_use]
+    #[allow(clippy::cast_sign_loss)]
+    pub fn send(fd: i32, buf: *const u8, len: u32, flags: MsgFlags) -> Self {
+        Self(IoUringSqe {
+            opcode: Opcode::Send.into(),
+            fd,
+            addr: buf as u64,
+            len,
+            op_flags: flags.bits() as u32,
+            ..IoUringSqe::default()
+        })
+    }
+
+    /// Prepare a recv operation.
+    #[must_use]
+    #[allow(clippy::cast_sign_loss)]
+    pub fn recv(fd: i32, buf: *mut u8, len: u32, flags: MsgFlags) -> Self {
+        Self(IoUringSqe {
+            opcode: Opcode::Recv.into(),
+            fd,
+            addr: buf as u64,
+            len,
+            op_flags: flags.bits() as u32,
+            ..IoUringSqe::default()
+        })
+    }
+
+    /// Prepare a sendmsg operation.
+    #[must_use]
+    #[allow(clippy::cast_sign_loss)]
+    pub fn sendmsg(fd: i32, msg: *const MsgHdr, flags: MsgFlags) -> Self {
+        Self(IoUringSqe {
+            opcode: Opcode::SendMsg.into(),
+            fd,
+            addr: msg as u64,
+            len: 1,
+            op_flags: flags.bits() as u32,
+            ..IoUringSqe::default()
+        })
+    }
+
+    /// Prepare a recvmsg operation.
+    #[must_use]
+    #[allow(clippy::cast_sign_loss)]
+    pub fn recvmsg(fd: i32, msg: *mut MsgHdr, flags: MsgFlags) -> Self {
+        Self(IoUringSqe {
+            opcode: Opcode::RecvMsg.into(),
+            fd,
+            addr: msg as u64,
+            len: 1,
+            op_flags: flags.bits() as u32,
+            ..IoUringSqe::default()
+        })
+    }
+
+    /// Prepare a socket creation operation.
+    #[must_use]
+    #[allow(clippy::cast_sign_loss)]
+    pub fn socket(domain: i32, sock_type: i32, protocol: i32, flags: u32) -> Self {
+        Self(IoUringSqe {
+            opcode: Opcode::Socket.into(),
+            fd: domain,
+            off: sock_type as u64,
+            len: protocol as u32,
+            op_flags: flags,
+            ..IoUringSqe::default()
+        })
+    }
+
+    /// Prepare a shutdown operation.
+    #[must_use]
+    pub fn shutdown(fd: i32, how: ShutdownHow) -> Self {
+        Self(IoUringSqe {
+            opcode: Opcode::Shutdown.into(),
+            fd,
+            len: how as u32,
             ..IoUringSqe::default()
         })
     }

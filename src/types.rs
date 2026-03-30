@@ -12,15 +12,19 @@ pub enum Opcode {
     Readv = 1,
     Writev = 2,
     Fsync = 3,
+    ReadFixed = 4,
+    WriteFixed = 5,
     PollAdd = 6,
     PollRemove = 7,
-    Fallocate = 9,
+    SendMsg = 9,
+    RecvMsg = 10,
     Timeout = 11,
     TimeoutRemove = 12,
     Accept = 13,
     AsyncCancel = 14,
     LinkTimeout = 15,
     Connect = 16,
+    Fallocate = 17,
     Openat = 18,
     Close = 19,
     Statx = 21,
@@ -693,4 +697,117 @@ impl BitOr for UnlinkFlags {
     fn bitor(self, rhs: Self) -> Self {
         Self(self.0 | rhs.0)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Networking constants
+// ---------------------------------------------------------------------------
+
+/// Address family constants.
+pub const AF_INET: i32 = 2;
+pub const AF_INET6: i32 = 10;
+
+/// Socket type constants.
+pub const SOCK_STREAM: i32 = 1;
+pub const SOCK_DGRAM: i32 = 2;
+pub const SOCK_NONBLOCK: i32 = 0o4000;
+
+/// Socket option levels and options.
+pub const SOL_SOCKET: i32 = 1;
+pub const SO_REUSEADDR: i32 = 2;
+
+/// Shutdown modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum ShutdownHow {
+    Read = 0,
+    Write = 1,
+    Both = 2,
+}
+
+impl From<ShutdownHow> for i32 {
+    fn from(how: ShutdownHow) -> Self {
+        how as Self
+    }
+}
+
+/// Send/recv flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MsgFlags(i32);
+
+impl MsgFlags {
+    pub const NONE: Self = Self(0);
+    pub const DONTWAIT: Self = Self(0x40);
+    pub const NOSIGNAL: Self = Self(0x4000);
+    pub const WAITALL: Self = Self(0x100);
+
+    #[must_use]
+    pub const fn bits(self) -> i32 {
+        self.0
+    }
+}
+
+impl PartialEq<i32> for MsgFlags {
+    fn eq(&self, other: &i32) -> bool {
+        self.0 == *other
+    }
+}
+
+impl BitOr for MsgFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+/// Accept flags (same as socket flags that make sense for accept4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AcceptFlags(i32);
+
+impl AcceptFlags {
+    pub const NONE: Self = Self(0);
+    pub const NONBLOCK: Self = Self(SOCK_NONBLOCK);
+
+    #[must_use]
+    pub const fn bits(self) -> i32 {
+        self.0
+    }
+}
+
+impl PartialEq<i32> for AcceptFlags {
+    fn eq(&self, other: &i32) -> bool {
+        self.0 == *other
+    }
+}
+
+impl BitOr for AcceptFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+/// IPv4 socket address.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct SockAddrIn {
+    pub sin_family: u16,
+    pub sin_port: u16,
+    pub sin_addr: u32,
+    pub sin_zero: [u8; 8],
+}
+
+/// Message header for sendmsg/recvmsg.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct MsgHdr {
+    pub msg_name: *mut u8,
+    pub msg_namelen: u32,
+    pub(crate) _pad1: u32,
+    pub msg_iov: *mut IoVec,
+    pub msg_iovlen: usize,
+    pub msg_control: *mut u8,
+    pub msg_controllen: usize,
+    pub msg_flags: i32,
+    pub(crate) _pad2: u32,
 }

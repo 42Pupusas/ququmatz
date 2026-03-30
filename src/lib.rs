@@ -19,8 +19,8 @@ pub use types::{IoVec, SqeFlags, TimeoutFlags, Timespec};
 mod tests {
     use super::*;
     use crate::types::{
-        FileMode, FsyncFlags, IoUringCqe, IoUringParams, IoUringSqe, Opcode, OpenFlags, PollMask,
-        SqeFlags, Statx, StatxFlags, StatxMask,
+        AcceptFlags, FileMode, FsyncFlags, IoUringCqe, IoUringParams, IoUringSqe, MsgFlags, Opcode,
+        OpenFlags, PollMask, SockAddrIn, SqeFlags, Statx, StatxFlags, StatxMask,
     };
     use core::mem;
 
@@ -564,5 +564,123 @@ mod tests {
         assert_eq!(&read_buf[..total], b"hello world!");
 
         let _ = syscall::close(fd as usize);
+    }
+
+    #[cfg(not(miri))]
+    fn setup_tcp_listener(port: u16) -> i32 {
+        let fd = syscall::socket(types::AF_INET, types::SOCK_STREAM | types::SOCK_NONBLOCK, 0)
+            .expect("socket") as i32;
+
+        let one: i32 = 1;
+        syscall::setsockopt(
+            fd as usize,
+            types::SOL_SOCKET,
+            types::SO_REUSEADDR,
+            (&raw const one).cast(),
+            core::mem::size_of::<i32>() as u32,
+        )
+        .expect("setsockopt");
+
+        let addr = SockAddrIn {
+            sin_family: types::AF_INET as u16,
+            sin_port: port.to_be(),
+            sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+            sin_zero: [0; 8],
+        };
+        syscall::bind(
+            fd as usize,
+            (&raw const addr).cast(),
+            core::mem::size_of::<SockAddrIn>() as u32,
+        )
+        .expect("bind");
+        syscall::listen(fd as usize, 1).expect("listen");
+        fd
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn tcp_send_recv_roundtrip() {
+        let mut ring = IoUring::new(8).expect("setup");
+        let port: u16 = 44_444;
+        let listener = setup_tcp_listener(port);
+
+        let client = syscall::socket(types::AF_INET, types::SOCK_STREAM | types::SOCK_NONBLOCK, 0)
+            .expect("client socket") as i32;
+
+        // Accept + connect in parallel
+        ring.push(
+            Sqe::accept(
+                listener,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                AcceptFlags::NONE,
+            )
+            .user_data(1),
+        )
+        .expect("push accept");
+
+        let connect_addr = SockAddrIn {
+            sin_family: types::AF_INET as u16,
+            sin_port: port.to_be(),
+            sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+            sin_zero: [0; 8],
+        };
+        ring.push(
+            Sqe::connect(
+                client,
+                (&raw const connect_addr).cast(),
+                core::mem::size_of::<SockAddrIn>() as u32,
+            )
+            .user_data(2),
+        )
+        .expect("push connect");
+
+        ring.submit_and_wait(2).expect("submit");
+
+        let mut server_fd = -1i32;
+        for _ in 0..2 {
+            let cqe = ring.complete().expect("cqe");
+            if cqe.user_data == 1 {
+                assert!(cqe.result >= 0, "accept failed: {}", cqe.result);
+                server_fd = cqe.result;
+            } else {
+                assert!(
+                    cqe.result == 0 || cqe.result == -115,
+                    "connect failed: {}",
+                    cqe.result
+                );
+            }
+        }
+        assert!(server_fd >= 0, "never got accept completion");
+
+        // Send from client, recv on server
+        let msg = b"hello from io_uring!";
+        ring.push(Sqe::send(client, msg.as_ptr(), msg.len() as u32, MsgFlags::NONE).user_data(3))
+            .expect("push send");
+        ring.submit_and_wait(1).expect("submit send");
+        let cqe = ring.complete().expect("send cqe");
+        assert_eq!(cqe.user_data, 3);
+        assert_eq!(cqe.result, msg.len() as i32);
+
+        let mut recv_buf = [0u8; 64];
+        ring.push(
+            Sqe::recv(
+                server_fd,
+                recv_buf.as_mut_ptr(),
+                recv_buf.len() as u32,
+                MsgFlags::NONE,
+            )
+            .user_data(4),
+        )
+        .expect("push recv");
+        ring.submit_and_wait(1).expect("submit recv");
+        let cqe = ring.complete().expect("recv cqe");
+        assert_eq!(cqe.user_data, 4);
+        assert_eq!(cqe.result, msg.len() as i32);
+        assert_eq!(&recv_buf[..msg.len()], msg);
+
+        let _ = syscall::close(server_fd as usize);
+        let _ = syscall::close(client as usize);
+        let _ = syscall::close(listener as usize);
     }
 }
