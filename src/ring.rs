@@ -181,7 +181,6 @@ impl IoUring {
         unsafe { *self.sq_array.add(idx as usize) = idx };
 
         self.sq_tail_local = next_tail;
-        unsafe { &*self.sq_tail }.store(self.sq_tail_local, Ordering::Release);
 
         Ok(())
     }
@@ -197,6 +196,14 @@ impl IoUring {
         self.push(Sqe::nop().user_data(user_data))
     }
 
+    /// Publish the local SQ tail to the kernel-visible atomic tail.
+    ///
+    /// Called automatically by `submit` and `submit_and_wait`; only needed
+    /// directly when using SQPOLL mode without explicit submission.
+    fn flush_sq_tail(&self) {
+        unsafe { &*self.sq_tail }.store(self.sq_tail_local, Ordering::Release);
+    }
+
     /// Submit all queued entries to the kernel.
     ///
     /// Returns the number of entries submitted.
@@ -206,6 +213,7 @@ impl IoUring {
     /// Returns an error if the kernel rejects the submission.
     #[allow(clippy::cast_possible_truncation)]
     pub fn submit(&mut self) -> Result<u32, Error> {
+        self.flush_sq_tail();
         let head = unsafe { &*self.sq_head }.load(Ordering::Acquire);
         let to_submit = self.sq_tail_local.wrapping_sub(head);
         if to_submit == 0 {
@@ -224,6 +232,7 @@ impl IoUring {
     /// Returns an error if the kernel rejects the submission.
     #[allow(clippy::cast_possible_truncation)]
     pub fn submit_and_wait(&mut self, min_complete: u32) -> Result<u32, Error> {
+        self.flush_sq_tail();
         let head = unsafe { &*self.sq_head }.load(Ordering::Acquire);
         let to_submit = self.sq_tail_local.wrapping_sub(head);
         let ret = syscall::io_uring_enter(self.fd, to_submit, min_complete, EnterFlags::GETEVENTS)?;
