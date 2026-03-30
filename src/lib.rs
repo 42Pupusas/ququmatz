@@ -19,7 +19,8 @@ pub use types::{IoVec, SqeFlags, TimeoutFlags, Timespec};
 mod tests {
     use super::*;
     use crate::types::{
-        FileMode, IoUringCqe, IoUringParams, IoUringSqe, Opcode, OpenFlags, SqeFlags,
+        FileMode, FsyncFlags, IoUringCqe, IoUringParams, IoUringSqe, Opcode, OpenFlags, PollMask,
+        SqeFlags, Statx, StatxFlags, StatxMask,
     };
     use core::mem;
 
@@ -299,6 +300,86 @@ mod tests {
         let ts = Timespec::from_millis(50);
         assert_eq!(ts.tv_sec, 0);
         assert_eq!(ts.tv_nsec, 50_000_000);
+    }
+
+    #[test]
+    fn sqe_builder_fsync_places_fields_correctly() {
+        let sqe = Sqe::fsync(5, FsyncFlags::DATASYNC).user_data(10);
+        let inner = sqe.0;
+
+        assert_eq!(Opcode::Fsync, inner.opcode);
+        assert_eq!(inner.fd, 5);
+        assert_eq!(inner.op_flags, FsyncFlags::DATASYNC.bits());
+        assert_eq!(inner.user_data, 10);
+    }
+
+    #[test]
+    fn sqe_builder_poll_add_places_fields_correctly() {
+        let sqe = Sqe::poll_add(3, PollMask::IN | PollMask::RDHUP).user_data(20);
+        let inner = sqe.0;
+
+        assert_eq!(Opcode::PollAdd, inner.opcode);
+        assert_eq!(inner.fd, 3);
+        assert_eq!(inner.op_flags, (PollMask::IN | PollMask::RDHUP).bits());
+        assert_eq!(inner.user_data, 20);
+    }
+
+    #[test]
+    fn statx_layout() {
+        assert_eq!(core::mem::size_of::<Statx>(), 256);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn fsync_on_tmpfile() {
+        let mut ring = IoUring::new(4).expect("setup");
+        let fd = open_tmpfile();
+
+        // Write some data first
+        let buf = b"fsync test";
+        ring.push(Sqe::write(fd, buf.as_ptr(), buf.len() as u32, 0).user_data(1))
+            .expect("push write");
+        ring.submit_and_wait(1).expect("submit");
+        ring.complete().expect("write cqe");
+
+        // Fsync
+        ring.push(Sqe::fsync(fd, FsyncFlags::default()).user_data(2))
+            .expect("push fsync");
+        ring.submit_and_wait(1).expect("submit");
+
+        let cqe = ring.complete().expect("fsync cqe");
+        assert_eq!(cqe.user_data, 2);
+        assert_eq!(cqe.result, 0);
+
+        let _ = syscall::close(fd as usize);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn statx_on_tmp() {
+        let mut ring = IoUring::new(4).expect("setup");
+        let mut buf = Statx::default();
+
+        ring.push(
+            Sqe::statx(
+                types::AT_FDCWD,
+                c"/tmp".as_ptr().cast(),
+                StatxFlags::default(),
+                StatxMask::BASIC_STATS,
+                &raw mut buf,
+            )
+            .user_data(1),
+        )
+        .expect("push statx");
+        ring.submit_and_wait(1).expect("submit");
+
+        let cqe = ring.complete().expect("statx cqe");
+        assert_eq!(cqe.user_data, 1);
+        assert_eq!(cqe.result, 0);
+
+        // /tmp should be a directory (mode & S_IFMT == S_IFDIR = 0o40000)
+        assert_ne!(buf.stx_mode & 0o17_0000, 0);
+        assert!(buf.stx_size > 0 || buf.stx_mode & 0o40000 != 0);
     }
 
     #[cfg(not(miri))]

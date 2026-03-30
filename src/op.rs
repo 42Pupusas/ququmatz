@@ -1,6 +1,9 @@
 #![allow(clippy::cast_sign_loss)]
 
-use crate::types::{IoUringSqe, IoVec, Opcode, OpenFlags, SqeFlags, TimeoutFlags, Timespec};
+use crate::types::{
+    FallocateMode, FsyncFlags, IoUringSqe, IoVec, Opcode, OpenFlags, PollMask, RenameFlags,
+    SqeFlags, StatxFlags, StatxMask, TimeoutFlags, Timespec, UnlinkFlags,
+};
 
 /// A prepared submission queue entry, ready to be pushed onto the ring.
 ///
@@ -157,6 +160,135 @@ impl Sqe {
         Self(IoUringSqe {
             opcode: Opcode::AsyncCancel.into(),
             addr: target_user_data,
+            ..IoUringSqe::default()
+        })
+    }
+
+    /// Prepare an fsync operation.
+    #[must_use]
+    pub fn fsync(fd: i32, flags: FsyncFlags) -> Self {
+        Self(IoUringSqe {
+            opcode: Opcode::Fsync.into(),
+            fd,
+            op_flags: flags.bits(),
+            ..IoUringSqe::default()
+        })
+    }
+
+    /// Prepare an fdatasync operation (convenience for fsync + DATASYNC flag).
+    #[must_use]
+    pub fn fdatasync(fd: i32) -> Self {
+        Self::fsync(fd, FsyncFlags::DATASYNC)
+    }
+
+    /// Prepare a poll add operation.
+    ///
+    /// Waits for events matching `mask` on the given fd.
+    #[must_use]
+    #[allow(clippy::cast_sign_loss)]
+    pub fn poll_add(fd: i32, mask: PollMask) -> Self {
+        Self(IoUringSqe {
+            opcode: Opcode::PollAdd.into(),
+            fd,
+            // poll_events is stored in the lower 32 bits of op_flags,
+            // but io_uring expects it as __poll_t in a specific field.
+            // For io_uring, poll32_events goes in op_flags.
+            op_flags: mask.bits(),
+            ..IoUringSqe::default()
+        })
+    }
+
+    /// Prepare a poll remove operation.
+    ///
+    /// Removes a previously added poll request identified by `user_data`.
+    #[must_use]
+    pub fn poll_remove(target_user_data: u64) -> Self {
+        Self(IoUringSqe {
+            opcode: Opcode::PollRemove.into(),
+            addr: target_user_data,
+            ..IoUringSqe::default()
+        })
+    }
+
+    /// Prepare a fallocate operation.
+    #[must_use]
+    #[allow(clippy::cast_sign_loss)]
+    pub fn fallocate(fd: i32, mode: FallocateMode, offset: u64, len: u64) -> Self {
+        Self(IoUringSqe {
+            opcode: Opcode::Fallocate.into(),
+            fd,
+            off: offset,
+            addr: len,
+            len: mode.bits() as u32,
+            ..IoUringSqe::default()
+        })
+    }
+
+    /// Prepare a statx operation.
+    ///
+    /// `dfd` is the directory fd (use `AT_FDCWD` for cwd). `path` must be
+    /// null-terminated. `statx_buf` is where the result will be written.
+    #[must_use]
+    #[allow(clippy::cast_sign_loss)]
+    pub fn statx(
+        dfd: i32,
+        path: *const u8,
+        flags: StatxFlags,
+        mask: StatxMask,
+        statx_buf: *mut crate::types::Statx,
+    ) -> Self {
+        Self(IoUringSqe {
+            opcode: Opcode::Statx.into(),
+            fd: dfd,
+            off: statx_buf as u64,
+            addr: path as u64,
+            len: mask.bits(),
+            op_flags: flags.bits() as u32,
+            ..IoUringSqe::default()
+        })
+    }
+
+    /// Prepare a renameat operation.
+    #[must_use]
+    pub fn renameat(
+        old_dfd: i32,
+        old_path: *const u8,
+        new_dfd: i32,
+        new_path: *const u8,
+        flags: RenameFlags,
+    ) -> Self {
+        Self(IoUringSqe {
+            opcode: Opcode::Renameat.into(),
+            fd: old_dfd,
+            addr: old_path as u64,
+            len: new_dfd as u32,
+            off: new_path as u64,
+            op_flags: flags.bits(),
+            ..IoUringSqe::default()
+        })
+    }
+
+    /// Prepare an unlinkat operation.
+    #[must_use]
+    #[allow(clippy::cast_sign_loss)]
+    pub fn unlinkat(dfd: i32, path: *const u8, flags: UnlinkFlags) -> Self {
+        Self(IoUringSqe {
+            opcode: Opcode::Unlinkat.into(),
+            fd: dfd,
+            addr: path as u64,
+            op_flags: flags.bits() as u32,
+            ..IoUringSqe::default()
+        })
+    }
+
+    /// Prepare a mkdirat operation.
+    #[must_use]
+    pub fn mkdirat(dfd: i32, path: *const u8, mode: u32) -> Self {
+        Self(IoUringSqe {
+            opcode: Opcode::Mkdirat.into(),
+            fd: dfd,
+            addr: path as u64,
+            len: mode,
             ..IoUringSqe::default()
         })
     }

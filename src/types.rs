@@ -11,15 +11,28 @@ pub enum Opcode {
     Nop = 0,
     Readv = 1,
     Writev = 2,
+    Fsync = 3,
+    PollAdd = 6,
+    PollRemove = 7,
+    Fallocate = 9,
     Timeout = 11,
     TimeoutRemove = 12,
     Accept = 13,
     AsyncCancel = 14,
     LinkTimeout = 15,
+    Connect = 16,
     Openat = 18,
     Close = 19,
+    Statx = 21,
     Read = 22,
     Write = 23,
+    Send = 26,
+    Recv = 27,
+    Shutdown = 34,
+    Renameat = 35,
+    Unlinkat = 36,
+    Mkdirat = 37,
+    Socket = 45,
 }
 
 impl PartialEq<u8> for Opcode {
@@ -408,6 +421,274 @@ impl PartialEq<u32> for TimeoutFlags {
 }
 
 impl BitOr for TimeoutFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fsync flags
+// ---------------------------------------------------------------------------
+
+/// Flags for fsync operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FsyncFlags(u32);
+
+impl FsyncFlags {
+    /// Only sync file data, not metadata (fdatasync behavior).
+    pub const DATASYNC: Self = Self(1 << 0);
+
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+impl PartialEq<u32> for FsyncFlags {
+    fn eq(&self, other: &u32) -> bool {
+        self.0 == *other
+    }
+}
+
+impl BitOr for FsyncFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Poll mask
+// ---------------------------------------------------------------------------
+
+/// Event mask for poll operations (matches Linux poll event bits).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PollMask(u32);
+
+impl PollMask {
+    pub const IN: Self = Self(0x0001);
+    pub const OUT: Self = Self(0x0004);
+    pub const ERR: Self = Self(0x0008);
+    pub const HUP: Self = Self(0x0010);
+    pub const RDHUP: Self = Self(0x2000);
+
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+impl PartialEq<u32> for PollMask {
+    fn eq(&self, other: &u32) -> bool {
+        self.0 == *other
+    }
+}
+
+impl BitOr for PollMask {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fallocate mode
+// ---------------------------------------------------------------------------
+
+/// Mode flags for fallocate operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FallocateMode(i32);
+
+impl FallocateMode {
+    /// Default mode: allocate space.
+    pub const NONE: Self = Self(0);
+    /// Keep file size unchanged.
+    pub const KEEP_SIZE: Self = Self(0x01);
+    /// Punch a hole (deallocate).
+    pub const PUNCH_HOLE: Self = Self(0x02);
+    /// Zero a range (do not deallocate).
+    pub const ZERO_RANGE: Self = Self(0x10);
+
+    #[must_use]
+    pub const fn bits(self) -> i32 {
+        self.0
+    }
+}
+
+impl PartialEq<i32> for FallocateMode {
+    fn eq(&self, other: &i32) -> bool {
+        self.0 == *other
+    }
+}
+
+impl BitOr for FallocateMode {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Statx
+// ---------------------------------------------------------------------------
+
+/// Flags for statx requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StatxFlags(i32);
+
+impl StatxFlags {
+    pub const EMPTY_PATH: Self = Self(0x1000);
+    pub const SYMLINK_NOFOLLOW: Self = Self(0x100);
+
+    #[must_use]
+    pub const fn bits(self) -> i32 {
+        self.0
+    }
+}
+
+impl PartialEq<i32> for StatxFlags {
+    fn eq(&self, other: &i32) -> bool {
+        self.0 == *other
+    }
+}
+
+impl BitOr for StatxFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+/// Mask for which statx fields to populate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StatxMask(u32);
+
+impl StatxMask {
+    pub const TYPE: Self = Self(0x0001);
+    pub const MODE: Self = Self(0x0002);
+    pub const NLINK: Self = Self(0x0004);
+    pub const UID: Self = Self(0x0008);
+    pub const GID: Self = Self(0x0010);
+    pub const ATIME: Self = Self(0x0020);
+    pub const MTIME: Self = Self(0x0040);
+    pub const CTIME: Self = Self(0x0080);
+    pub const INO: Self = Self(0x0100);
+    pub const SIZE: Self = Self(0x0200);
+    pub const BLOCKS: Self = Self(0x0400);
+    pub const BASIC_STATS: Self = Self(0x07FF);
+    pub const ALL: Self = Self(0x0FFF);
+
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+impl PartialEq<u32> for StatxMask {
+    fn eq(&self, other: &u32) -> bool {
+        self.0 == *other
+    }
+}
+
+impl BitOr for StatxMask {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+/// Kernel `statx` timestamp.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct StatxTimestamp {
+    pub tv_sec: i64,
+    pub tv_nsec: u32,
+    pub(crate) _reserved: i32,
+}
+
+/// Kernel `statx` result structure.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct Statx {
+    pub stx_mask: u32,
+    pub stx_blksize: u32,
+    pub stx_attributes: u64,
+    pub stx_nlink: u32,
+    pub stx_uid: u32,
+    pub stx_gid: u32,
+    pub stx_mode: u16,
+    pub(crate) _spare0: u16,
+    pub stx_ino: u64,
+    pub stx_size: u64,
+    pub stx_blocks: u64,
+    pub stx_attributes_mask: u64,
+    pub stx_atime: StatxTimestamp,
+    pub stx_btime: StatxTimestamp,
+    pub stx_ctime: StatxTimestamp,
+    pub stx_mtime: StatxTimestamp,
+    pub stx_rdev_major: u32,
+    pub stx_rdev_minor: u32,
+    pub stx_dev_major: u32,
+    pub stx_dev_minor: u32,
+    pub stx_mnt_id: u64,
+    pub stx_dio_mem_align: u32,
+    pub stx_dio_offset_align: u32,
+    pub(crate) _spare3: [u64; 12],
+}
+
+// ---------------------------------------------------------------------------
+// Rename / unlink flags
+// ---------------------------------------------------------------------------
+
+/// Flags for renameat2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RenameFlags(u32);
+
+impl RenameFlags {
+    pub const NOREPLACE: Self = Self(1 << 0);
+    pub const EXCHANGE: Self = Self(1 << 1);
+
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+impl PartialEq<u32> for RenameFlags {
+    fn eq(&self, other: &u32) -> bool {
+        self.0 == *other
+    }
+}
+
+impl BitOr for RenameFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+/// Flags for unlinkat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UnlinkFlags(i32);
+
+impl UnlinkFlags {
+    /// Remove a directory instead of a file.
+    pub const REMOVEDIR: Self = Self(0x200);
+
+    #[must_use]
+    pub const fn bits(self) -> i32 {
+        self.0
+    }
+}
+
+impl PartialEq<i32> for UnlinkFlags {
+    fn eq(&self, other: &i32) -> bool {
+        self.0 == *other
+    }
+}
+
+impl BitOr for UnlinkFlags {
     type Output = Self;
     fn bitor(self, rhs: Self) -> Self {
         Self(self.0 | rhs.0)
