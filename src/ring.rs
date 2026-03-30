@@ -29,6 +29,13 @@ impl MappedRegion {
 }
 
 /// Safe wrapper around a Linux `io_uring` instance.
+///
+/// # Thread Safety
+///
+/// `IoUring` is `!Send` and `!Sync` (due to raw pointers into mmap'd memory).
+/// This is intentional — the ring's mmap'd regions and cached indices are not
+/// safe to share across threads without external synchronization. Create one
+/// ring per thread, or wrap in a `Mutex` if you must share.
 pub struct IoUring {
     fd: usize,
 
@@ -36,6 +43,7 @@ pub struct IoUring {
     sq_head: *const AtomicU32,
     sq_tail: *const AtomicU32,
     sq_mask: u32,
+    sq_flags: *const AtomicU32,
     sq_array: *mut u32,
 
     // SQE array
@@ -83,6 +91,18 @@ impl IoUring {
         self.features
     }
 
+    /// Check if the CQ ring has overflowed.
+    ///
+    /// This happens when the kernel has more completions than the CQ can hold.
+    /// When this returns `true`, completions may have been lost. Drain the CQ
+    /// and call [`submit_and_wait`](Self::submit_and_wait) to flush the backlog.
+    #[must_use]
+    pub fn cq_overflow(&self) -> bool {
+        const IORING_SQ_CQ_OVERFLOW: u32 = 1 << 1;
+        let flags = unsafe { &*self.sq_flags }.load(Ordering::Acquire);
+        flags & IORING_SQ_CQ_OVERFLOW != 0
+    }
+
     #[allow(clippy::cast_ptr_alignment)]
     fn from_params(entries: u32, params: &mut IoUringParams) -> Result<Self, Error> {
         let prot = Prot::READ | Prot::WRITE;
@@ -108,6 +128,7 @@ impl IoUring {
         let sq_head = unsafe { sq_base.add(params.sq_off.head as usize) }.cast::<AtomicU32>();
         let sq_tail = unsafe { sq_base.add(params.sq_off.tail as usize) }.cast::<AtomicU32>();
         let sq_mask = unsafe { *sq_base.add(params.sq_off.ring_mask as usize).cast::<u32>() };
+        let sq_flags = unsafe { sq_base.add(params.sq_off.flags as usize) }.cast::<AtomicU32>();
         let sq_array = unsafe { sq_base.add(params.sq_off.array as usize) } as *mut u32;
 
         let cq_base = cq_ring_ptr as *const u8;
@@ -124,6 +145,7 @@ impl IoUring {
             sq_head,
             sq_tail,
             sq_mask,
+            sq_flags,
             sq_array,
             sqes: sqes_ptr as *mut IoUringSqe,
             sq_tail_local,

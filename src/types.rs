@@ -472,6 +472,9 @@ pub struct IoUringCqe {
     pub flags: u32,
 }
 
+/// Raw file descriptor type alias.
+pub type RawFd = i32;
+
 /// I/O vector for vectored read/write operations.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]

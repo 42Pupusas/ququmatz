@@ -26,6 +26,11 @@ impl Sqe {
     ///
     /// Reads up to `len` bytes from `fd` at `offset` into `buf`.
     /// Use offset `u64::MAX` (`-1` as unsigned) for current file position.
+    ///
+    /// # Safety contract
+    ///
+    /// The caller must ensure `buf` points to at least `len` bytes of valid,
+    /// writable memory that remains valid until the operation completes.
     #[must_use]
     pub fn read(fd: i32, buf: *mut u8, len: u32, offset: u64) -> Self {
         Self(IoUringSqe {
@@ -42,6 +47,11 @@ impl Sqe {
     ///
     /// Writes `len` bytes from `buf` to `fd` at `offset`.
     /// Use offset `u64::MAX` (`-1` as unsigned) for current file position.
+    ///
+    /// # Safety contract
+    ///
+    /// The caller must ensure `buf` points to at least `len` bytes of valid,
+    /// readable memory that remains valid until the operation completes.
     #[must_use]
     pub fn write(fd: i32, buf: *const u8, len: u32, offset: u64) -> Self {
         Self(IoUringSqe {
@@ -57,6 +67,11 @@ impl Sqe {
     /// Prepare a vectored read operation.
     ///
     /// Reads from `fd` at `offset` into the buffers described by `iovecs`.
+    ///
+    /// # Safety contract
+    ///
+    /// The caller must ensure `iovecs` and all referenced buffers remain valid
+    /// until the operation completes.
     #[must_use]
     pub fn readv(fd: i32, iovecs: *const IoVec, nr_vecs: u32, offset: u64) -> Self {
         Self(IoUringSqe {
@@ -72,6 +87,11 @@ impl Sqe {
     /// Prepare a vectored write operation.
     ///
     /// Writes to `fd` at `offset` from the buffers described by `iovecs`.
+    ///
+    /// # Safety contract
+    ///
+    /// The caller must ensure `iovecs` and all referenced buffers remain valid
+    /// until the operation completes.
     #[must_use]
     pub fn writev(fd: i32, iovecs: *const IoVec, nr_vecs: u32, offset: u64) -> Self {
         Self(IoUringSqe {
