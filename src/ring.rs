@@ -235,7 +235,6 @@ impl IoUring {
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
     pub fn submit(&mut self) -> Result<u32, Error> {
-        self.flush_cq_head();
         self.flush_sq_tail();
         let head = unsafe { &*self.sq_head }.load(Ordering::Acquire);
         let to_submit = self.sq_tail_local.wrapping_sub(head);
@@ -243,6 +242,7 @@ impl IoUring {
             return Ok(0);
         }
         let ret = syscall::io_uring_enter(self.fd, to_submit, 0, EnterFlags::default())?;
+        self.flush_cq_head();
         Ok(ret as u32)
     }
 
@@ -298,6 +298,16 @@ impl IoUring {
         self.cq_head_local += 1;
 
         Some(completion)
+    }
+
+    /// Publish the local CQ head to the kernel, making consumed CQ slots
+    /// available for new completions.
+    ///
+    /// Call this after draining completions if you're worried about the CQ
+    /// filling up. It's also called automatically in `Drop`.
+    #[inline]
+    pub fn sync_cq(&self) {
+        self.flush_cq_head();
     }
 
     /// Register buffers for zero-copy I/O with `read_fixed`/`write_fixed`.
