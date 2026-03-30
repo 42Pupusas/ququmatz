@@ -82,6 +82,92 @@ impl BitOr for EnterFlags {
 }
 
 // ---------------------------------------------------------------------------
+// io_uring setup flags
+// ---------------------------------------------------------------------------
+
+/// Flags for `io_uring_setup`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SetupFlags(u32);
+
+impl SetupFlags {
+    /// Kernel-side SQ polling thread.
+    pub const SQPOLL: Self = Self(1 << 1);
+    /// Bind SQPOLL thread to a specific CPU.
+    pub const SQ_AFF: Self = Self(1 << 2);
+    /// Use user-specified CQ ring size.
+    pub const CQSIZE: Self = Self(1 << 3);
+    /// Clamp SQ/CQ ring sizes to implementation limits.
+    pub const CLAMP: Self = Self(1 << 4);
+    /// Attach to an existing workqueue.
+    pub const ATTACH_WQ: Self = Self(1 << 5);
+    /// Single-issuer hint (5.18+).
+    pub const SINGLE_ISSUER: Self = Self(1 << 12);
+
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+impl PartialEq<u32> for SetupFlags {
+    fn eq(&self, other: &u32) -> bool {
+        self.0 == *other
+    }
+}
+
+impl BitOr for SetupFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// io_uring feature flags (returned by kernel in params.features)
+// ---------------------------------------------------------------------------
+
+/// Feature flags reported by the kernel after `io_uring_setup`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Features(pub(crate) u32);
+
+impl Features {
+    pub const SINGLE_MMAP: Self = Self(1 << 0);
+    pub const NODROP: Self = Self(1 << 1);
+    pub const SUBMIT_STABLE: Self = Self(1 << 2);
+    pub const RW_CUR_POS: Self = Self(1 << 3);
+    pub const CUR_PERSONALITY: Self = Self(1 << 4);
+    pub const FAST_POLL: Self = Self(1 << 5);
+    pub const POLL_32BITS: Self = Self(1 << 6);
+    pub const SQPOLL_NONFIXED: Self = Self(1 << 7);
+    pub const EXT_ARG: Self = Self(1 << 8);
+    pub const NATIVE_WORKERS: Self = Self(1 << 9);
+
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Check if a specific feature flag is set.
+    #[must_use]
+    pub const fn contains(self, flag: Self) -> bool {
+        (self.0 & flag.0) == flag.0
+    }
+}
+
+impl PartialEq<u32> for Features {
+    fn eq(&self, other: &u32) -> bool {
+        self.0 == *other
+    }
+}
+
+impl BitOr for Features {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SQE flags (for linking, drain, async)
 // ---------------------------------------------------------------------------
 

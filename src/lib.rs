@@ -7,8 +7,8 @@ mod ring;
 
 pub use error::Error;
 pub use op::Sqe;
-pub use ring::{Completion, Completions, IoUring};
-pub use types::{IoVec, SqeFlags, TimeoutFlags, Timespec};
+pub use ring::{Completion, Completions, IoUring, IoUringBuilder};
+pub use types::{Features, IoVec, SetupFlags, SqeFlags, TimeoutFlags, Timespec};
 
 #[cfg(test)]
 #[allow(
@@ -564,6 +564,34 @@ mod tests {
         assert_eq!(&read_buf[..total], b"hello world!");
 
         let _ = syscall::close(fd as usize);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn builder_with_cq_entries() {
+        let ring = IoUring::builder(4).cq_entries(16).build().expect("setup");
+        // Just verify it was created successfully
+        drop(ring);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn builder_with_clamp() {
+        // Requesting absurdly large ring with clamp should succeed
+        let ring = IoUring::builder(1 << 20).clamp().build().expect("setup");
+        drop(ring);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn feature_detection() {
+        let ring = IoUring::new(4).expect("setup");
+        let features = ring.features();
+        // Any modern kernel (5.4+) should have SINGLE_MMAP
+        assert!(
+            features.contains(Features::SINGLE_MMAP),
+            "expected SINGLE_MMAP feature"
+        );
     }
 
     #[cfg(not(miri))]

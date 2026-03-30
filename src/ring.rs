@@ -1,7 +1,10 @@
 use crate::error::Error;
 use crate::op::Sqe;
 use crate::syscall;
-use crate::types::{EnterFlags, IoUringCqe, IoUringParams, IoUringSqe, MapFlags, Prot, RingOffset};
+use crate::types::{
+    EnterFlags, Features, IoUringCqe, IoUringParams, IoUringSqe, MapFlags, Prot, RingOffset,
+    SetupFlags,
+};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 /// A completed `io_uring` operation.
@@ -46,6 +49,9 @@ pub struct IoUring {
     cqes: *const IoUringCqe,
     cq_head_local: u32,
 
+    // Kernel-reported features
+    features: Features,
+
     // For cleanup
     sq_ring: MappedRegion,
     cq_ring: MappedRegion,
@@ -56,17 +62,33 @@ impl IoUring {
     /// Create a new `io_uring` instance with the given queue depth.
     ///
     /// `entries` will be rounded up to the next power of two by the kernel.
+    /// For more control over setup parameters, use [`IoUringBuilder`].
     ///
     /// # Errors
     ///
     /// Returns an error if the kernel rejects the setup or memory mapping fails.
-    #[allow(clippy::cast_ptr_alignment)]
     pub fn new(entries: u32) -> Result<Self, Error> {
-        let mut params = IoUringParams::default();
+        IoUringBuilder::new(entries).build()
+    }
+
+    /// Start building a configured `io_uring` instance.
+    #[must_use]
+    pub fn builder(entries: u32) -> IoUringBuilder {
+        IoUringBuilder::new(entries)
+    }
+
+    /// Returns the feature flags reported by the kernel.
+    #[must_use]
+    pub const fn features(&self) -> Features {
+        self.features
+    }
+
+    #[allow(clippy::cast_ptr_alignment)]
+    fn from_params(entries: u32, params: &mut IoUringParams) -> Result<Self, Error> {
         let prot = Prot::READ | Prot::WRITE;
         let map = MapFlags::SHARED | MapFlags::POPULATE;
 
-        let fd = syscall::io_uring_setup(entries, &raw mut params)?;
+        let fd = syscall::io_uring_setup(entries, &raw mut *params)?;
 
         // Map the SQ ring
         let sq_ring_sz =
@@ -110,6 +132,7 @@ impl IoUring {
             cq_mask,
             cqes,
             cq_head_local,
+            features: Features(params.features),
             sq_ring: MappedRegion::new(sq_ring_ptr, sq_ring_sz),
             cq_ring: MappedRegion::new(cq_ring_ptr, cq_ring_sz),
             sqes_region: MappedRegion::new(sqes_ptr, sqes_sz),
@@ -232,5 +255,96 @@ impl Drop for IoUring {
         let _ = syscall::munmap(self.cq_ring.addr, self.cq_ring.len);
         let _ = syscall::munmap(self.sq_ring.addr, self.sq_ring.len);
         let _ = syscall::close(self.fd);
+    }
+}
+
+/// Builder for configuring an `io_uring` instance before creation.
+///
+/// ```no_run
+/// # use ququmatz::IoUring;
+/// let ring = IoUring::builder(32)
+///     .cq_entries(64)
+///     .clamp()
+///     .build()
+///     .expect("setup failed");
+/// ```
+pub struct IoUringBuilder {
+    entries: u32,
+    params: IoUringParams,
+}
+
+impl IoUringBuilder {
+    /// Start building an `io_uring` with the given queue depth.
+    #[must_use]
+    pub fn new(entries: u32) -> Self {
+        Self {
+            entries,
+            params: IoUringParams::default(),
+        }
+    }
+
+    /// Enable kernel-side SQ polling with the given idle timeout in milliseconds.
+    ///
+    /// When SQPOLL is active, the kernel polls the SQ for new entries without
+    /// requiring `io_uring_enter` calls, reducing syscall overhead.
+    #[must_use]
+    pub const fn sqpoll(mut self, idle_ms: u32) -> Self {
+        self.params.flags |= SetupFlags::SQPOLL.bits();
+        self.params.sq_thread_idle = idle_ms;
+        self
+    }
+
+    /// Pin the SQPOLL thread to a specific CPU.
+    #[must_use]
+    pub const fn sqpoll_cpu(mut self, cpu: u32) -> Self {
+        self.params.flags |= SetupFlags::SQPOLL.bits() | SetupFlags::SQ_AFF.bits();
+        self.params.sq_thread_cpu = cpu;
+        self
+    }
+
+    /// Set a custom CQ ring size (must be >= SQ size).
+    #[must_use]
+    pub const fn cq_entries(mut self, n: u32) -> Self {
+        self.params.flags |= SetupFlags::CQSIZE.bits();
+        self.params.cq_entries = n;
+        self
+    }
+
+    /// Clamp SQ/CQ sizes to kernel implementation limits instead of failing.
+    #[must_use]
+    pub const fn clamp(mut self) -> Self {
+        self.params.flags |= SetupFlags::CLAMP.bits();
+        self
+    }
+
+    /// Hint that only one thread will submit to this ring (5.18+).
+    #[must_use]
+    pub const fn single_issuer(mut self) -> Self {
+        self.params.flags |= SetupFlags::SINGLE_ISSUER.bits();
+        self
+    }
+
+    /// Attach to an existing `io_uring` workqueue (share its worker threads).
+    #[must_use]
+    pub const fn attach_wq(mut self, wq_fd: u32) -> Self {
+        self.params.flags |= SetupFlags::ATTACH_WQ.bits();
+        self.params.wq_fd = wq_fd;
+        self
+    }
+
+    /// Set raw setup flags directly.
+    #[must_use]
+    pub const fn setup_flags(mut self, flags: SetupFlags) -> Self {
+        self.params.flags |= flags.bits();
+        self
+    }
+
+    /// Build the `io_uring` instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the kernel rejects the parameters.
+    pub fn build(mut self) -> Result<IoUring, Error> {
+        IoUring::from_params(self.entries, &mut self.params)
     }
 }
