@@ -11,6 +11,11 @@ pub enum Opcode {
     Nop = 0,
     Readv = 1,
     Writev = 2,
+    Timeout = 11,
+    TimeoutRemove = 12,
+    Accept = 13,
+    AsyncCancel = 14,
+    LinkTimeout = 15,
     Openat = 18,
     Close = 19,
     Read = 22,
@@ -347,4 +352,64 @@ pub struct IoUringCqe {
 pub struct IoVec {
     pub base: *mut u8,
     pub len: usize,
+}
+
+/// Kernel timespec for timeout operations.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct Timespec {
+    pub tv_sec: i64,
+    pub tv_nsec: i64,
+}
+
+impl Timespec {
+    /// Create a timespec from seconds and nanoseconds.
+    #[must_use]
+    pub const fn new(sec: i64, nsec: i64) -> Self {
+        Self {
+            tv_sec: sec,
+            tv_nsec: nsec,
+        }
+    }
+
+    /// Create a timespec from milliseconds.
+    #[must_use]
+    #[allow(clippy::cast_possible_wrap)]
+    pub const fn from_millis(ms: u64) -> Self {
+        Self {
+            tv_sec: (ms / 1000) as i64,
+            tv_nsec: ((ms % 1000) * 1_000_000) as i64,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Timeout flags
+// ---------------------------------------------------------------------------
+
+/// Flags for timeout operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TimeoutFlags(u32);
+
+impl TimeoutFlags {
+    /// Use an absolute timeout instead of relative.
+    pub const ABS: Self = Self(1 << 0);
+
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+impl PartialEq<u32> for TimeoutFlags {
+    fn eq(&self, other: &u32) -> bool {
+        self.0 == *other
+    }
+}
+
+impl BitOr for TimeoutFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
 }

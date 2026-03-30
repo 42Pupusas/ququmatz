@@ -8,7 +8,7 @@ mod ring;
 pub use error::Error;
 pub use op::Sqe;
 pub use ring::{Completion, Completions, IoUring};
-pub use types::{IoVec, SqeFlags};
+pub use types::{IoVec, SqeFlags, TimeoutFlags, Timespec};
 
 #[cfg(test)]
 #[allow(
@@ -265,6 +265,57 @@ mod tests {
         // Combining flags
         let sqe = Sqe::nop().user_data(4).link().drain();
         assert_eq!((SqeFlags::IO_LINK | SqeFlags::IO_DRAIN).bits(), sqe.0.flags);
+    }
+
+    #[test]
+    fn sqe_builder_timeout_places_fields_correctly() {
+        let ts = Timespec::new(1, 500_000_000);
+        let sqe = Sqe::timeout(&raw const ts, 3, TimeoutFlags::default()).user_data(42);
+        let inner = sqe.0;
+
+        assert_eq!(Opcode::Timeout, inner.opcode);
+        assert_eq!(inner.addr, (&raw const ts) as u64);
+        assert_eq!(inner.off, 3); // count
+        assert_eq!(inner.op_flags, 0);
+        assert_eq!(inner.user_data, 42);
+    }
+
+    #[test]
+    fn sqe_builder_cancel_places_fields_correctly() {
+        let sqe = Sqe::cancel(99).user_data(100);
+        let inner = sqe.0;
+
+        assert_eq!(Opcode::AsyncCancel, inner.opcode);
+        assert_eq!(inner.addr, 99); // target user_data
+        assert_eq!(inner.user_data, 100);
+    }
+
+    #[test]
+    fn timespec_from_millis() {
+        let ts = Timespec::from_millis(1500);
+        assert_eq!(ts.tv_sec, 1);
+        assert_eq!(ts.tv_nsec, 500_000_000);
+
+        let ts = Timespec::from_millis(50);
+        assert_eq!(ts.tv_sec, 0);
+        assert_eq!(ts.tv_nsec, 50_000_000);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn timeout_expiry() {
+        let mut ring = IoUring::new(4).expect("setup");
+
+        // 50ms timeout with count=0 (pure timer)
+        let ts = Timespec::from_millis(50);
+        ring.push(Sqe::timeout(&raw const ts, 0, TimeoutFlags::default()).user_data(1))
+            .expect("push");
+        ring.submit_and_wait(1).expect("submit");
+
+        let cqe = ring.complete().expect("completion");
+        assert_eq!(cqe.user_data, 1);
+        // Timeout expiry returns -ETIME (62)
+        assert_eq!(cqe.result, -62);
     }
 
     #[cfg(not(miri))]

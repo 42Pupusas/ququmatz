@@ -1,6 +1,6 @@
 #![allow(clippy::cast_sign_loss)]
 
-use crate::types::{IoUringSqe, IoVec, Opcode, OpenFlags, SqeFlags};
+use crate::types::{IoUringSqe, IoVec, Opcode, OpenFlags, SqeFlags, TimeoutFlags, Timespec};
 
 /// A prepared submission queue entry, ready to be pushed onto the ring.
 ///
@@ -102,6 +102,61 @@ impl Sqe {
         Self(IoUringSqe {
             opcode: Opcode::Close.into(),
             fd,
+            ..IoUringSqe::default()
+        })
+    }
+
+    /// Prepare a timeout operation.
+    ///
+    /// Completes when either `count` completions have occurred or the timeout
+    /// expires, whichever comes first. Use `count = 0` for a pure timer.
+    #[must_use]
+    pub fn timeout(ts: *const Timespec, count: u32, flags: TimeoutFlags) -> Self {
+        Self(IoUringSqe {
+            opcode: Opcode::Timeout.into(),
+            addr: ts as u64,
+            len: 1,
+            off: u64::from(count),
+            op_flags: flags.bits(),
+            ..IoUringSqe::default()
+        })
+    }
+
+    /// Prepare a linked timeout.
+    ///
+    /// Must be submitted immediately after a linked SQE. If the timeout fires
+    /// before the linked operation completes, the linked operation is cancelled.
+    #[must_use]
+    pub fn link_timeout(ts: *const Timespec, flags: TimeoutFlags) -> Self {
+        Self(IoUringSqe {
+            opcode: Opcode::LinkTimeout.into(),
+            addr: ts as u64,
+            len: 1,
+            op_flags: flags.bits(),
+            ..IoUringSqe::default()
+        })
+    }
+
+    /// Prepare a timeout removal.
+    ///
+    /// Cancels a previously submitted timeout identified by its `user_data`.
+    #[must_use]
+    pub fn timeout_remove(target_user_data: u64) -> Self {
+        Self(IoUringSqe {
+            opcode: Opcode::TimeoutRemove.into(),
+            addr: target_user_data,
+            ..IoUringSqe::default()
+        })
+    }
+
+    /// Prepare an async cancellation.
+    ///
+    /// Cancels a previously submitted operation identified by its `user_data`.
+    #[must_use]
+    pub fn cancel(target_user_data: u64) -> Self {
+        Self(IoUringSqe {
+            opcode: Opcode::AsyncCancel.into(),
+            addr: target_user_data,
             ..IoUringSqe::default()
         })
     }
