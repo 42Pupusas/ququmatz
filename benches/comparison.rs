@@ -348,16 +348,12 @@ fn bench_writev(c: &mut Criterion) {
         let mut buf_b = [0xBBu8; 2048];
 
         g.bench_function("ququmatz", |b| {
-            let vecs = [
-                ququmatz::IoVec {
-                    base: buf_a.as_mut_ptr(),
-                    len: buf_a.len(),
-                },
-                ququmatz::IoVec {
-                    base: buf_b.as_mut_ptr(),
-                    len: buf_b.len(),
-                },
-            ];
+            let vecs = unsafe {
+                [
+                    ququmatz::IoVec::new(buf_a.as_mut_ptr(), buf_a.len()),
+                    ququmatz::IoVec::new(buf_b.as_mut_ptr(), buf_b.len()),
+                ]
+            };
             b.iter(|| {
                 ring.push(unsafe { ququmatz::Sqe::writev(fd, vecs.as_ptr(), 2, 0) }.user_data(1))
                     .unwrap();

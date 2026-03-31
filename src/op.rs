@@ -12,8 +12,9 @@ use crate::types::{
 /// then chain modifiers like `user_data()` before pushing.
 pub struct Sqe(pub(crate) IoUringSqe);
 
-/// Create a zeroed SQE. This is a single `const` value that the compiler can
-/// inline as an immediate, avoiding a runtime `memset` on every builder call.
+/// Create a zeroed SQE. All fields are integer primitives, so zero-init is
+/// valid. This `const` lets the compiler inline it as an immediate, avoiding
+/// a runtime `memset` on every builder call.
 const ZEROED: IoUringSqe = unsafe { core::mem::zeroed() };
 
 impl Sqe {

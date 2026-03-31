@@ -171,10 +171,7 @@ mod tests {
     #[test]
     fn sqe_builder_readv_places_fields_correctly() {
         let mut buf = [0u8; 8];
-        let vecs = [IoVec {
-            base: buf.as_mut_ptr(),
-            len: buf.len(),
-        }];
+        let vecs = [unsafe { IoVec::new(buf.as_mut_ptr(), buf.len()) }];
         let sqe = unsafe { Sqe::readv(3, vecs.as_ptr(), 1, 50) }.user_data(10);
         let inner = sqe.0;
 
@@ -374,6 +371,30 @@ mod tests {
     #[test]
     fn statx_layout() {
         assert_eq!(core::mem::size_of::<Statx>(), 256);
+        assert_eq!(mem::align_of::<Statx>(), 8);
+
+        assert_eq!(mem::offset_of!(Statx, stx_mask), 0);
+        assert_eq!(mem::offset_of!(Statx, stx_blksize), 4);
+        assert_eq!(mem::offset_of!(Statx, stx_attributes), 8);
+        assert_eq!(mem::offset_of!(Statx, stx_nlink), 16);
+        assert_eq!(mem::offset_of!(Statx, stx_uid), 20);
+        assert_eq!(mem::offset_of!(Statx, stx_gid), 24);
+        assert_eq!(mem::offset_of!(Statx, stx_mode), 28);
+        assert_eq!(mem::offset_of!(Statx, stx_ino), 32);
+        assert_eq!(mem::offset_of!(Statx, stx_size), 40);
+        assert_eq!(mem::offset_of!(Statx, stx_blocks), 48);
+        assert_eq!(mem::offset_of!(Statx, stx_attributes_mask), 56);
+        assert_eq!(mem::offset_of!(Statx, stx_atime), 64);
+        assert_eq!(mem::offset_of!(Statx, stx_btime), 80);
+        assert_eq!(mem::offset_of!(Statx, stx_ctime), 96);
+        assert_eq!(mem::offset_of!(Statx, stx_mtime), 112);
+        assert_eq!(mem::offset_of!(Statx, stx_rdev_major), 128);
+        assert_eq!(mem::offset_of!(Statx, stx_rdev_minor), 132);
+        assert_eq!(mem::offset_of!(Statx, stx_dev_major), 136);
+        assert_eq!(mem::offset_of!(Statx, stx_dev_minor), 140);
+        assert_eq!(mem::offset_of!(Statx, stx_mnt_id), 144);
+        assert_eq!(mem::offset_of!(Statx, stx_dio_mem_align), 152);
+        assert_eq!(mem::offset_of!(Statx, stx_dio_offset_align), 156);
     }
 
     #[cfg(not(miri))]
@@ -584,14 +605,8 @@ mod tests {
         let mut buf_a = *b"hello ";
         let mut buf_b = *b"world!";
         let write_vecs = [
-            IoVec {
-                base: buf_a.as_mut_ptr(),
-                len: buf_a.len(),
-            },
-            IoVec {
-                base: buf_b.as_mut_ptr(),
-                len: buf_b.len(),
-            },
+            unsafe { IoVec::new(buf_a.as_mut_ptr(), buf_a.len()) },
+            unsafe { IoVec::new(buf_b.as_mut_ptr(), buf_b.len()) },
         ];
         ring.push(unsafe { Sqe::writev(fd, write_vecs.as_ptr(), 2, 0) }.user_data(1))
             .expect("failed to push writev");
@@ -602,10 +617,7 @@ mod tests {
         assert_eq!(cqe.result as usize, buf_a.len() + buf_b.len());
 
         let mut read_buf = [0u8; 64];
-        let read_vecs = [IoVec {
-            base: read_buf.as_mut_ptr(),
-            len: read_buf.len(),
-        }];
+        let read_vecs = [unsafe { IoVec::new(read_buf.as_mut_ptr(), read_buf.len()) }];
         ring.push(unsafe { Sqe::readv(fd, read_vecs.as_ptr(), 1, 0) }.user_data(2))
             .expect("failed to push readv");
         ring.submit_and_wait(1).expect("failed to submit readv");
@@ -655,10 +667,7 @@ mod tests {
 
         // Create and register a buffer
         let mut buf = vec![0u8; 4096];
-        let iov = [IoVec {
-            base: buf.as_mut_ptr(),
-            len: buf.len(),
-        }];
+        let iov = [unsafe { IoVec::new(buf.as_mut_ptr(), buf.len()) }];
         ring.register_buffers(&iov).expect("register_buffers");
 
         // Write via fixed buffer

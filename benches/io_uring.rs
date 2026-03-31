@@ -122,16 +122,12 @@ fn bench_vectored_write(c: &mut Criterion) {
     let mut buf_b = [0xBBu8; 2048];
 
     c.bench_function("writev_2x2k", |b| {
-        let vecs = [
-            IoVec {
-                base: buf_a.as_mut_ptr(),
-                len: buf_a.len(),
-            },
-            IoVec {
-                base: buf_b.as_mut_ptr(),
-                len: buf_b.len(),
-            },
-        ];
+        let vecs = unsafe {
+            [
+                IoVec::new(buf_a.as_mut_ptr(), buf_a.len()),
+                IoVec::new(buf_b.as_mut_ptr(), buf_b.len()),
+            ]
+        };
         b.iter(|| {
             ring.push(unsafe { Sqe::writev(fd, vecs.as_ptr(), 2, 0) }.user_data(1))
                 .unwrap();

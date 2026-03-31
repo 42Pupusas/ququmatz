@@ -46,6 +46,32 @@ macro_rules! bitflags {
                 Self(self.0 | rhs.0)
             }
         }
+
+        impl core::ops::BitOrAssign for $Name {
+            fn bitor_assign(&mut self, rhs: Self) {
+                self.0 |= rhs.0;
+            }
+        }
+
+        impl core::ops::BitAnd for $Name {
+            type Output = Self;
+            fn bitand(self, rhs: Self) -> Self {
+                Self(self.0 & rhs.0)
+            }
+        }
+
+        impl core::ops::BitAndAssign for $Name {
+            fn bitand_assign(&mut self, rhs: Self) {
+                self.0 &= rhs.0;
+            }
+        }
+
+        impl core::ops::Not for $Name {
+            type Output = Self;
+            fn not(self) -> Self {
+                Self(!self.0)
+            }
+        }
     };
 }
 
@@ -398,11 +424,47 @@ impl CqeFlags {
 pub type RawFd = i32;
 
 /// I/O vector for vectored read/write operations.
+///
+/// Fields are private because an `IoVec` with a dangling or mismatched
+/// pointer/length is instant UB when submitted to the kernel. Use
+/// [`new`](Self::new) to construct.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct IoVec {
-    pub base: *mut u8,
-    pub len: usize,
+    base: *mut u8,
+    len: usize,
+}
+
+impl IoVec {
+    /// Create a new I/O vector from a pointer and length.
+    ///
+    /// # Safety
+    ///
+    /// `base` must point to at least `len` bytes of valid memory that
+    /// remains valid for the duration of any I/O operation that uses
+    /// this vector.
+    #[must_use]
+    pub const unsafe fn new(base: *mut u8, len: usize) -> Self {
+        Self { base, len }
+    }
+
+    /// Returns the base pointer.
+    #[must_use]
+    pub const fn base(&self) -> *mut u8 {
+        self.base
+    }
+
+    /// Returns the length in bytes.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns `true` if the length is zero.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 /// Kernel timespec for timeout operations.
@@ -690,4 +752,11 @@ pub struct MsgHdr {
     pub msg_flags: i32,
     /// Trailing padding after i32 `msg_flags` for 8-byte struct alignment.
     pub(crate) _pad2: u32,
+}
+
+impl Default for MsgHdr {
+    fn default() -> Self {
+        // Safety: all fields are integer or pointer types; zero is valid.
+        unsafe { core::mem::zeroed() }
+    }
 }

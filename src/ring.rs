@@ -224,6 +224,11 @@ impl IoUring {
         let sq_flags = unsafe { sq_base.add(params.sq_off.flags as usize) }.cast::<AtomicU32>();
         let sq_array = unsafe { sq_base.add(params.sq_off.array as usize) } as *mut u32;
 
+        debug_assert!(sq_head.is_aligned(), "sq_head not aligned");
+        debug_assert!(sq_tail.is_aligned(), "sq_tail not aligned");
+        debug_assert!(sq_flags.is_aligned(), "sq_flags not aligned");
+        debug_assert!(sq_array.is_aligned(), "sq_array not aligned");
+
         // Pre-fill sq_array with identity mapping (sqe[i] -> slot i).
         // The kernel reads sq_array to find which SQE slot each submission
         // refers to. With identity mapping we never need to update it again.
@@ -236,6 +241,10 @@ impl IoUring {
         let cq_tail = unsafe { cq_base.add(params.cq_off.tail as usize) }.cast::<AtomicU32>();
         let cq_mask = unsafe { *cq_base.add(params.cq_off.ring_mask as usize).cast::<u32>() };
         let cqes = unsafe { cq_base.add(params.cq_off.cqes as usize) }.cast::<IoUringCqe>();
+
+        debug_assert!(cq_head.is_aligned(), "cq_head not aligned");
+        debug_assert!(cq_tail.is_aligned(), "cq_tail not aligned");
+        debug_assert!(cqes.is_aligned(), "cqes not aligned");
 
         let sq_tail_local = unsafe { &*sq_tail }.load(Ordering::Acquire);
         let cq_head_local = unsafe { &*cq_head }.load(Ordering::Acquire);
@@ -332,6 +341,12 @@ impl IoUring {
     /// Submit all queued entries and wait for at least `min_complete` completions.
     ///
     /// Returns the number of entries submitted.
+    ///
+    /// **Important:** Unlike [`submit`](Self::submit), this method always calls
+    /// `io_uring_enter` — even when no entries have been pushed — because it
+    /// needs to wait for `min_complete` completions. If you call this with
+    /// `min_complete > 0` and no completions are forthcoming (e.g., you forgot
+    /// to push any SQEs), it will block indefinitely.
     ///
     /// # Errors
     ///
