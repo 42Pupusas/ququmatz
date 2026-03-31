@@ -1,4 +1,53 @@
-use core::ops::BitOr;
+// ---------------------------------------------------------------------------
+// Bitflag newtype macro — eliminates per-type boilerplate.
+// ---------------------------------------------------------------------------
+
+macro_rules! bitflags {
+    (
+        $(#[$meta:meta])*
+        $vis:vis struct $Name:ident($inner:ty);
+        $(
+            $(#[$cmeta:meta])*
+            const $FLAG:ident = $value:expr;
+        )*
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+        $vis struct $Name($inner);
+
+        impl $Name {
+            $(
+                $(#[$cmeta])*
+                pub const $FLAG: Self = Self($value);
+            )*
+
+            /// Returns the raw underlying value.
+            #[must_use]
+            pub const fn bits(self) -> $inner {
+                self.0
+            }
+
+            /// Check whether all bits in `flag` are set.
+            #[must_use]
+            pub const fn contains(self, flag: Self) -> bool {
+                (self.0 & flag.0) == flag.0
+            }
+        }
+
+        impl PartialEq<$inner> for $Name {
+            fn eq(&self, other: &$inner) -> bool {
+                self.0 == *other
+            }
+        }
+
+        impl core::ops::BitOr for $Name {
+            type Output = Self;
+            fn bitor(self, rhs: Self) -> Self {
+                Self(self.0 | rhs.0)
+            }
+        }
+    };
+}
 
 // ---------------------------------------------------------------------------
 // io_uring opcodes
@@ -56,115 +105,56 @@ impl From<Opcode> for u8 {
 // io_uring_enter flags
 // ---------------------------------------------------------------------------
 
-/// Flags for `io_uring_enter`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct EnterFlags(u32);
-
-impl EnterFlags {
-    pub const GETEVENTS: Self = Self(1 << 0);
-
-    #[must_use]
-    pub const fn bits(self) -> u32 {
-        self.0
-    }
-}
-
-impl PartialEq<u32> for EnterFlags {
-    fn eq(&self, other: &u32) -> bool {
-        self.0 == *other
-    }
-}
-
-impl BitOr for EnterFlags {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
-    }
+bitflags! {
+    /// Flags for `io_uring_enter`.
+    pub struct EnterFlags(u32);
+    const GETEVENTS = 1 << 0;
 }
 
 // ---------------------------------------------------------------------------
 // io_uring setup flags
 // ---------------------------------------------------------------------------
 
-/// Flags for `io_uring_setup`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct SetupFlags(u32);
-
-impl SetupFlags {
+bitflags! {
+    /// Flags for `io_uring_setup`.
+    pub struct SetupFlags(u32);
     /// Kernel-side SQ polling thread.
-    pub const SQPOLL: Self = Self(1 << 1);
+    const SQPOLL = 1 << 1;
     /// Bind SQPOLL thread to a specific CPU.
-    pub const SQ_AFF: Self = Self(1 << 2);
+    const SQ_AFF = 1 << 2;
     /// Use user-specified CQ ring size.
-    pub const CQSIZE: Self = Self(1 << 3);
+    const CQSIZE = 1 << 3;
     /// Clamp SQ/CQ ring sizes to implementation limits.
-    pub const CLAMP: Self = Self(1 << 4);
+    const CLAMP = 1 << 4;
     /// Attach to an existing workqueue.
-    pub const ATTACH_WQ: Self = Self(1 << 5);
+    const ATTACH_WQ = 1 << 5;
     /// Single-issuer hint (5.18+).
-    pub const SINGLE_ISSUER: Self = Self(1 << 12);
-
-    #[must_use]
-    pub const fn bits(self) -> u32 {
-        self.0
-    }
-}
-
-impl PartialEq<u32> for SetupFlags {
-    fn eq(&self, other: &u32) -> bool {
-        self.0 == *other
-    }
-}
-
-impl BitOr for SetupFlags {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
-    }
+    const SINGLE_ISSUER = 1 << 12;
 }
 
 // ---------------------------------------------------------------------------
 // io_uring feature flags (returned by kernel in params.features)
 // ---------------------------------------------------------------------------
 
-/// Feature flags reported by the kernel after `io_uring_setup`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Features(pub(crate) u32);
+bitflags! {
+    /// Feature flags reported by the kernel after `io_uring_setup`.
+    pub struct Features(u32);
+    const SINGLE_MMAP = 1 << 0;
+    const NODROP = 1 << 1;
+    const SUBMIT_STABLE = 1 << 2;
+    const RW_CUR_POS = 1 << 3;
+    const CUR_PERSONALITY = 1 << 4;
+    const FAST_POLL = 1 << 5;
+    const POLL_32BITS = 1 << 6;
+    const SQPOLL_NONFIXED = 1 << 7;
+    const EXT_ARG = 1 << 8;
+    const NATIVE_WORKERS = 1 << 9;
+}
 
 impl Features {
-    pub const SINGLE_MMAP: Self = Self(1 << 0);
-    pub const NODROP: Self = Self(1 << 1);
-    pub const SUBMIT_STABLE: Self = Self(1 << 2);
-    pub const RW_CUR_POS: Self = Self(1 << 3);
-    pub const CUR_PERSONALITY: Self = Self(1 << 4);
-    pub const FAST_POLL: Self = Self(1 << 5);
-    pub const POLL_32BITS: Self = Self(1 << 6);
-    pub const SQPOLL_NONFIXED: Self = Self(1 << 7);
-    pub const EXT_ARG: Self = Self(1 << 8);
-    pub const NATIVE_WORKERS: Self = Self(1 << 9);
-
-    #[must_use]
-    pub const fn bits(self) -> u32 {
-        self.0
-    }
-
-    /// Check if a specific feature flag is set.
-    #[must_use]
-    pub const fn contains(self, flag: Self) -> bool {
-        (self.0 & flag.0) == flag.0
-    }
-}
-
-impl PartialEq<u32> for Features {
-    fn eq(&self, other: &u32) -> bool {
-        self.0 == *other
-    }
-}
-
-impl BitOr for Features {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
+    /// Construct from the raw value returned by the kernel.
+    pub(crate) const fn from_raw(raw: u32) -> Self {
+        Self(raw)
     }
 }
 
@@ -172,45 +162,19 @@ impl BitOr for Features {
 // SQE flags (for linking, drain, async)
 // ---------------------------------------------------------------------------
 
-/// Flags set on individual SQEs to control execution ordering and behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct SqeFlags(u8);
-
-impl SqeFlags {
-    /// Drain the submission queue before executing this SQE.
-    pub const IO_DRAIN: Self = Self(1 << 1);
-    /// Link this SQE to the next one — if this fails, the next is cancelled.
-    pub const IO_LINK: Self = Self(1 << 2);
-    /// Hard-link: like `IO_LINK` but the chain continues even on failure.
-    pub const IO_HARDLINK: Self = Self(1 << 3);
-    /// Force async execution even if the op could complete inline.
-    pub const IO_ASYNC: Self = Self(1 << 4);
+bitflags! {
+    /// Flags set on individual SQEs to control execution ordering and behavior.
+    pub struct SqeFlags(u8);
     /// Use a registered/fixed file descriptor.
-    pub const FIXED_FILE: Self = Self(1 << 0);
-
-    #[must_use]
-    pub const fn bits(self) -> u8 {
-        self.0
-    }
-}
-
-impl PartialEq<u8> for SqeFlags {
-    fn eq(&self, other: &u8) -> bool {
-        self.0 == *other
-    }
-}
-
-impl From<SqeFlags> for u8 {
-    fn from(f: SqeFlags) -> Self {
-        f.0
-    }
-}
-
-impl BitOr for SqeFlags {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
-    }
+    const FIXED_FILE = 1 << 0;
+    /// Drain the submission queue before executing this SQE.
+    const IO_DRAIN = 1 << 1;
+    /// Link this SQE to the next one — if this fails, the next is cancelled.
+    const IO_LINK = 1 << 2;
+    /// Hard-link: like `IO_LINK` but the chain continues even on failure.
+    const IO_HARDLINK = 1 << 3;
+    /// Force async execution even if the op could complete inline.
+    const IO_ASYNC = 1 << 4;
 }
 
 // ---------------------------------------------------------------------------
@@ -238,62 +202,22 @@ impl From<RegisterOp> for u32 {
 // mmap protection flags
 // ---------------------------------------------------------------------------
 
-/// Memory protection flags for `mmap`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Prot(i32);
-
-impl Prot {
-    pub const READ: Self = Self(0x1);
-    pub const WRITE: Self = Self(0x2);
-
-    #[must_use]
-    pub const fn bits(self) -> i32 {
-        self.0
-    }
-}
-
-impl PartialEq<i32> for Prot {
-    fn eq(&self, other: &i32) -> bool {
-        self.0 == *other
-    }
-}
-
-impl BitOr for Prot {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
-    }
+bitflags! {
+    /// Memory protection flags for `mmap`.
+    pub struct Prot(u32);
+    const READ = 0x1;
+    const WRITE = 0x2;
 }
 
 // ---------------------------------------------------------------------------
 // mmap mapping flags
 // ---------------------------------------------------------------------------
 
-/// Mapping flags for `mmap`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct MapFlags(i32);
-
-impl MapFlags {
-    pub const SHARED: Self = Self(0x01);
-    pub const POPULATE: Self = Self(0x0000_8000);
-
-    #[must_use]
-    pub const fn bits(self) -> i32 {
-        self.0
-    }
-}
-
-impl PartialEq<i32> for MapFlags {
-    fn eq(&self, other: &i32) -> bool {
-        self.0 == *other
-    }
-}
-
-impl BitOr for MapFlags {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
-    }
+bitflags! {
+    /// Mapping flags for `mmap`.
+    pub struct MapFlags(u32);
+    const SHARED = 0x01;
+    const POPULATE = 0x0000_8000;
 }
 
 // ---------------------------------------------------------------------------
@@ -325,35 +249,15 @@ impl From<RingOffset> for u64 {
 // openat flags
 // ---------------------------------------------------------------------------
 
-/// File open flags for `openat`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct OpenFlags(i32);
-
-impl OpenFlags {
-    pub const RDONLY: Self = Self(0);
-    pub const WRONLY: Self = Self(1);
-    pub const RDWR: Self = Self(2);
-    pub const CREAT: Self = Self(0o100);
-    pub const TRUNC: Self = Self(0o1000);
-    pub const TMPFILE: Self = Self(0o20_200_000);
-
-    #[must_use]
-    pub const fn bits(self) -> i32 {
-        self.0
-    }
-}
-
-impl PartialEq<i32> for OpenFlags {
-    fn eq(&self, other: &i32) -> bool {
-        self.0 == *other
-    }
-}
-
-impl BitOr for OpenFlags {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
-    }
+bitflags! {
+    /// File open flags for `openat`.
+    pub struct OpenFlags(u32);
+    const RDONLY = 0;
+    const WRONLY = 1;
+    const RDWR = 2;
+    const CREAT = 0o100;
+    const TRUNC = 0o1000;
+    const TMPFILE = 0o20_200_000;
 }
 
 /// Special directory fd meaning "current working directory".
@@ -363,31 +267,18 @@ pub const AT_FDCWD: i32 = -100;
 // File mode bits
 // ---------------------------------------------------------------------------
 
-/// File permission mode bits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct FileMode(u32);
-
-impl FileMode {
-    pub const OWNER_READ: Self = Self(0o400);
-    pub const OWNER_WRITE: Self = Self(0o200);
-
-    #[must_use]
-    pub const fn bits(self) -> u32 {
-        self.0
-    }
-}
-
-impl PartialEq<u32> for FileMode {
-    fn eq(&self, other: &u32) -> bool {
-        self.0 == *other
-    }
-}
-
-impl BitOr for FileMode {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
-    }
+bitflags! {
+    /// File permission mode bits.
+    pub struct FileMode(u32);
+    const OWNER_READ = 0o400;
+    const OWNER_WRITE = 0o200;
+    const OWNER_EXEC = 0o100;
+    const GROUP_READ = 0o040;
+    const GROUP_WRITE = 0o020;
+    const GROUP_EXEC = 0o010;
+    const OTHER_READ = 0o004;
+    const OTHER_WRITE = 0o002;
+    const OTHER_EXEC = 0o001;
 }
 
 // ---------------------------------------------------------------------------
@@ -500,7 +391,10 @@ impl Timespec {
     /// Panics in debug builds if `nsec` is not in `0..1_000_000_000`.
     #[must_use]
     pub const fn new(sec: i64, nsec: i64) -> Self {
-        debug_assert!(nsec >= 0 && nsec < 1_000_000_000, "nsec out of range 0..1_000_000_000");
+        debug_assert!(
+            nsec >= 0 && nsec < 1_000_000_000,
+            "nsec out of range 0..1_000_000_000"
+        );
         Self {
             tv_sec: sec,
             tv_nsec: nsec,
@@ -522,202 +416,82 @@ impl Timespec {
 // Timeout flags
 // ---------------------------------------------------------------------------
 
-/// Flags for timeout operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct TimeoutFlags(u32);
-
-impl TimeoutFlags {
+bitflags! {
+    /// Flags for timeout operations.
+    pub struct TimeoutFlags(u32);
     /// Use an absolute timeout instead of relative.
-    pub const ABS: Self = Self(1 << 0);
-
-    #[must_use]
-    pub const fn bits(self) -> u32 {
-        self.0
-    }
-}
-
-impl PartialEq<u32> for TimeoutFlags {
-    fn eq(&self, other: &u32) -> bool {
-        self.0 == *other
-    }
-}
-
-impl BitOr for TimeoutFlags {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
-    }
+    const ABS = 1 << 0;
 }
 
 // ---------------------------------------------------------------------------
 // Fsync flags
 // ---------------------------------------------------------------------------
 
-/// Flags for fsync operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct FsyncFlags(u32);
-
-impl FsyncFlags {
+bitflags! {
+    /// Flags for fsync operations.
+    pub struct FsyncFlags(u32);
     /// Only sync file data, not metadata (fdatasync behavior).
-    pub const DATASYNC: Self = Self(1 << 0);
-
-    #[must_use]
-    pub const fn bits(self) -> u32 {
-        self.0
-    }
-}
-
-impl PartialEq<u32> for FsyncFlags {
-    fn eq(&self, other: &u32) -> bool {
-        self.0 == *other
-    }
-}
-
-impl BitOr for FsyncFlags {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
-    }
+    const DATASYNC = 1 << 0;
 }
 
 // ---------------------------------------------------------------------------
 // Poll mask
 // ---------------------------------------------------------------------------
 
-/// Event mask for poll operations (matches Linux poll event bits).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct PollMask(u32);
-
-impl PollMask {
-    pub const IN: Self = Self(0x0001);
-    pub const OUT: Self = Self(0x0004);
-    pub const ERR: Self = Self(0x0008);
-    pub const HUP: Self = Self(0x0010);
-    pub const RDHUP: Self = Self(0x2000);
-
-    #[must_use]
-    pub const fn bits(self) -> u32 {
-        self.0
-    }
-}
-
-impl PartialEq<u32> for PollMask {
-    fn eq(&self, other: &u32) -> bool {
-        self.0 == *other
-    }
-}
-
-impl BitOr for PollMask {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
-    }
+bitflags! {
+    /// Event mask for poll operations (matches Linux poll event bits).
+    pub struct PollMask(u32);
+    const IN = 0x0001;
+    const OUT = 0x0004;
+    const ERR = 0x0008;
+    const HUP = 0x0010;
+    const RDHUP = 0x2000;
 }
 
 // ---------------------------------------------------------------------------
 // Fallocate mode
 // ---------------------------------------------------------------------------
 
-/// Mode flags for fallocate operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct FallocateMode(i32);
-
-impl FallocateMode {
+bitflags! {
+    /// Mode flags for fallocate operations.
+    pub struct FallocateMode(u32);
     /// Default mode: allocate space.
-    pub const NONE: Self = Self(0);
+    const NONE = 0;
     /// Keep file size unchanged.
-    pub const KEEP_SIZE: Self = Self(0x01);
+    const KEEP_SIZE = 0x01;
     /// Punch a hole (deallocate).
-    pub const PUNCH_HOLE: Self = Self(0x02);
+    const PUNCH_HOLE = 0x02;
     /// Zero a range (do not deallocate).
-    pub const ZERO_RANGE: Self = Self(0x10);
-
-    #[must_use]
-    pub const fn bits(self) -> i32 {
-        self.0
-    }
-}
-
-impl PartialEq<i32> for FallocateMode {
-    fn eq(&self, other: &i32) -> bool {
-        self.0 == *other
-    }
-}
-
-impl BitOr for FallocateMode {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
-    }
+    const ZERO_RANGE = 0x10;
 }
 
 // ---------------------------------------------------------------------------
 // Statx
 // ---------------------------------------------------------------------------
 
-/// Flags for statx requests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct StatxFlags(i32);
-
-impl StatxFlags {
-    pub const EMPTY_PATH: Self = Self(0x1000);
-    pub const SYMLINK_NOFOLLOW: Self = Self(0x100);
-
-    #[must_use]
-    pub const fn bits(self) -> i32 {
-        self.0
-    }
+bitflags! {
+    /// Flags for statx requests.
+    pub struct StatxFlags(u32);
+    const EMPTY_PATH = 0x1000;
+    const SYMLINK_NOFOLLOW = 0x100;
 }
 
-impl PartialEq<i32> for StatxFlags {
-    fn eq(&self, other: &i32) -> bool {
-        self.0 == *other
-    }
-}
-
-impl BitOr for StatxFlags {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
-    }
-}
-
-/// Mask for which statx fields to populate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct StatxMask(u32);
-
-impl StatxMask {
-    pub const TYPE: Self = Self(0x0001);
-    pub const MODE: Self = Self(0x0002);
-    pub const NLINK: Self = Self(0x0004);
-    pub const UID: Self = Self(0x0008);
-    pub const GID: Self = Self(0x0010);
-    pub const ATIME: Self = Self(0x0020);
-    pub const MTIME: Self = Self(0x0040);
-    pub const CTIME: Self = Self(0x0080);
-    pub const INO: Self = Self(0x0100);
-    pub const SIZE: Self = Self(0x0200);
-    pub const BLOCKS: Self = Self(0x0400);
-    pub const BASIC_STATS: Self = Self(0x07FF);
-    pub const ALL: Self = Self(0x0FFF);
-
-    #[must_use]
-    pub const fn bits(self) -> u32 {
-        self.0
-    }
-}
-
-impl PartialEq<u32> for StatxMask {
-    fn eq(&self, other: &u32) -> bool {
-        self.0 == *other
-    }
-}
-
-impl BitOr for StatxMask {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
-    }
+bitflags! {
+    /// Mask for which statx fields to populate.
+    pub struct StatxMask(u32);
+    const TYPE = 0x0001;
+    const MODE = 0x0002;
+    const NLINK = 0x0004;
+    const UID = 0x0008;
+    const GID = 0x0010;
+    const ATIME = 0x0020;
+    const MTIME = 0x0040;
+    const CTIME = 0x0080;
+    const INO = 0x0100;
+    const SIZE = 0x0200;
+    const BLOCKS = 0x0400;
+    const BASIC_STATS = 0x07FF;
+    const ALL = 0x0FFF;
 }
 
 /// Kernel `statx` timestamp.
@@ -763,58 +537,18 @@ pub struct Statx {
 // Rename / unlink flags
 // ---------------------------------------------------------------------------
 
-/// Flags for renameat2.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct RenameFlags(u32);
-
-impl RenameFlags {
-    pub const NOREPLACE: Self = Self(1 << 0);
-    pub const EXCHANGE: Self = Self(1 << 1);
-
-    #[must_use]
-    pub const fn bits(self) -> u32 {
-        self.0
-    }
+bitflags! {
+    /// Flags for renameat2.
+    pub struct RenameFlags(u32);
+    const NOREPLACE = 1 << 0;
+    const EXCHANGE = 1 << 1;
 }
 
-impl PartialEq<u32> for RenameFlags {
-    fn eq(&self, other: &u32) -> bool {
-        self.0 == *other
-    }
-}
-
-impl BitOr for RenameFlags {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
-    }
-}
-
-/// Flags for unlinkat.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct UnlinkFlags(i32);
-
-impl UnlinkFlags {
+bitflags! {
+    /// Flags for unlinkat.
+    pub struct UnlinkFlags(u32);
     /// Remove a directory instead of a file.
-    pub const REMOVEDIR: Self = Self(0x200);
-
-    #[must_use]
-    pub const fn bits(self) -> i32 {
-        self.0
-    }
-}
-
-impl PartialEq<i32> for UnlinkFlags {
-    fn eq(&self, other: &i32) -> bool {
-        self.0 == *other
-    }
-}
-
-impl BitOr for UnlinkFlags {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
-    }
+    const REMOVEDIR = 0x200;
 }
 
 // ---------------------------------------------------------------------------
@@ -836,73 +570,33 @@ pub const SO_REUSEADDR: i32 = 2;
 
 /// Shutdown modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i32)]
+#[repr(u32)]
 pub enum ShutdownHow {
     Read = 0,
     Write = 1,
     Both = 2,
 }
 
-impl From<ShutdownHow> for i32 {
+impl From<ShutdownHow> for u32 {
     fn from(how: ShutdownHow) -> Self {
         how as Self
     }
 }
 
-/// Send/recv flags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct MsgFlags(i32);
-
-impl MsgFlags {
-    pub const NONE: Self = Self(0);
-    pub const DONTWAIT: Self = Self(0x40);
-    pub const NOSIGNAL: Self = Self(0x4000);
-    pub const WAITALL: Self = Self(0x100);
-
-    #[must_use]
-    pub const fn bits(self) -> i32 {
-        self.0
-    }
+bitflags! {
+    /// Send/recv flags.
+    pub struct MsgFlags(u32);
+    const NONE = 0;
+    const DONTWAIT = 0x40;
+    const NOSIGNAL = 0x4000;
+    const WAITALL = 0x100;
 }
 
-impl PartialEq<i32> for MsgFlags {
-    fn eq(&self, other: &i32) -> bool {
-        self.0 == *other
-    }
-}
-
-impl BitOr for MsgFlags {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
-    }
-}
-
-/// Accept flags (same as socket flags that make sense for accept4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct AcceptFlags(i32);
-
-impl AcceptFlags {
-    pub const NONE: Self = Self(0);
-    pub const NONBLOCK: Self = Self(SOCK_NONBLOCK);
-
-    #[must_use]
-    pub const fn bits(self) -> i32 {
-        self.0
-    }
-}
-
-impl PartialEq<i32> for AcceptFlags {
-    fn eq(&self, other: &i32) -> bool {
-        self.0 == *other
-    }
-}
-
-impl BitOr for AcceptFlags {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
-    }
+bitflags! {
+    /// Accept flags (same as socket flags that make sense for accept4).
+    pub struct AcceptFlags(u32);
+    const NONE = 0;
+    const NONBLOCK = 0o4000;
 }
 
 /// IPv4 socket address.

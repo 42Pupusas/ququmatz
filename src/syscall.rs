@@ -93,14 +93,7 @@ unsafe fn syscall4(nr: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> isi
 }
 
 #[inline]
-unsafe fn syscall5(
-    nr: usize,
-    a1: usize,
-    a2: usize,
-    a3: usize,
-    a4: usize,
-    a5: usize,
-) -> isize {
+unsafe fn syscall5(nr: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
     let ret: isize;
     unsafe {
         asm!(

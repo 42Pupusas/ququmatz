@@ -155,7 +155,7 @@ mod tests {
                 types::AT_FDCWD,
                 path.as_ptr().cast(),
                 OpenFlags::RDONLY,
-                0o644,
+                FileMode::OWNER_READ | FileMode::OWNER_WRITE | FileMode::GROUP_READ | FileMode::OTHER_READ,
             )
         }
         .user_data(77);
@@ -165,7 +165,7 @@ mod tests {
         assert_eq!(inner.fd, types::AT_FDCWD);
         assert_eq!(inner.addr, path.as_ptr() as u64);
         assert_eq!(inner.len, 0o644);
-        assert_eq!(inner.op_flags, OpenFlags::RDONLY.bits() as u32);
+        assert_eq!(inner.op_flags, OpenFlags::RDONLY.bits());
         assert_eq!(inner.user_data, 77);
     }
 
@@ -505,8 +505,10 @@ mod tests {
         let fd = open_tmpfile();
 
         let write_buf = b"hello io_uring!";
-        ring.push(unsafe { Sqe::write(fd, write_buf.as_ptr(), write_buf.len() as u32, 0) }.user_data(1))
-            .expect("failed to push write");
+        ring.push(
+            unsafe { Sqe::write(fd, write_buf.as_ptr(), write_buf.len() as u32, 0) }.user_data(1),
+        )
+        .expect("failed to push write");
         ring.submit_and_wait(1).expect("failed to submit write");
 
         let cqe = ring.complete().expect("expected write completion");
@@ -514,8 +516,10 @@ mod tests {
         assert_eq!(cqe.result, write_buf.len() as i32);
 
         let mut read_buf = [0u8; 64];
-        ring.push(unsafe { Sqe::read(fd, read_buf.as_mut_ptr(), read_buf.len() as u32, 0) }.user_data(2))
-            .expect("failed to push read");
+        ring.push(
+            unsafe { Sqe::read(fd, read_buf.as_mut_ptr(), read_buf.len() as u32, 0) }.user_data(2),
+        )
+        .expect("failed to push read");
         ring.submit_and_wait(1).expect("failed to submit read");
 
         let cqe = ring.complete().expect("expected read completion");
@@ -621,8 +625,10 @@ mod tests {
         // Write via fixed buffer
         let msg = b"fixed buffer write!";
         buf[..msg.len()].copy_from_slice(msg);
-        ring.push(unsafe { Sqe::write_fixed(fd, buf.as_ptr(), msg.len() as u32, 0, 0) }.user_data(1))
-            .expect("push write_fixed");
+        ring.push(
+            unsafe { Sqe::write_fixed(fd, buf.as_ptr(), msg.len() as u32, 0, 0) }.user_data(1),
+        )
+        .expect("push write_fixed");
         ring.submit_and_wait(1).expect("submit");
         let cqe = ring.complete().expect("write cqe");
         assert_eq!(cqe.user_data, 1);
@@ -630,8 +636,10 @@ mod tests {
 
         // Read back via fixed buffer
         buf.fill(0);
-        ring.push(unsafe { Sqe::read_fixed(fd, buf.as_mut_ptr(), msg.len() as u32, 0, 0) }.user_data(2))
-            .expect("push read_fixed");
+        ring.push(
+            unsafe { Sqe::read_fixed(fd, buf.as_mut_ptr(), msg.len() as u32, 0, 0) }.user_data(2),
+        )
+        .expect("push read_fixed");
         ring.submit_and_wait(1).expect("submit");
         let cqe = ring.complete().expect("read cqe");
         assert_eq!(cqe.user_data, 2);
@@ -645,7 +653,7 @@ mod tests {
     #[cfg(not(miri))]
     #[test]
     fn registered_files() {
-        let ring = IoUring::new(4).expect("setup");
+        let mut ring = IoUring::new(4).expect("setup");
         let fd = open_tmpfile();
 
         ring.register_files(&[fd]).expect("register_files");
@@ -686,12 +694,8 @@ mod tests {
         // Retrieve the actual port assigned by the kernel
         let mut bound_addr = SockAddrIn::default();
         let mut addrlen = core::mem::size_of::<SockAddrIn>() as u32;
-        syscall::getsockname(
-            fd as usize,
-            (&raw mut bound_addr).cast(),
-            &raw mut addrlen,
-        )
-        .expect("getsockname");
+        syscall::getsockname(fd as usize, (&raw mut bound_addr).cast(), &raw mut addrlen)
+            .expect("getsockname");
 
         (fd, u16::from_be(bound_addr.sin_port))
     }
@@ -757,8 +761,11 @@ mod tests {
 
         // Send from client, recv on server
         let msg = b"hello from io_uring!";
-        ring.push(unsafe { Sqe::send(client, msg.as_ptr(), msg.len() as u32, MsgFlags::NONE) }.user_data(3))
-            .expect("push send");
+        ring.push(
+            unsafe { Sqe::send(client, msg.as_ptr(), msg.len() as u32, MsgFlags::NONE) }
+                .user_data(3),
+        )
+        .expect("push send");
         ring.submit_and_wait(1).expect("submit send");
         let cqe = ring.complete().expect("send cqe");
         assert_eq!(cqe.user_data, 3);

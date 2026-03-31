@@ -1,9 +1,9 @@
 #![allow(clippy::cast_sign_loss)]
 
 use crate::types::{
-    AcceptFlags, FallocateMode, FsyncFlags, IoUringSqe, IoVec, MsgFlags, MsgHdr, Opcode, OpenFlags,
-    PollMask, RenameFlags, ShutdownHow, SqeFlags, StatxFlags, StatxMask, TimeoutFlags, Timespec,
-    UnlinkFlags,
+    AcceptFlags, FallocateMode, FileMode, FsyncFlags, IoUringSqe, IoVec, MsgFlags, MsgHdr, Opcode,
+    OpenFlags, PollMask, RenameFlags, ShutdownHow, SqeFlags, StatxFlags, StatxMask, TimeoutFlags,
+    Timespec, UnlinkFlags,
 };
 
 /// A prepared submission queue entry, ready to be pushed onto the ring.
@@ -113,13 +113,13 @@ impl Sqe {
     /// `path` must be a valid, null-terminated C string that remains valid
     /// until the operation completes.
     #[must_use]
-    pub unsafe fn openat(dfd: i32, path: *const u8, flags: OpenFlags, mode: u32) -> Self {
+    pub unsafe fn openat(dfd: i32, path: *const u8, flags: OpenFlags, mode: FileMode) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Openat.into();
         sqe.fd = dfd;
         sqe.addr = path as u64;
-        sqe.len = mode;
-        sqe.op_flags = flags.bits() as u32;
+        sqe.len = mode.bits();
+        sqe.op_flags = flags.bits();
         Self(sqe)
     }
 
@@ -163,7 +163,13 @@ impl Sqe {
     /// within the registered buffer at `buf_index`, and must remain valid
     /// until the operation completes.
     #[must_use]
-    pub unsafe fn write_fixed(fd: i32, buf: *const u8, len: u32, offset: u64, buf_index: u16) -> Self {
+    pub unsafe fn write_fixed(
+        fd: i32,
+        buf: *const u8,
+        len: u32,
+        offset: u64,
+        buf_index: u16,
+    ) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::WriteFixed.into();
         sqe.fd = fd;
@@ -255,7 +261,6 @@ impl Sqe {
     ///
     /// Waits for events matching `mask` on the given fd.
     #[must_use]
-    #[allow(clippy::cast_sign_loss)]
     pub fn poll_add(fd: i32, mask: PollMask) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::PollAdd.into();
@@ -277,14 +282,13 @@ impl Sqe {
 
     /// Prepare a fallocate operation.
     #[must_use]
-    #[allow(clippy::cast_sign_loss)]
     pub fn fallocate(fd: i32, mode: FallocateMode, offset: u64, len: u64) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Fallocate.into();
         sqe.fd = fd;
         sqe.off = offset;
         sqe.addr = len;
-        sqe.len = mode.bits() as u32;
+        sqe.len = mode.bits();
         Self(sqe)
     }
 
@@ -298,7 +302,6 @@ impl Sqe {
     /// point to a valid `Statx`. Both must remain valid until the operation
     /// completes.
     #[must_use]
-    #[allow(clippy::cast_sign_loss)]
     pub unsafe fn statx(
         dfd: i32,
         path: *const u8,
@@ -312,7 +315,7 @@ impl Sqe {
         sqe.off = statx_buf as u64;
         sqe.addr = path as u64;
         sqe.len = mask.bits();
-        sqe.op_flags = flags.bits() as u32;
+        sqe.op_flags = flags.bits();
         Self(sqe)
     }
 
@@ -334,6 +337,7 @@ impl Sqe {
         sqe.opcode = Opcode::Renameat.into();
         sqe.fd = old_dfd;
         sqe.addr = old_path as u64;
+        // Kernel reads sqe.len as the new directory fd (reinterpreted as i32).
         sqe.len = new_dfd as u32;
         sqe.off = new_path as u64;
         sqe.op_flags = flags.bits();
@@ -347,13 +351,12 @@ impl Sqe {
     /// `path` must be a valid, null-terminated C string that remains valid
     /// until the operation completes.
     #[must_use]
-    #[allow(clippy::cast_sign_loss)]
     pub unsafe fn unlinkat(dfd: i32, path: *const u8, flags: UnlinkFlags) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Unlinkat.into();
         sqe.fd = dfd;
         sqe.addr = path as u64;
-        sqe.op_flags = flags.bits() as u32;
+        sqe.op_flags = flags.bits();
         Self(sqe)
     }
 
@@ -368,14 +371,13 @@ impl Sqe {
     /// address and `addrlen` must point to its size. Both must remain valid
     /// until the operation completes.
     #[must_use]
-    #[allow(clippy::cast_sign_loss)]
     pub unsafe fn accept(fd: i32, addr: *mut u8, addrlen: *mut u32, flags: AcceptFlags) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Accept.into();
         sqe.fd = fd;
         sqe.addr = addr as u64;
         sqe.off = addrlen as u64;
-        sqe.op_flags = flags.bits() as u32;
+        sqe.op_flags = flags.bits();
         Self(sqe)
     }
 
@@ -402,14 +404,13 @@ impl Sqe {
     /// `buf` must point to at least `len` bytes of valid, readable memory
     /// that remains valid until the operation completes.
     #[must_use]
-    #[allow(clippy::cast_sign_loss)]
     pub unsafe fn send(fd: i32, buf: *const u8, len: u32, flags: MsgFlags) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Send.into();
         sqe.fd = fd;
         sqe.addr = buf as u64;
         sqe.len = len;
-        sqe.op_flags = flags.bits() as u32;
+        sqe.op_flags = flags.bits();
         Self(sqe)
     }
 
@@ -420,14 +421,13 @@ impl Sqe {
     /// `buf` must point to at least `len` bytes of valid, writable memory
     /// that remains valid until the operation completes.
     #[must_use]
-    #[allow(clippy::cast_sign_loss)]
     pub unsafe fn recv(fd: i32, buf: *mut u8, len: u32, flags: MsgFlags) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Recv.into();
         sqe.fd = fd;
         sqe.addr = buf as u64;
         sqe.len = len;
-        sqe.op_flags = flags.bits() as u32;
+        sqe.op_flags = flags.bits();
         Self(sqe)
     }
 
@@ -438,14 +438,13 @@ impl Sqe {
     /// `msg` and all buffers it references must remain valid until the
     /// operation completes.
     #[must_use]
-    #[allow(clippy::cast_sign_loss)]
     pub unsafe fn sendmsg(fd: i32, msg: *const MsgHdr, flags: MsgFlags) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::SendMsg.into();
         sqe.fd = fd;
         sqe.addr = msg as u64;
         sqe.len = 1;
-        sqe.op_flags = flags.bits() as u32;
+        sqe.op_flags = flags.bits();
         Self(sqe)
     }
 
@@ -456,20 +455,18 @@ impl Sqe {
     /// `msg` and all buffers it references must remain valid until the
     /// operation completes.
     #[must_use]
-    #[allow(clippy::cast_sign_loss)]
     pub unsafe fn recvmsg(fd: i32, msg: *mut MsgHdr, flags: MsgFlags) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::RecvMsg.into();
         sqe.fd = fd;
         sqe.addr = msg as u64;
         sqe.len = 1;
-        sqe.op_flags = flags.bits() as u32;
+        sqe.op_flags = flags.bits();
         Self(sqe)
     }
 
     /// Prepare a socket creation operation.
     #[must_use]
-    #[allow(clippy::cast_sign_loss)]
     pub fn socket(domain: i32, sock_type: i32, protocol: i32, flags: u32) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Socket.into();
@@ -486,7 +483,7 @@ impl Sqe {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Shutdown.into();
         sqe.fd = fd;
-        sqe.len = how as u32;
+        sqe.len = how.into();
         Self(sqe)
     }
 
@@ -497,12 +494,12 @@ impl Sqe {
     /// `path` must be a valid, null-terminated C string that remains valid
     /// until the operation completes.
     #[must_use]
-    pub unsafe fn mkdirat(dfd: i32, path: *const u8, mode: u32) -> Self {
+    pub unsafe fn mkdirat(dfd: i32, path: *const u8, mode: FileMode) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Mkdirat.into();
         sqe.fd = dfd;
         sqe.addr = path as u64;
-        sqe.len = mode;
+        sqe.len = mode.bits();
         Self(sqe)
     }
 

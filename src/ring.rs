@@ -109,7 +109,7 @@ impl IoUring {
 
         let fd = syscall::io_uring_setup(entries, &raw mut *params)?;
 
-        let features = Features(params.features);
+        let features = Features::from_raw(params.features);
         let single_mmap = features.contains(Features::SINGLE_MMAP);
 
         // Compute ring sizes
@@ -124,7 +124,8 @@ impl IoUring {
         } else {
             sq_ring_sz
         };
-        let sq_ring_ptr = match syscall::mmap(0, mmap_sz, prot, map, fd, RingOffset::SqRing.into()) {
+        let sq_ring_ptr = match syscall::mmap(0, mmap_sz, prot, map, fd, RingOffset::SqRing.into())
+        {
             Ok(ptr) => ptr,
             Err(e) => {
                 let _ = syscall::close(fd);
@@ -317,7 +318,7 @@ impl IoUring {
             result: cqe.res,
         };
 
-        self.cq_head_local += 1;
+        self.cq_head_local = self.cq_head_local.wrapping_add(1);
 
         Some(completion)
     }
@@ -338,7 +339,7 @@ impl IoUring {
     ///
     /// Returns an error if registration fails (e.g., too many buffers, already registered).
     #[allow(clippy::cast_possible_truncation)]
-    pub fn register_buffers(&self, bufs: &[IoVec]) -> Result<(), Error> {
+    pub fn register_buffers(&mut self, bufs: &[IoVec]) -> Result<(), Error> {
         syscall::io_uring_register(
             self.fd,
             RegisterOp::RegisterBuffers.into(),
@@ -353,7 +354,7 @@ impl IoUring {
     /// # Errors
     ///
     /// Returns an error if no buffers are registered.
-    pub fn unregister_buffers(&self) -> Result<(), Error> {
+    pub fn unregister_buffers(&mut self) -> Result<(), Error> {
         syscall::io_uring_register(self.fd, RegisterOp::UnregisterBuffers.into(), 0, 0)?;
         Ok(())
     }
@@ -364,7 +365,7 @@ impl IoUring {
     ///
     /// Returns an error if registration fails.
     #[allow(clippy::cast_possible_truncation)]
-    pub fn register_files(&self, fds: &[i32]) -> Result<(), Error> {
+    pub fn register_files(&mut self, fds: &[i32]) -> Result<(), Error> {
         syscall::io_uring_register(
             self.fd,
             RegisterOp::RegisterFiles.into(),
@@ -379,7 +380,7 @@ impl IoUring {
     /// # Errors
     ///
     /// Returns an error if no files are registered.
-    pub fn unregister_files(&self) -> Result<(), Error> {
+    pub fn unregister_files(&mut self) -> Result<(), Error> {
         syscall::io_uring_register(self.fd, RegisterOp::UnregisterFiles.into(), 0, 0)?;
         Ok(())
     }
@@ -434,6 +435,7 @@ impl IoUringBuilder {
     /// Start building an `io_uring` with the given queue depth.
     #[must_use]
     pub fn new(entries: u32) -> Self {
+        debug_assert!(entries > 0, "io_uring entries must be > 0");
         Self {
             entries,
             params: IoUringParams::default(),

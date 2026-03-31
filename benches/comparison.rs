@@ -27,7 +27,7 @@ fn open_tmpfile_raw() -> i32 {
         .into_raw_fd()
 }
 
-/// Drain all completions from an io-uring CompletionQueue without consuming it.
+/// Drain all completions from an io-uring `CompletionQueue` without consuming it.
 fn drain_cq(cq: &mut io_uring::cqueue::CompletionQueue<'_>) -> usize {
     let mut n = 0;
     while cq.next().is_some() {
@@ -72,13 +72,7 @@ fn bench_sqe_build(c: &mut Criterion) {
         });
 
         g.bench_function("io-uring", |b| {
-            b.iter(|| {
-                black_box(
-                    io_uring::opcode::Nop::new()
-                        .build()
-                        .user_data(1),
-                )
-            });
+            b.iter(|| black_box(io_uring::opcode::Nop::new().build().user_data(1)));
         });
 
         g.finish();
@@ -243,8 +237,10 @@ fn bench_write_4k(c: &mut Criterion) {
         let mut ring = ququmatz::IoUring::new(32).expect("setup");
         g.bench_function("ququmatz", |b| {
             b.iter(|| {
-                ring.push(unsafe { ququmatz::Sqe::write(fd, write_buf.as_ptr(), 4096, 0) }.user_data(1))
-                    .unwrap();
+                ring.push(
+                    unsafe { ququmatz::Sqe::write(fd, write_buf.as_ptr(), 4096, 0) }.user_data(1),
+                )
+                .unwrap();
                 ring.submit_and_wait(1).unwrap();
                 black_box(ring.complete().unwrap());
             });
@@ -379,10 +375,7 @@ fn bench_writev(c: &mut Criterion) {
         let buf_b = [0xBBu8; 2048];
 
         g.bench_function("io-uring", |b| {
-            let vecs = [
-                std::io::IoSlice::new(&buf_a),
-                std::io::IoSlice::new(&buf_b),
-            ];
+            let vecs = [std::io::IoSlice::new(&buf_a), std::io::IoSlice::new(&buf_b)];
             b.iter(|| {
                 sq.sync();
                 let entry =
@@ -463,7 +456,10 @@ fn bench_struct_sizes(c: &mut Criterion) {
         b.iter(|| {
             let ours = core::mem::size_of::<ququmatz::types::IoUringSqe>();
             let theirs = core::mem::size_of::<io_uring::squeue::Entry>();
-            assert_eq!(ours, theirs, "SQE size mismatch: ours={ours}, theirs={theirs}");
+            assert_eq!(
+                ours, theirs,
+                "SQE size mismatch: ours={ours}, theirs={theirs}"
+            );
             assert_eq!(ours, 64, "SQE must be 64 bytes");
 
             let our_cqe = core::mem::size_of::<ququmatz::types::IoUringCqe>();
