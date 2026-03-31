@@ -5,17 +5,18 @@
 )]
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use ququmatz::types::{AT_FDCWD, FileMode, OpenFlags};
 use ququmatz::{IoUring, IoVec, Sqe};
+use std::os::unix::io::IntoRawFd;
 
 fn open_tmpfile() -> i32 {
-    ququmatz::syscall::openat(
-        AT_FDCWD,
-        c"/tmp".as_ptr().cast(),
-        OpenFlags::TMPFILE | OpenFlags::RDWR,
-        FileMode::OWNER_READ | FileMode::OWNER_WRITE,
-    )
-    .expect("failed to open tmpfile") as i32
+    std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open("/tmp/ququmatz-bench-tmpfile")
+        .expect("failed to open tmpfile")
+        .into_raw_fd()
 }
 
 fn bench_ring_setup(c: &mut Criterion) {
@@ -36,11 +37,11 @@ fn bench_sqe_construction(c: &mut Criterion) {
     });
 
     c.bench_function("sqe_build_read", |b| {
-        b.iter(|| black_box(Sqe::read(3, ptr, 4096, 0).user_data(1)));
+        b.iter(|| black_box(unsafe { Sqe::read(3, ptr, 4096, 0) }.user_data(1)));
     });
 
     c.bench_function("sqe_build_write", |b| {
-        b.iter(|| black_box(Sqe::write(3, ptr, 4096, 0).user_data(1)));
+        b.iter(|| black_box(unsafe { Sqe::write(3, ptr, 4096, 0) }.user_data(1)));
     });
 }
 
@@ -88,14 +89,14 @@ fn bench_read_write(c: &mut Criterion) {
 
     // Pre-write some data so reads have something to return
     let write_buf = [0xABu8; 4096];
-    ring.push(Sqe::write(fd, write_buf.as_ptr(), 4096, 0).user_data(0))
+    ring.push(unsafe { Sqe::write(fd, write_buf.as_ptr(), 4096, 0) }.user_data(0))
         .unwrap();
     ring.submit_and_wait(1).unwrap();
     ring.complete().unwrap();
 
     c.bench_function("write_4k", |b| {
         b.iter(|| {
-            ring.push(Sqe::write(fd, write_buf.as_ptr(), 4096, 0).user_data(1))
+            ring.push(unsafe { Sqe::write(fd, write_buf.as_ptr(), 4096, 0) }.user_data(1))
                 .unwrap();
             ring.submit_and_wait(1).unwrap();
             black_box(ring.complete().unwrap());
@@ -105,14 +106,12 @@ fn bench_read_write(c: &mut Criterion) {
     c.bench_function("read_4k", |b| {
         let mut read_buf = [0u8; 4096];
         b.iter(|| {
-            ring.push(Sqe::read(fd, read_buf.as_mut_ptr(), 4096, 0).user_data(1))
+            ring.push(unsafe { Sqe::read(fd, read_buf.as_mut_ptr(), 4096, 0) }.user_data(1))
                 .unwrap();
             ring.submit_and_wait(1).unwrap();
             black_box(ring.complete().unwrap());
         });
     });
-
-    let _ = ququmatz::syscall::close(fd as usize);
 }
 
 fn bench_vectored_write(c: &mut Criterion) {
@@ -134,14 +133,12 @@ fn bench_vectored_write(c: &mut Criterion) {
             },
         ];
         b.iter(|| {
-            ring.push(Sqe::writev(fd, vecs.as_ptr(), 2, 0).user_data(1))
+            ring.push(unsafe { Sqe::writev(fd, vecs.as_ptr(), 2, 0) }.user_data(1))
                 .unwrap();
             ring.submit_and_wait(1).unwrap();
             black_box(ring.complete().unwrap());
         });
     });
-
-    let _ = ququmatz::syscall::close(fd as usize);
 }
 
 criterion_group!(

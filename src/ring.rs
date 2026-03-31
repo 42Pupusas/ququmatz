@@ -124,19 +124,41 @@ impl IoUring {
         } else {
             sq_ring_sz
         };
-        let sq_ring_ptr = syscall::mmap(0, mmap_sz, prot, map, fd, RingOffset::SqRing.into())?;
+        let sq_ring_ptr = match syscall::mmap(0, mmap_sz, prot, map, fd, RingOffset::SqRing.into()) {
+            Ok(ptr) => ptr,
+            Err(e) => {
+                let _ = syscall::close(fd);
+                return Err(e);
+            }
+        };
 
         // Map the CQ ring (reuse SQ mmap if SINGLE_MMAP)
         let (cq_ring_ptr, cq_ring_region) = if single_mmap {
             (sq_ring_ptr, MappedRegion::new(0, 0))
         } else {
-            let ptr = syscall::mmap(0, cq_ring_sz, prot, map, fd, RingOffset::CqRing.into())?;
-            (ptr, MappedRegion::new(ptr, cq_ring_sz))
+            match syscall::mmap(0, cq_ring_sz, prot, map, fd, RingOffset::CqRing.into()) {
+                Ok(ptr) => (ptr, MappedRegion::new(ptr, cq_ring_sz)),
+                Err(e) => {
+                    let _ = syscall::munmap(sq_ring_ptr, mmap_sz);
+                    let _ = syscall::close(fd);
+                    return Err(e);
+                }
+            }
         };
 
         // Map the SQE array
         let sqes_sz = params.sq_entries as usize * core::mem::size_of::<IoUringSqe>();
-        let sqes_ptr = syscall::mmap(0, sqes_sz, prot, map, fd, RingOffset::Sqes.into())?;
+        let sqes_ptr = match syscall::mmap(0, sqes_sz, prot, map, fd, RingOffset::Sqes.into()) {
+            Ok(ptr) => ptr,
+            Err(e) => {
+                if cq_ring_region.len > 0 {
+                    let _ = syscall::munmap(cq_ring_region.addr, cq_ring_region.len);
+                }
+                let _ = syscall::munmap(sq_ring_ptr, mmap_sz);
+                let _ = syscall::close(fd);
+                return Err(e);
+            }
+        };
 
         let sq_base = sq_ring_ptr as *const u8;
         let sq_head = unsafe { sq_base.add(params.sq_off.head as usize) }.cast::<AtomicU32>();

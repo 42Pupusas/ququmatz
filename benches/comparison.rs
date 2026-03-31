@@ -11,19 +11,20 @@
 //! the relative difference.
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::os::unix::io::IntoRawFd;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-/// Open an anonymous tmpfile via ququmatz's raw syscall.
+/// Open an anonymous tmpfile for benchmarking.
 fn open_tmpfile_raw() -> i32 {
-    use ququmatz::types::{AT_FDCWD, FileMode, OpenFlags};
-    ququmatz::syscall::openat(
-        AT_FDCWD,
-        c"/tmp".as_ptr().cast(),
-        OpenFlags::TMPFILE | OpenFlags::RDWR,
-        FileMode::OWNER_READ | FileMode::OWNER_WRITE,
-    )
-    .expect("failed to open tmpfile") as i32
+    std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open("/tmp/ququmatz-cmp-bench-tmpfile")
+        .expect("failed to open tmpfile")
+        .into_raw_fd()
 }
 
 /// Drain all completions from an io-uring CompletionQueue without consuming it.
@@ -87,7 +88,7 @@ fn bench_sqe_build(c: &mut Criterion) {
         let mut g = c.benchmark_group("sqe_build_read");
 
         g.bench_function("ququmatz", |b| {
-            b.iter(|| black_box(ququmatz::Sqe::read(3, ptr, 4096, 0).user_data(1)));
+            b.iter(|| black_box(unsafe { ququmatz::Sqe::read(3, ptr, 4096, 0) }.user_data(1)));
         });
 
         g.bench_function("io-uring", |b| {
@@ -108,7 +109,7 @@ fn bench_sqe_build(c: &mut Criterion) {
         let mut g = c.benchmark_group("sqe_build_write");
 
         g.bench_function("ququmatz", |b| {
-            b.iter(|| black_box(ququmatz::Sqe::write(3, ptr, 4096, 0).user_data(1)));
+            b.iter(|| black_box(unsafe { ququmatz::Sqe::write(3, ptr, 4096, 0) }.user_data(1)));
         });
 
         g.bench_function("io-uring", |b| {
@@ -242,13 +243,12 @@ fn bench_write_4k(c: &mut Criterion) {
         let mut ring = ququmatz::IoUring::new(32).expect("setup");
         g.bench_function("ququmatz", |b| {
             b.iter(|| {
-                ring.push(ququmatz::Sqe::write(fd, write_buf.as_ptr(), 4096, 0).user_data(1))
+                ring.push(unsafe { ququmatz::Sqe::write(fd, write_buf.as_ptr(), 4096, 0) }.user_data(1))
                     .unwrap();
                 ring.submit_and_wait(1).unwrap();
                 black_box(ring.complete().unwrap());
             });
         });
-        let _ = ququmatz::syscall::close(fd as usize);
     }
 
     {
@@ -270,7 +270,6 @@ fn bench_write_4k(c: &mut Criterion) {
                 black_box(drain_cq(&mut cq));
             });
         });
-        let _ = ququmatz::syscall::close(fd as usize);
     }
 
     g.finish();
@@ -287,7 +286,7 @@ fn bench_read_4k(c: &mut Criterion) {
         let fd = open_tmpfile_raw();
         let mut ring = ququmatz::IoUring::new(32).expect("setup");
         // seed
-        ring.push(ququmatz::Sqe::write(fd, seed_buf.as_ptr(), 4096, 0).user_data(0))
+        ring.push(unsafe { ququmatz::Sqe::write(fd, seed_buf.as_ptr(), 4096, 0) }.user_data(0))
             .unwrap();
         ring.submit_and_wait(1).unwrap();
         ring.complete().unwrap();
@@ -296,21 +295,20 @@ fn bench_read_4k(c: &mut Criterion) {
         g.bench_function("ququmatz", |b| {
             b.iter(|| {
                 ring.push(
-                    ququmatz::Sqe::read(fd, read_buf.as_mut_ptr(), 4096, 0).user_data(1),
+                    unsafe { ququmatz::Sqe::read(fd, read_buf.as_mut_ptr(), 4096, 0) }.user_data(1),
                 )
                 .unwrap();
                 ring.submit_and_wait(1).unwrap();
                 black_box(ring.complete().unwrap());
             });
         });
-        let _ = ququmatz::syscall::close(fd as usize);
     }
 
     {
         let fd = open_tmpfile_raw();
         let mut ring_setup = ququmatz::IoUring::new(32).expect("setup");
         ring_setup
-            .push(ququmatz::Sqe::write(fd, seed_buf.as_ptr(), 4096, 0).user_data(0))
+            .push(unsafe { ququmatz::Sqe::write(fd, seed_buf.as_ptr(), 4096, 0) }.user_data(0))
             .unwrap();
         ring_setup.submit_and_wait(1).unwrap();
         ring_setup.complete().unwrap();
@@ -337,7 +335,6 @@ fn bench_read_4k(c: &mut Criterion) {
                 black_box(drain_cq(&mut cq));
             });
         });
-        let _ = ququmatz::syscall::close(fd as usize);
     }
 
     g.finish();
@@ -366,13 +363,12 @@ fn bench_writev(c: &mut Criterion) {
                 },
             ];
             b.iter(|| {
-                ring.push(ququmatz::Sqe::writev(fd, vecs.as_ptr(), 2, 0).user_data(1))
+                ring.push(unsafe { ququmatz::Sqe::writev(fd, vecs.as_ptr(), 2, 0) }.user_data(1))
                     .unwrap();
                 ring.submit_and_wait(1).unwrap();
                 black_box(ring.complete().unwrap());
             });
         });
-        let _ = ququmatz::syscall::close(fd as usize);
     }
 
     {
@@ -401,7 +397,6 @@ fn bench_writev(c: &mut Criterion) {
                 black_box(drain_cq(&mut cq));
             });
         });
-        let _ = ququmatz::syscall::close(fd as usize);
     }
 
     g.finish();

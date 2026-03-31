@@ -30,12 +30,12 @@ impl Sqe {
     /// Reads up to `len` bytes from `fd` at `offset` into `buf`.
     /// Use offset `u64::MAX` (`-1` as unsigned) for current file position.
     ///
-    /// # Safety contract
+    /// # Safety
     ///
     /// The caller must ensure `buf` points to at least `len` bytes of valid,
     /// writable memory that remains valid until the operation completes.
     #[must_use]
-    pub fn read(fd: i32, buf: *mut u8, len: u32, offset: u64) -> Self {
+    pub unsafe fn read(fd: i32, buf: *mut u8, len: u32, offset: u64) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Read.into();
         sqe.fd = fd;
@@ -50,12 +50,12 @@ impl Sqe {
     /// Writes `len` bytes from `buf` to `fd` at `offset`.
     /// Use offset `u64::MAX` (`-1` as unsigned) for current file position.
     ///
-    /// # Safety contract
+    /// # Safety
     ///
     /// The caller must ensure `buf` points to at least `len` bytes of valid,
     /// readable memory that remains valid until the operation completes.
     #[must_use]
-    pub fn write(fd: i32, buf: *const u8, len: u32, offset: u64) -> Self {
+    pub unsafe fn write(fd: i32, buf: *const u8, len: u32, offset: u64) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Write.into();
         sqe.fd = fd;
@@ -69,12 +69,12 @@ impl Sqe {
     ///
     /// Reads from `fd` at `offset` into the buffers described by `iovecs`.
     ///
-    /// # Safety contract
+    /// # Safety
     ///
     /// The caller must ensure `iovecs` and all referenced buffers remain valid
     /// until the operation completes.
     #[must_use]
-    pub fn readv(fd: i32, iovecs: *const IoVec, nr_vecs: u32, offset: u64) -> Self {
+    pub unsafe fn readv(fd: i32, iovecs: *const IoVec, nr_vecs: u32, offset: u64) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Readv.into();
         sqe.fd = fd;
@@ -88,12 +88,12 @@ impl Sqe {
     ///
     /// Writes to `fd` at `offset` from the buffers described by `iovecs`.
     ///
-    /// # Safety contract
+    /// # Safety
     ///
     /// The caller must ensure `iovecs` and all referenced buffers remain valid
     /// until the operation completes.
     #[must_use]
-    pub fn writev(fd: i32, iovecs: *const IoVec, nr_vecs: u32, offset: u64) -> Self {
+    pub unsafe fn writev(fd: i32, iovecs: *const IoVec, nr_vecs: u32, offset: u64) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Writev.into();
         sqe.fd = fd;
@@ -106,9 +106,14 @@ impl Sqe {
     /// Prepare an `openat` operation.
     ///
     /// Opens a file relative to directory fd `dfd`. Use `AT_FDCWD` for the
-    /// current working directory. `path` must be a null-terminated C string.
+    /// current working directory.
+    ///
+    /// # Safety
+    ///
+    /// `path` must be a valid, null-terminated C string that remains valid
+    /// until the operation completes.
     #[must_use]
-    pub fn openat(dfd: i32, path: *const u8, flags: OpenFlags, mode: u32) -> Self {
+    pub unsafe fn openat(dfd: i32, path: *const u8, flags: OpenFlags, mode: u32) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Openat.into();
         sqe.fd = dfd;
@@ -130,8 +135,14 @@ impl Sqe {
     /// Prepare a fixed-buffer read operation.
     ///
     /// Like `read`, but uses a pre-registered buffer identified by `buf_index`.
+    ///
+    /// # Safety
+    ///
+    /// `buf` must point to at least `len` bytes of valid, writable memory
+    /// within the registered buffer at `buf_index`, and must remain valid
+    /// until the operation completes.
     #[must_use]
-    pub fn read_fixed(fd: i32, buf: *mut u8, len: u32, offset: u64, buf_index: u16) -> Self {
+    pub unsafe fn read_fixed(fd: i32, buf: *mut u8, len: u32, offset: u64, buf_index: u16) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::ReadFixed.into();
         sqe.fd = fd;
@@ -145,8 +156,14 @@ impl Sqe {
     /// Prepare a fixed-buffer write operation.
     ///
     /// Like `write`, but uses a pre-registered buffer identified by `buf_index`.
+    ///
+    /// # Safety
+    ///
+    /// `buf` must point to at least `len` bytes of valid, readable memory
+    /// within the registered buffer at `buf_index`, and must remain valid
+    /// until the operation completes.
     #[must_use]
-    pub fn write_fixed(fd: i32, buf: *const u8, len: u32, offset: u64, buf_index: u16) -> Self {
+    pub unsafe fn write_fixed(fd: i32, buf: *const u8, len: u32, offset: u64, buf_index: u16) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::WriteFixed.into();
         sqe.fd = fd;
@@ -161,8 +178,13 @@ impl Sqe {
     ///
     /// Completes when either `count` completions have occurred or the timeout
     /// expires, whichever comes first. Use `count = 0` for a pure timer.
+    ///
+    /// # Safety
+    ///
+    /// `ts` must point to a valid `Timespec` that remains valid until the
+    /// operation completes.
     #[must_use]
-    pub fn timeout(ts: *const Timespec, count: u32, flags: TimeoutFlags) -> Self {
+    pub unsafe fn timeout(ts: *const Timespec, count: u32, flags: TimeoutFlags) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Timeout.into();
         sqe.addr = ts as u64;
@@ -176,8 +198,13 @@ impl Sqe {
     ///
     /// Must be submitted immediately after a linked SQE. If the timeout fires
     /// before the linked operation completes, the linked operation is cancelled.
+    ///
+    /// # Safety
+    ///
+    /// `ts` must point to a valid `Timespec` that remains valid until the
+    /// operation completes.
     #[must_use]
-    pub fn link_timeout(ts: *const Timespec, flags: TimeoutFlags) -> Self {
+    pub unsafe fn link_timeout(ts: *const Timespec, flags: TimeoutFlags) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::LinkTimeout.into();
         sqe.addr = ts as u64;
@@ -263,11 +290,16 @@ impl Sqe {
 
     /// Prepare a statx operation.
     ///
-    /// `dfd` is the directory fd (use `AT_FDCWD` for cwd). `path` must be
-    /// null-terminated. `statx_buf` is where the result will be written.
+    /// `dfd` is the directory fd (use `AT_FDCWD` for cwd).
+    ///
+    /// # Safety
+    ///
+    /// `path` must be a valid, null-terminated C string and `statx_buf` must
+    /// point to a valid `Statx`. Both must remain valid until the operation
+    /// completes.
     #[must_use]
     #[allow(clippy::cast_sign_loss)]
-    pub fn statx(
+    pub unsafe fn statx(
         dfd: i32,
         path: *const u8,
         flags: StatxFlags,
@@ -285,8 +317,13 @@ impl Sqe {
     }
 
     /// Prepare a renameat operation.
+    ///
+    /// # Safety
+    ///
+    /// `old_path` and `new_path` must be valid, null-terminated C strings
+    /// that remain valid until the operation completes.
     #[must_use]
-    pub fn renameat(
+    pub unsafe fn renameat(
         old_dfd: i32,
         old_path: *const u8,
         new_dfd: i32,
@@ -304,9 +341,14 @@ impl Sqe {
     }
 
     /// Prepare an unlinkat operation.
+    ///
+    /// # Safety
+    ///
+    /// `path` must be a valid, null-terminated C string that remains valid
+    /// until the operation completes.
     #[must_use]
     #[allow(clippy::cast_sign_loss)]
-    pub fn unlinkat(dfd: i32, path: *const u8, flags: UnlinkFlags) -> Self {
+    pub unsafe fn unlinkat(dfd: i32, path: *const u8, flags: UnlinkFlags) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Unlinkat.into();
         sqe.fd = dfd;
@@ -319,9 +361,15 @@ impl Sqe {
     ///
     /// Accepts a connection on a listening socket. `addr` and `addrlen` can be
     /// null/null if you don't need the peer address.
+    ///
+    /// # Safety
+    ///
+    /// If non-null, `addr` must point to a buffer large enough for the peer
+    /// address and `addrlen` must point to its size. Both must remain valid
+    /// until the operation completes.
     #[must_use]
     #[allow(clippy::cast_sign_loss)]
-    pub fn accept(fd: i32, addr: *mut u8, addrlen: *mut u32, flags: AcceptFlags) -> Self {
+    pub unsafe fn accept(fd: i32, addr: *mut u8, addrlen: *mut u32, flags: AcceptFlags) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Accept.into();
         sqe.fd = fd;
@@ -332,8 +380,13 @@ impl Sqe {
     }
 
     /// Prepare a connect operation.
+    ///
+    /// # Safety
+    ///
+    /// `addr` must point to a valid socket address of `addrlen` bytes that
+    /// remains valid until the operation completes.
     #[must_use]
-    pub fn connect(fd: i32, addr: *const u8, addrlen: u32) -> Self {
+    pub unsafe fn connect(fd: i32, addr: *const u8, addrlen: u32) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Connect.into();
         sqe.fd = fd;
@@ -343,9 +396,14 @@ impl Sqe {
     }
 
     /// Prepare a send operation.
+    ///
+    /// # Safety
+    ///
+    /// `buf` must point to at least `len` bytes of valid, readable memory
+    /// that remains valid until the operation completes.
     #[must_use]
     #[allow(clippy::cast_sign_loss)]
-    pub fn send(fd: i32, buf: *const u8, len: u32, flags: MsgFlags) -> Self {
+    pub unsafe fn send(fd: i32, buf: *const u8, len: u32, flags: MsgFlags) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Send.into();
         sqe.fd = fd;
@@ -356,9 +414,14 @@ impl Sqe {
     }
 
     /// Prepare a recv operation.
+    ///
+    /// # Safety
+    ///
+    /// `buf` must point to at least `len` bytes of valid, writable memory
+    /// that remains valid until the operation completes.
     #[must_use]
     #[allow(clippy::cast_sign_loss)]
-    pub fn recv(fd: i32, buf: *mut u8, len: u32, flags: MsgFlags) -> Self {
+    pub unsafe fn recv(fd: i32, buf: *mut u8, len: u32, flags: MsgFlags) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Recv.into();
         sqe.fd = fd;
@@ -369,9 +432,14 @@ impl Sqe {
     }
 
     /// Prepare a sendmsg operation.
+    ///
+    /// # Safety
+    ///
+    /// `msg` and all buffers it references must remain valid until the
+    /// operation completes.
     #[must_use]
     #[allow(clippy::cast_sign_loss)]
-    pub fn sendmsg(fd: i32, msg: *const MsgHdr, flags: MsgFlags) -> Self {
+    pub unsafe fn sendmsg(fd: i32, msg: *const MsgHdr, flags: MsgFlags) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::SendMsg.into();
         sqe.fd = fd;
@@ -382,9 +450,14 @@ impl Sqe {
     }
 
     /// Prepare a recvmsg operation.
+    ///
+    /// # Safety
+    ///
+    /// `msg` and all buffers it references must remain valid until the
+    /// operation completes.
     #[must_use]
     #[allow(clippy::cast_sign_loss)]
-    pub fn recvmsg(fd: i32, msg: *mut MsgHdr, flags: MsgFlags) -> Self {
+    pub unsafe fn recvmsg(fd: i32, msg: *mut MsgHdr, flags: MsgFlags) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::RecvMsg.into();
         sqe.fd = fd;
@@ -418,8 +491,13 @@ impl Sqe {
     }
 
     /// Prepare a mkdirat operation.
+    ///
+    /// # Safety
+    ///
+    /// `path` must be a valid, null-terminated C string that remains valid
+    /// until the operation completes.
     #[must_use]
-    pub fn mkdirat(dfd: i32, path: *const u8, mode: u32) -> Self {
+    pub unsafe fn mkdirat(dfd: i32, path: *const u8, mode: u32) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Mkdirat.into();
         sqe.fd = dfd;
