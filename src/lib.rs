@@ -12,7 +12,7 @@ pub use error::Error;
 pub use op::Sqe;
 pub use ring::{Completion, Completions, IoUring, IoUringBuilder};
 pub use types::{
-    CqeFlags, Features, IoVec, RawFd, SetupFlags, SqeFlags, TimeoutFlags, Timespec,
+    CqeFlags, Features, IoVec, RawFd, SetupFlags, SocketFlags, SqeFlags, TimeoutFlags, Timespec,
 };
 
 #[cfg(test)]
@@ -27,8 +27,9 @@ mod tests {
 
     use super::*;
     use crate::types::{
-        AcceptFlags, FileMode, FsyncFlags, IoUringCqe, IoUringParams, IoUringSqe, MsgFlags, Opcode,
-        OpenFlags, PollMask, SockAddrIn, SqeFlags, Statx, StatxFlags, StatxMask,
+        AcceptFlags, FileMode, FsyncFlags, IoCqringOffsets, IoSqringOffsets, IoUringCqe,
+        IoUringParams, IoUringSqe, MsgFlags, MsgHdr, Opcode, OpenFlags, PollMask, SockAddrIn,
+        SqeFlags, Statx, StatxFlags, StatxMask, StatxTimestamp,
     };
     use core::mem;
 
@@ -59,6 +60,42 @@ mod tests {
     fn iovec_layout() {
         assert_eq!(mem::size_of::<IoVec>(), 16);
         assert_eq!(mem::align_of::<IoVec>(), 8);
+    }
+
+    #[test]
+    fn msghdr_layout() {
+        assert_eq!(mem::size_of::<MsgHdr>(), 56);
+        assert_eq!(mem::align_of::<MsgHdr>(), 8);
+    }
+
+    #[test]
+    fn sockaddrin_layout() {
+        assert_eq!(mem::size_of::<SockAddrIn>(), 16);
+        assert_eq!(mem::align_of::<SockAddrIn>(), 4);
+    }
+
+    #[test]
+    fn timespec_layout() {
+        assert_eq!(mem::size_of::<Timespec>(), 16);
+        assert_eq!(mem::align_of::<Timespec>(), 8);
+    }
+
+    #[test]
+    fn io_sqring_offsets_layout() {
+        assert_eq!(mem::size_of::<IoSqringOffsets>(), 40);
+        assert_eq!(mem::align_of::<IoSqringOffsets>(), 8);
+    }
+
+    #[test]
+    fn io_cqring_offsets_layout() {
+        assert_eq!(mem::size_of::<IoCqringOffsets>(), 40);
+        assert_eq!(mem::align_of::<IoCqringOffsets>(), 8);
+    }
+
+    #[test]
+    fn statx_timestamp_layout() {
+        assert_eq!(mem::size_of::<StatxTimestamp>(), 16);
+        assert_eq!(mem::align_of::<StatxTimestamp>(), 8);
     }
 
     // ---------------------------------------------------------------
@@ -156,7 +193,7 @@ mod tests {
             Sqe::openat(
                 types::AT_FDCWD,
                 path.as_ptr().cast(),
-                OpenFlags::RDONLY,
+                OpenFlags::default(),
                 FileMode::OWNER_READ | FileMode::OWNER_WRITE | FileMode::GROUP_READ | FileMode::OTHER_READ,
             )
         }
@@ -167,7 +204,7 @@ mod tests {
         assert_eq!(inner.fd, types::AT_FDCWD);
         assert_eq!(inner.addr, path.as_ptr() as u64);
         assert_eq!(inner.len, 0o644);
-        assert_eq!(inner.op_flags, OpenFlags::RDONLY.bits());
+        assert_eq!(inner.op_flags, 0);
         assert_eq!(inner.user_data, 77);
     }
 
@@ -304,12 +341,12 @@ mod tests {
     #[test]
     fn timespec_from_millis() {
         let ts = Timespec::from_millis(1500);
-        assert_eq!(ts.tv_sec, 1);
-        assert_eq!(ts.tv_nsec, 500_000_000);
+        assert_eq!(ts.tv_sec(), 1);
+        assert_eq!(ts.tv_nsec(), 500_000_000);
 
         let ts = Timespec::from_millis(50);
-        assert_eq!(ts.tv_sec, 0);
-        assert_eq!(ts.tv_nsec, 50_000_000);
+        assert_eq!(ts.tv_sec(), 0);
+        assert_eq!(ts.tv_nsec(), 50_000_000);
     }
 
     #[test]
@@ -718,7 +755,7 @@ mod tests {
                     listener,
                     core::ptr::null_mut(),
                     core::ptr::null_mut(),
-                    AcceptFlags::NONE,
+                    AcceptFlags::default(),
                 )
             }
             .user_data(1),
@@ -764,7 +801,7 @@ mod tests {
         // Send from client, recv on server
         let msg = b"hello from io_uring!";
         ring.push(
-            unsafe { Sqe::send(client, msg.as_ptr(), msg.len() as u32, MsgFlags::NONE) }
+            unsafe { Sqe::send(client, msg.as_ptr(), msg.len() as u32, MsgFlags::default()) }
                 .user_data(3),
         )
         .expect("push send");
@@ -780,7 +817,7 @@ mod tests {
                     server_fd,
                     recv_buf.as_mut_ptr(),
                     recv_buf.len() as u32,
-                    MsgFlags::NONE,
+                    MsgFlags::default(),
                 )
             }
             .user_data(4),

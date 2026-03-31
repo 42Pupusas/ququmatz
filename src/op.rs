@@ -2,8 +2,8 @@
 
 use crate::types::{
     AcceptFlags, FallocateMode, FileMode, FsyncFlags, IoUringSqe, IoVec, MsgFlags, MsgHdr, Opcode,
-    OpenFlags, PollMask, RenameFlags, ShutdownHow, SqeFlags, StatxFlags, StatxMask, TimeoutFlags,
-    Timespec, UnlinkFlags,
+    OpenFlags, PollMask, RenameFlags, ShutdownHow, SocketFlags, SqeFlags, StatxFlags, StatxMask,
+    TimeoutFlags, Timespec, UnlinkFlags,
 };
 
 /// A prepared submission queue entry, ready to be pushed onto the ring.
@@ -281,14 +281,21 @@ impl Sqe {
     }
 
     /// Prepare a fallocate operation.
+    ///
+    /// # Field mapping
+    ///
+    /// The kernel's fallocate SQE reuses fields unconventionally:
+    /// `sqe.addr` carries the byte length (not an address) because
+    /// `sqe.len` is only u32 and fallocate needs a 64-bit length.
+    /// `sqe.len` carries the mode flags instead.
     #[must_use]
     pub fn fallocate(fd: i32, mode: FallocateMode, offset: u64, len: u64) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Fallocate.into();
         sqe.fd = fd;
         sqe.off = offset;
-        sqe.addr = len;
-        sqe.len = mode.bits();
+        sqe.addr = len; // byte length (u64), not an address
+        sqe.len = mode.bits(); // mode flags, not a length
         Self(sqe)
     }
 
@@ -466,14 +473,18 @@ impl Sqe {
     }
 
     /// Prepare a socket creation operation.
+    ///
+    /// `domain` is the address family (e.g., `AF_INET`), `sock_type` is the
+    /// socket type (e.g., `SOCK_STREAM`), and `flags` controls socket-level
+    /// options like `NONBLOCK` and `CLOEXEC`.
     #[must_use]
-    pub fn socket(domain: i32, sock_type: i32, protocol: i32, flags: u32) -> Self {
+    pub fn socket(domain: i32, sock_type: i32, protocol: i32, flags: SocketFlags) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Socket.into();
         sqe.fd = domain;
         sqe.off = sock_type as u64;
         sqe.len = protocol as u32;
-        sqe.op_flags = flags;
+        sqe.op_flags = flags.bits();
         Self(sqe)
     }
 

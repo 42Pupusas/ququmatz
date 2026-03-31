@@ -12,14 +12,24 @@ use core::sync::atomic::{AtomicU32, Ordering};
 pub struct Completion {
     /// The `user_data` value from the original submission.
     pub user_data: u64,
-    /// The result code (bytes transferred on success, negative errno on failure).
+    /// The raw result code from the kernel. Interpretation is operation-specific:
+    /// for read/write it is the byte count, for accept it is a new fd, for
+    /// timeout expiry it is `-ETIME`, etc. Negative values are negated errno
+    /// codes. Use [`into_result`](Self::into_result) for the common
+    /// "non-negative value or error" pattern.
     pub result: i32,
     /// Kernel-set flags (multishot, buffer selection, etc.).
     pub flags: CqeFlags,
 }
 
 impl Completion {
-    /// Convert the result into a `Result`, mapping negative errno to `Error`.
+    /// Convert the raw result into a `Result<u32, Error>`.
+    ///
+    /// This is a convenience for the common "non-negative value or error"
+    /// pattern (e.g., byte count from read/write, fd from accept). For
+    /// operations where a negative result has specific meaning beyond an
+    /// error (e.g., `IORING_OP_TIMEOUT` returns `-ETIME` on normal expiry),
+    /// inspect [`result`](Self::result) directly instead.
     ///
     /// # Errors
     ///
@@ -60,6 +70,16 @@ impl MappedRegion {
 /// This is intentional — the ring's mmap'd regions and cached indices are not
 /// safe to share across threads without external synchronization. Create one
 /// ring per thread, or wrap in a `Mutex` if you must share.
+///
+/// # Drop Behavior
+///
+/// When dropped, any SQEs that have been [`push`](Self::push)ed but not yet
+/// submitted via [`submit`](Self::submit) or [`submit_and_wait`](Self::submit_and_wait)
+/// are **silently discarded**. The drop implementation flushes the CQ head
+/// (so the kernel can reuse completed CQ slots), unmaps ring memory, and
+/// closes the ring fd. It does *not* call `io_uring_enter` to flush pending
+/// submissions. Always submit before dropping if you need those operations
+/// to execute.
 pub struct IoUring {
     fd: usize,
 
@@ -241,6 +261,10 @@ impl IoUring {
     }
 
     /// Push a prepared SQE onto the submission queue.
+    ///
+    /// The SQE is not visible to the kernel until [`submit`](Self::submit) or
+    /// [`submit_and_wait`](Self::submit_and_wait) is called. Pushed SQEs are
+    /// silently lost if the ring is dropped without submitting.
     ///
     /// # Errors
     ///

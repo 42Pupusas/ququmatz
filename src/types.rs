@@ -253,8 +253,12 @@ impl From<RingOffset> for u64 {
 
 bitflags! {
     /// File open flags for `openat`.
+    ///
+    /// Note: `O_RDONLY` (0) is not included because it is the *absence* of
+    /// `WRONLY` and `RDWR`, not a flag bit. Use `OpenFlags::default()` for
+    /// read-only access. `WRONLY` and `RDWR` are mutually exclusive access
+    /// modes, not combinable flags.
     pub struct OpenFlags(u32);
-    const RDONLY = 0;
     const WRONLY = 1;
     const RDWR = 2;
     const CREAT = 0o100;
@@ -402,11 +406,15 @@ pub struct IoVec {
 }
 
 /// Kernel timespec for timeout operations.
+///
+/// Fields are private to enforce the nanosecond range invariant
+/// (`0 <= tv_nsec < 1_000_000_000`). Use [`new`](Self::new) or
+/// [`from_millis`](Self::from_millis) to construct.
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
 pub struct Timespec {
-    pub tv_sec: i64,
-    pub tv_nsec: i64,
+    tv_sec: i64,
+    tv_nsec: i64,
 }
 
 impl Timespec {
@@ -414,7 +422,7 @@ impl Timespec {
     ///
     /// # Panics
     ///
-    /// Panics in debug builds if `nsec` is not in `0..1_000_000_000`.
+    /// Panics if `nsec` is not in `0..1_000_000_000`.
     #[must_use]
     pub const fn new(sec: i64, nsec: i64) -> Self {
         assert!(
@@ -435,6 +443,18 @@ impl Timespec {
             tv_sec: (ms / 1000) as i64,
             tv_nsec: ((ms % 1000) * 1_000_000) as i64,
         }
+    }
+
+    /// Returns the seconds component.
+    #[must_use]
+    pub const fn tv_sec(&self) -> i64 {
+        self.tv_sec
+    }
+
+    /// Returns the nanoseconds component (always in `0..1_000_000_000`).
+    #[must_use]
+    pub const fn tv_nsec(&self) -> i64 {
+        self.tv_nsec
     }
 }
 
@@ -480,9 +500,10 @@ bitflags! {
 
 bitflags! {
     /// Mode flags for fallocate operations.
+    ///
+    /// Use `FallocateMode::default()` for the default allocation mode
+    /// (`FALLOC_FL_DEFAULT = 0`), which is the absence of any mode flags.
     pub struct FallocateMode(u32);
-    /// Default mode: allocate space.
-    const NONE = 0;
     /// Keep file size unchanged.
     const KEEP_SIZE = 0x01;
     /// Punch a hole (deallocate).
@@ -611,8 +632,9 @@ impl From<ShutdownHow> for u32 {
 
 bitflags! {
     /// Send/recv flags.
+    ///
+    /// Use `MsgFlags::default()` for no flags.
     pub struct MsgFlags(u32);
-    const NONE = 0;
     const DONTWAIT = 0x40;
     const NOSIGNAL = 0x4000;
     const WAITALL = 0x100;
@@ -620,9 +642,22 @@ bitflags! {
 
 bitflags! {
     /// Accept flags (same as socket flags that make sense for accept4).
+    ///
+    /// Use `AcceptFlags::default()` for no flags.
     pub struct AcceptFlags(u32);
-    const NONE = 0;
     const NONBLOCK = 0o4000;
+}
+
+bitflags! {
+    /// Flags for `IORING_OP_SOCKET` (passed via `sqe.rw_flags`).
+    ///
+    /// These modify the created socket's behavior independently of the
+    /// socket type passed in `sock_type`.
+    pub struct SocketFlags(u32);
+    /// Set the socket to non-blocking mode (`SOCK_NONBLOCK`).
+    const NONBLOCK = 0o4000;
+    /// Set close-on-exec on the new file descriptor (`SOCK_CLOEXEC`).
+    const CLOEXEC = 0o2_000_000;
 }
 
 /// IPv4 socket address.
@@ -636,16 +671,23 @@ pub struct SockAddrIn {
 }
 
 /// Message header for sendmsg/recvmsg.
+///
+/// The padding fields match the `x86_64` C ABI layout of `struct msghdr`:
+/// the compiler inserts padding after `msg_namelen` (u32) to align
+/// `msg_iov` (pointer) to 8 bytes, and after `msg_flags` (i32) to bring
+/// the struct size to a multiple of 8 (the alignment of pointer fields).
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct MsgHdr {
     pub msg_name: *mut u8,
     pub msg_namelen: u32,
+    /// Alignment padding after u32 `msg_namelen` to align `msg_iov` to 8 bytes.
     pub(crate) _pad1: u32,
     pub msg_iov: *mut IoVec,
     pub msg_iovlen: usize,
     pub msg_control: *mut u8,
     pub msg_controllen: usize,
     pub msg_flags: i32,
+    /// Trailing padding after i32 `msg_flags` for 8-byte struct alignment.
     pub(crate) _pad2: u32,
 }
