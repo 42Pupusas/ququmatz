@@ -6,6 +6,7 @@ use core::ops::BitOr;
 
 /// `io_uring` submission queue operation codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 #[repr(u8)]
 pub enum Opcode {
     Nop = 0,
@@ -437,7 +438,7 @@ pub struct IoUringParams {
 }
 
 /// Submission queue entry. Flat layout with padding to match the 64-byte kernel struct.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct IoUringSqe {
     pub opcode: u8,
@@ -493,8 +494,13 @@ pub struct Timespec {
 
 impl Timespec {
     /// Create a timespec from seconds and nanoseconds.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds if `nsec` is not in `0..1_000_000_000`.
     #[must_use]
     pub const fn new(sec: i64, nsec: i64) -> Self {
+        debug_assert!(nsec >= 0 && nsec < 1_000_000_000, "nsec out of range 0..1_000_000_000");
         Self {
             tv_sec: sec,
             tv_nsec: nsec,

@@ -171,7 +171,7 @@ impl IoUring {
         // The kernel reads sq_array to find which SQE slot each submission
         // refers to. With identity mapping we never need to update it again.
         for i in 0..params.sq_entries {
-            unsafe { sq_array.add(i as usize).write_volatile(i) };
+            unsafe { sq_array.add(i as usize).write(i) };
         }
 
         let cq_base = cq_ring_ptr as *const u8;
@@ -212,9 +212,9 @@ impl IoUring {
     #[allow(clippy::needless_pass_by_value)]
     pub fn push(&mut self, sqe: Sqe) -> Result<(), Error> {
         let head = unsafe { &*self.sq_head }.load(Ordering::Acquire);
-        let next_tail = self.sq_tail_local + 1;
+        let next_tail = self.sq_tail_local.wrapping_add(1);
 
-        if next_tail - head > self.sq_mask + 1 {
+        if next_tail.wrapping_sub(head) > self.sq_mask + 1 {
             return Err(Error::EAGAIN);
         }
 

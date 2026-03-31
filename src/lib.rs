@@ -1,3 +1,6 @@
+#![no_std]
+#![cfg(target_arch = "x86_64")]
+
 mod error;
 pub mod op;
 pub(crate) mod syscall;
@@ -17,6 +20,9 @@ pub use types::{Features, IoVec, RawFd, SetupFlags, SqeFlags, TimeoutFlags, Time
     clippy::cast_sign_loss
 )]
 mod tests {
+    extern crate std;
+    use std::{vec, vec::Vec};
+
     use super::*;
     use crate::types::{
         AcceptFlags, FileMode, FsyncFlags, IoUringCqe, IoUringParams, IoUringSqe, MsgFlags, Opcode,
@@ -649,7 +655,7 @@ mod tests {
     }
 
     #[cfg(not(miri))]
-    fn setup_tcp_listener(port: u16) -> i32 {
+    fn setup_tcp_listener() -> (i32, u16) {
         let fd = syscall::socket(types::AF_INET, types::SOCK_STREAM | types::SOCK_NONBLOCK, 0)
             .expect("socket") as i32;
 
@@ -665,7 +671,7 @@ mod tests {
 
         let addr = SockAddrIn {
             sin_family: types::AF_INET as u16,
-            sin_port: port.to_be(),
+            sin_port: 0u16.to_be(), // let the kernel pick an ephemeral port
             sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
             sin_zero: [0; 8],
         };
@@ -676,15 +682,25 @@ mod tests {
         )
         .expect("bind");
         syscall::listen(fd as usize, 1).expect("listen");
-        fd
+
+        // Retrieve the actual port assigned by the kernel
+        let mut bound_addr = SockAddrIn::default();
+        let mut addrlen = core::mem::size_of::<SockAddrIn>() as u32;
+        syscall::getsockname(
+            fd as usize,
+            (&raw mut bound_addr).cast(),
+            &raw mut addrlen,
+        )
+        .expect("getsockname");
+
+        (fd, u16::from_be(bound_addr.sin_port))
     }
 
     #[cfg(not(miri))]
     #[test]
     fn tcp_send_recv_roundtrip() {
         let mut ring = IoUring::new(8).expect("setup");
-        let port: u16 = 44_444;
-        let listener = setup_tcp_listener(port);
+        let (listener, port) = setup_tcp_listener();
 
         let client = syscall::socket(types::AF_INET, types::SOCK_STREAM | types::SOCK_NONBLOCK, 0)
             .expect("client socket") as i32;

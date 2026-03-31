@@ -15,6 +15,7 @@ const SYS_MUNMAP: usize = 11;
 const SYS_SOCKET: usize = 41;
 const SYS_BIND: usize = 49;
 const SYS_LISTEN: usize = 50;
+const SYS_GETSOCKNAME: usize = 51;
 const SYS_SETSOCKOPT: usize = 54;
 const SYS_OPENAT: usize = 257;
 const SYS_IO_URING_SETUP: usize = 425;
@@ -46,6 +47,70 @@ unsafe fn syscall2(nr: usize, a1: usize, a2: usize) -> isize {
             inlateout("rax") nr as isize => ret,
             in("rdi") a1,
             in("rsi") a2,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+#[inline]
+unsafe fn syscall3(nr: usize, a1: usize, a2: usize, a3: usize) -> isize {
+    let ret: isize;
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") nr as isize => ret,
+            in("rdi") a1,
+            in("rsi") a2,
+            in("rdx") a3,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+#[inline]
+unsafe fn syscall4(nr: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> isize {
+    let ret: isize;
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") nr as isize => ret,
+            in("rdi") a1,
+            in("rsi") a2,
+            in("rdx") a3,
+            in("r10") a4,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+#[inline]
+unsafe fn syscall5(
+    nr: usize,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+) -> isize {
+    let ret: isize;
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") nr as isize => ret,
+            in("rdi") a1,
+            in("rsi") a2,
+            in("rdx") a3,
+            in("r10") a4,
+            in("r8") a5,
             lateout("rcx") _,
             lateout("r11") _,
             options(nostack),
@@ -150,39 +215,39 @@ pub fn openat(
     mode: crate::types::FileMode,
 ) -> Result<usize, Error> {
     check(unsafe {
-        syscall6(
+        syscall4(
             SYS_OPENAT,
             dfd as usize,
             path as usize,
             flags.bits() as usize,
             mode.bits() as usize,
-            0,
-            0,
         )
     })
 }
 
 pub fn socket(domain: i32, sock_type: i32, protocol: i32) -> Result<usize, Error> {
     check(unsafe {
-        syscall6(
+        syscall3(
             SYS_SOCKET,
             domain as usize,
             sock_type as usize,
             protocol as usize,
-            0,
-            0,
-            0,
         )
     })
 }
 
 pub fn bind(fd: usize, addr: *const u8, addrlen: u32) -> Result<(), Error> {
-    check(unsafe { syscall6(SYS_BIND, fd, addr as usize, addrlen as usize, 0, 0, 0) })?;
+    check(unsafe { syscall3(SYS_BIND, fd, addr as usize, addrlen as usize) })?;
     Ok(())
 }
 
 pub fn listen(fd: usize, backlog: i32) -> Result<(), Error> {
-    check(unsafe { syscall6(SYS_LISTEN, fd, backlog as usize, 0, 0, 0, 0) })?;
+    check(unsafe { syscall2(SYS_LISTEN, fd, backlog as usize) })?;
+    Ok(())
+}
+
+pub fn getsockname(fd: usize, addr: *mut u8, addrlen: *mut u32) -> Result<(), Error> {
+    check(unsafe { syscall3(SYS_GETSOCKNAME, fd, addr as usize, addrlen as usize) })?;
     Ok(())
 }
 
@@ -194,14 +259,13 @@ pub fn setsockopt(
     optlen: u32,
 ) -> Result<(), Error> {
     check(unsafe {
-        syscall6(
+        syscall5(
             SYS_SETSOCKOPT,
             fd,
             level as usize,
             optname as usize,
             optval as usize,
             optlen as usize,
-            0,
         )
     })?;
     Ok(())
@@ -209,14 +273,12 @@ pub fn setsockopt(
 
 pub fn io_uring_register(fd: usize, opcode: u32, arg: usize, nr_args: u32) -> Result<usize, Error> {
     check(unsafe {
-        syscall6(
+        syscall4(
             SYS_IO_URING_REGISTER,
             fd,
             opcode as usize,
             arg,
             nr_args as usize,
-            0,
-            0,
         )
     })
 }

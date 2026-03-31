@@ -513,10 +513,10 @@ impl Sqe {
         self
     }
 
-    /// Set SQE flags (e.g., for linked operations).
+    /// Add SQE flags (OR'd with any existing flags).
     #[must_use]
     pub const fn flags(mut self, flags: SqeFlags) -> Self {
-        self.0.flags = flags.bits();
+        self.0.flags |= flags.bits();
         self
     }
 
