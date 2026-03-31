@@ -2,6 +2,12 @@
 name = "ququmatz"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Zero-dependency io_uring bindings via raw syscalls, no libc"
+license = "MIT"
+repository = "https://github.com/42Pupusas/ququmatz"
+keywords = ["io-uring", "linux", "no-std", "async", "syscall"]
+categories = ["os::linux-apis", "no-std"]
 
 [lints.clippy]
 perf = { level = "warn", priority = -1 }
