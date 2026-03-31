@@ -15,6 +15,8 @@ impl Error {
     pub const EINVAL: Self = Self(22);
     pub const ENOSYS: Self = Self(38);
     pub const EAGAIN: Self = Self(11);
+    pub const ETIME: Self = Self(62);
+    pub const ECANCELED: Self = Self(125);
 
     /// Returns the raw errno value.
     #[must_use]

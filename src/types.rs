@@ -428,6 +428,11 @@ pub type RawFd = i32;
 /// Fields are private because an `IoVec` with a dangling or mismatched
 /// pointer/length is instant UB when submitted to the kernel. Use
 /// [`new`](Self::new) to construct.
+///
+/// **Lifetime warning:** `IoVec` implements `Clone` and `Copy` (required
+/// for use in arrays and kernel registration). Cloning an `IoVec` does
+/// *not* extend the lifetime of the underlying buffer — it is the
+/// caller's responsibility to ensure the buffer outlives all copies.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct IoVec {
@@ -501,10 +506,7 @@ impl Timespec {
     #[must_use]
     #[allow(clippy::cast_possible_wrap)]
     pub const fn from_millis(ms: u64) -> Self {
-        Self {
-            tv_sec: (ms / 1000) as i64,
-            tv_nsec: ((ms % 1000) * 1_000_000) as i64,
-        }
+        Self::new((ms / 1000) as i64, ((ms % 1000) * 1_000_000) as i64)
     }
 
     /// Returns the seconds component.

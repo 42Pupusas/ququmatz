@@ -31,11 +31,14 @@ impl Completion {
     /// error (e.g., `IORING_OP_TIMEOUT` returns `-ETIME` on normal expiry),
     /// inspect [`result`](Self::result) directly instead.
     ///
+    /// This method borrows rather than consuming so that `user_data` and
+    /// `flags` (e.g., `CqeFlags::MORE` for multishot) remain accessible.
+    ///
     /// # Errors
     ///
     /// Returns `Error` when the kernel reported a negative errno.
     #[allow(clippy::cast_sign_loss)]
-    pub const fn into_result(self) -> Result<u32, Error> {
+    pub const fn into_result(&self) -> Result<u32, Error> {
         if self.result < 0 {
             Err(Error(-self.result))
         } else {
@@ -59,6 +62,50 @@ struct MappedRegion {
 impl MappedRegion {
     const fn new(addr: usize, len: usize) -> Self {
         Self { addr, len }
+    }
+}
+
+/// Cleanup guard for partially-initialized ring resources.
+///
+/// Tracks resources acquired during `from_params` so that *any* error
+/// path can just `drop(guard)` instead of manually unwinding each
+/// prior allocation. Call `disarm()` on success to prevent cleanup.
+struct SetupGuard {
+    fd: usize,
+    sq_ring: MappedRegion,
+    cq_ring: MappedRegion,
+    sqes: MappedRegion,
+}
+
+impl SetupGuard {
+    const fn new(fd: usize) -> Self {
+        Self {
+            fd,
+            sq_ring: MappedRegion { addr: 0, len: 0 },
+            cq_ring: MappedRegion { addr: 0, len: 0 },
+            sqes: MappedRegion { addr: 0, len: 0 },
+        }
+    }
+
+    /// Consume the guard without running cleanup. Call after all
+    /// resources have been moved into the final `IoUring` struct.
+    const fn disarm(self) {
+        core::mem::forget(self);
+    }
+}
+
+impl Drop for SetupGuard {
+    fn drop(&mut self) {
+        if self.sqes.len > 0 {
+            let _ = syscall::munmap(self.sqes.addr, self.sqes.len);
+        }
+        if self.cq_ring.len > 0 {
+            let _ = syscall::munmap(self.cq_ring.addr, self.cq_ring.len);
+        }
+        if self.sq_ring.len > 0 {
+            let _ = syscall::munmap(self.sq_ring.addr, self.sq_ring.len);
+        }
+        let _ = syscall::close(self.fd);
     }
 }
 
@@ -92,6 +139,10 @@ pub struct IoUring {
     // SQE array
     sqes: *mut IoUringSqe,
     sq_tail_local: u32,
+    /// Last `sq_tail_local` value that was submitted to the kernel via
+    /// `io_uring_enter`. Used to compute `to_submit` without racing the
+    /// kernel's `sq_head` after `flush_sq_tail()`.
+    sq_submitted: u32,
 
     // CQ ring pointers (into mmap'd memory)
     cq_head: *const AtomicU32,
@@ -164,6 +215,7 @@ impl IoUring {
         let map = MapFlags::SHARED | MapFlags::POPULATE;
 
         let fd = syscall::io_uring_setup(entries, &raw mut *params)?;
+        let mut guard = SetupGuard::new(fd);
 
         let features = Features::from_raw(params.features);
         let single_mmap = features.contains(Features::SINGLE_MMAP);
@@ -180,42 +232,23 @@ impl IoUring {
         } else {
             sq_ring_sz
         };
-        let sq_ring_ptr = match syscall::mmap(0, mmap_sz, prot, map, fd, RingOffset::SqRing.into())
-        {
-            Ok(ptr) => ptr,
-            Err(e) => {
-                let _ = syscall::close(fd);
-                return Err(e);
-            }
-        };
+        let sq_ring_ptr = syscall::mmap(0, mmap_sz, prot, map, fd, RingOffset::SqRing.into())?;
+        guard.sq_ring = MappedRegion::new(sq_ring_ptr, mmap_sz);
 
         // Map the CQ ring (reuse SQ mmap if SINGLE_MMAP)
         let (cq_ring_ptr, cq_ring_region) = if single_mmap {
             (sq_ring_ptr, MappedRegion::new(0, 0))
         } else {
-            match syscall::mmap(0, cq_ring_sz, prot, map, fd, RingOffset::CqRing.into()) {
-                Ok(ptr) => (ptr, MappedRegion::new(ptr, cq_ring_sz)),
-                Err(e) => {
-                    let _ = syscall::munmap(sq_ring_ptr, mmap_sz);
-                    let _ = syscall::close(fd);
-                    return Err(e);
-                }
-            }
+            let ptr = syscall::mmap(0, cq_ring_sz, prot, map, fd, RingOffset::CqRing.into())?;
+            let region = MappedRegion::new(ptr, cq_ring_sz);
+            guard.cq_ring = MappedRegion::new(ptr, cq_ring_sz);
+            (ptr, region)
         };
 
         // Map the SQE array
         let sqes_sz = params.sq_entries as usize * core::mem::size_of::<IoUringSqe>();
-        let sqes_ptr = match syscall::mmap(0, sqes_sz, prot, map, fd, RingOffset::Sqes.into()) {
-            Ok(ptr) => ptr,
-            Err(e) => {
-                if cq_ring_region.len > 0 {
-                    let _ = syscall::munmap(cq_ring_region.addr, cq_ring_region.len);
-                }
-                let _ = syscall::munmap(sq_ring_ptr, mmap_sz);
-                let _ = syscall::close(fd);
-                return Err(e);
-            }
-        };
+        let sqes_ptr = syscall::mmap(0, sqes_sz, prot, map, fd, RingOffset::Sqes.into())?;
+        guard.sqes = MappedRegion::new(sqes_ptr, sqes_sz);
 
         let sq_base = sq_ring_ptr as *const u8;
         let sq_head = unsafe { sq_base.add(params.sq_off.head as usize) }.cast::<AtomicU32>();
@@ -229,9 +262,16 @@ impl IoUring {
         debug_assert!(sq_flags.is_aligned(), "sq_flags not aligned");
         debug_assert!(sq_array.is_aligned(), "sq_array not aligned");
 
-        // Pre-fill sq_array with identity mapping (sqe[i] -> slot i).
-        // The kernel reads sq_array to find which SQE slot each submission
-        // refers to. With identity mapping we never need to update it again.
+        // Pre-fill sq_array with identity mapping (sq_array[i] = i).
+        //
+        // The kernel reads sq_array[tail & mask] to find which SQE slot to
+        // consume. Because push() always writes sqes[tail & mask] and the
+        // identity mapping means sq_array[j] == j for all j < sq_entries,
+        // the kernel always picks up the right slot without us ever
+        // touching sq_array again.
+        //
+        // SAFETY: this invariant breaks if push() ever writes to a slot
+        // other than (tail & mask), or if SQE reordering is added later.
         for i in 0..params.sq_entries {
             unsafe { sq_array.add(i as usize).write(i) };
         }
@@ -249,6 +289,10 @@ impl IoUring {
         let sq_tail_local = unsafe { &*sq_tail }.load(Ordering::Acquire);
         let cq_head_local = unsafe { &*cq_head }.load(Ordering::Acquire);
 
+        // All resources acquired — disarm the guard so Drop doesn't
+        // clean up what we're about to hand to the IoUring struct.
+        guard.disarm();
+
         Ok(Self {
             fd,
             sq_head,
@@ -257,6 +301,7 @@ impl IoUring {
             sq_flags,
             sqes: sqes_ptr as *mut IoUringSqe,
             sq_tail_local,
+            sq_submitted: sq_tail_local,
             cq_head,
             cq_tail,
             cq_mask,
@@ -321,6 +366,11 @@ impl IoUring {
     ///
     /// Returns the number of entries submitted.
     ///
+    /// **SQPOLL note:** In SQPOLL mode the kernel thread consumes SQEs
+    /// asynchronously. This method issues a plain `io_uring_enter` which
+    /// may not wake a sleeping SQPOLL thread. Use
+    /// [`submit_sqpoll`](Self::submit_sqpoll) instead.
+    ///
     /// # Errors
     ///
     /// Returns an error if the kernel rejects the submission.
@@ -328,13 +378,17 @@ impl IoUring {
     #[allow(clippy::cast_possible_truncation)]
     pub fn submit(&mut self) -> Result<u32, Error> {
         self.flush_cq_head();
+        // Snapshot the count *before* publishing the tail. After
+        // flush_sq_tail() the kernel may start consuming entries
+        // immediately, advancing sq_head — reading head after the
+        // flush would race and undercount.
+        let to_submit = self.sq_tail_local.wrapping_sub(self.sq_submitted);
         self.flush_sq_tail();
-        let head = unsafe { &*self.sq_head }.load(Ordering::Acquire);
-        let to_submit = self.sq_tail_local.wrapping_sub(head);
         if to_submit == 0 {
             return Ok(0);
         }
         let ret = syscall::io_uring_enter(self.fd, to_submit, 0, EnterFlags::default())?;
+        self.sq_submitted = self.sq_tail_local;
         Ok(ret as u32)
     }
 
@@ -348,6 +402,11 @@ impl IoUring {
     /// `min_complete > 0` and no completions are forthcoming (e.g., you forgot
     /// to push any SQEs), it will block indefinitely.
     ///
+    /// **SQPOLL note:** In SQPOLL mode the kernel thread consumes SQEs
+    /// asynchronously. This method issues a plain `io_uring_enter` which
+    /// may not wake a sleeping SQPOLL thread. Use
+    /// [`submit_sqpoll`](Self::submit_sqpoll) instead.
+    ///
     /// # Errors
     ///
     /// Returns an error if the kernel rejects the submission.
@@ -355,10 +414,10 @@ impl IoUring {
     #[allow(clippy::cast_possible_truncation)]
     pub fn submit_and_wait(&mut self, min_complete: u32) -> Result<u32, Error> {
         self.flush_cq_head();
+        let to_submit = self.sq_tail_local.wrapping_sub(self.sq_submitted);
         self.flush_sq_tail();
-        let head = unsafe { &*self.sq_head }.load(Ordering::Acquire);
-        let to_submit = self.sq_tail_local.wrapping_sub(head);
         let ret = syscall::io_uring_enter(self.fd, to_submit, min_complete, EnterFlags::GETEVENTS)?;
+        self.sq_submitted = self.sq_tail_local;
         Ok(ret as u32)
     }
 
@@ -377,6 +436,7 @@ impl IoUring {
     pub fn submit_sqpoll(&mut self) -> Result<(), Error> {
         self.flush_cq_head();
         self.flush_sq_tail();
+        self.sq_submitted = self.sq_tail_local;
         if self.sq_need_wakeup() {
             syscall::io_uring_enter(self.fd, 0, 0, EnterFlags::SQ_WAKEUP)?;
         }
