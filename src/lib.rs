@@ -11,7 +11,9 @@ mod ring;
 pub use error::Error;
 pub use op::Sqe;
 pub use ring::{Completion, Completions, IoUring, IoUringBuilder};
-pub use types::{Features, IoVec, RawFd, SetupFlags, SqeFlags, TimeoutFlags, Timespec};
+pub use types::{
+    CqeFlags, Features, IoVec, RawFd, SetupFlags, SqeFlags, TimeoutFlags, Timespec,
+};
 
 #[cfg(test)]
 #[allow(

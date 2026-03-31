@@ -2,8 +2,8 @@ use crate::error::Error;
 use crate::op::Sqe;
 use crate::syscall;
 use crate::types::{
-    EnterFlags, Features, IoUringCqe, IoUringParams, IoUringSqe, IoVec, MapFlags, Prot, RegisterOp,
-    RingOffset, SetupFlags,
+    CqeFlags, EnterFlags, Features, IoUringCqe, IoUringParams, IoUringSqe, IoVec, MapFlags, Prot,
+    RegisterOp, RingOffset, SetupFlags,
 };
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -14,6 +14,30 @@ pub struct Completion {
     pub user_data: u64,
     /// The result code (bytes transferred on success, negative errno on failure).
     pub result: i32,
+    /// Kernel-set flags (multishot, buffer selection, etc.).
+    pub flags: CqeFlags,
+}
+
+impl Completion {
+    /// Convert the result into a `Result`, mapping negative errno to `Error`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error` when the kernel reported a negative errno.
+    #[allow(clippy::cast_sign_loss)]
+    pub const fn into_result(self) -> Result<u32, Error> {
+        if self.result < 0 {
+            Err(Error(-self.result))
+        } else {
+            Ok(self.result as u32)
+        }
+    }
+
+    /// Returns `true` if the result is a negative errno.
+    #[must_use]
+    pub const fn is_err(&self) -> bool {
+        self.result < 0
+    }
 }
 
 /// Mapped memory region, for cleanup in `Drop`.
@@ -100,6 +124,18 @@ impl IoUring {
         const IORING_SQ_CQ_OVERFLOW: u32 = 1 << 1;
         let flags = unsafe { &*self.sq_flags }.load(Ordering::Acquire);
         flags & IORING_SQ_CQ_OVERFLOW != 0
+    }
+
+    /// Check if the SQPOLL kernel thread needs a wakeup.
+    ///
+    /// Only meaningful when the ring was created with [`IoUringBuilder::sqpoll`].
+    /// When this returns `true`, call [`submit_sqpoll`](Self::submit_sqpoll) or
+    /// use `io_uring_enter` with `SQ_WAKEUP` to kick the kernel thread.
+    #[must_use]
+    pub fn sq_need_wakeup(&self) -> bool {
+        const IORING_SQ_NEED_WAKEUP: u32 = 1 << 0;
+        let flags = unsafe { &*self.sq_flags }.load(Ordering::Acquire);
+        flags & IORING_SQ_NEED_WAKEUP != 0
     }
 
     #[allow(clippy::cast_ptr_alignment)]
@@ -241,10 +277,10 @@ impl IoUring {
 
     /// Publish the local SQ tail to the kernel-visible atomic tail.
     ///
-    /// Called automatically by `submit` and `submit_and_wait`; only needed
-    /// directly when using SQPOLL mode without explicit submission.
+    /// Called automatically by `submit`, `submit_and_wait`, and `submit_sqpoll`.
+    /// Call directly only if you need fine-grained control in SQPOLL mode.
     #[inline]
-    fn flush_sq_tail(&self) {
+    pub fn flush_sq_tail(&self) {
         unsafe { &*self.sq_tail }.store(self.sq_tail_local, Ordering::Release);
     }
 
@@ -258,6 +294,7 @@ impl IoUring {
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
     pub fn submit(&mut self) -> Result<u32, Error> {
+        self.flush_cq_head();
         self.flush_sq_tail();
         let head = unsafe { &*self.sq_head }.load(Ordering::Acquire);
         let to_submit = self.sq_tail_local.wrapping_sub(head);
@@ -265,7 +302,6 @@ impl IoUring {
             return Ok(0);
         }
         let ret = syscall::io_uring_enter(self.fd, to_submit, 0, EnterFlags::default())?;
-        self.flush_cq_head();
         Ok(ret as u32)
     }
 
@@ -287,11 +323,32 @@ impl IoUring {
         Ok(ret as u32)
     }
 
+    /// Submit queued entries in SQPOLL mode.
+    ///
+    /// Publishes the SQ tail so the kernel polling thread sees new entries.
+    /// If the polling thread has gone to sleep, wakes it with `io_uring_enter`.
+    ///
+    /// Unlike [`submit`](Self::submit), this avoids a syscall when the kernel
+    /// thread is already running.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the wakeup `io_uring_enter` call fails.
+    #[inline]
+    pub fn submit_sqpoll(&mut self) -> Result<(), Error> {
+        self.flush_cq_head();
+        self.flush_sq_tail();
+        if self.sq_need_wakeup() {
+            syscall::io_uring_enter(self.fd, 0, 0, EnterFlags::SQ_WAKEUP)?;
+        }
+        Ok(())
+    }
+
     /// Publish the local CQ head to the kernel-visible atomic head.
     ///
-    /// Called automatically by `submit`, `submit_and_wait`, and `Drop`.
-    /// Call explicitly after draining completions if you need the kernel to
-    /// see freed CQ slots before the next submission.
+    /// Called automatically by `submit`, `submit_and_wait`, `submit_sqpoll`,
+    /// and `Drop`. Call explicitly after draining completions if you need the
+    /// kernel to see freed CQ slots before the next submission.
     #[inline]
     fn flush_cq_head(&self) {
         unsafe { &*self.cq_head }.store(self.cq_head_local, Ordering::Release);
@@ -316,6 +373,7 @@ impl IoUring {
         let completion = Completion {
             user_data: cqe.user_data,
             result: cqe.res,
+            flags: CqeFlags::from_raw(cqe.flags),
         };
 
         self.cq_head_local = self.cq_head_local.wrapping_add(1);
@@ -402,6 +460,13 @@ impl Iterator for Completions<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         self.ring.complete()
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let tail = unsafe { &*self.ring.cq_tail }.load(Ordering::Acquire);
+        let pending = tail.wrapping_sub(self.ring.cq_head_local) as usize;
+        // Lower bound is what's visible now; upper is unknown (more may arrive).
+        (pending, None)
+    }
 }
 
 impl Drop for IoUring {
@@ -433,9 +498,13 @@ pub struct IoUringBuilder {
 
 impl IoUringBuilder {
     /// Start building an `io_uring` with the given queue depth.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `entries` is 0.
     #[must_use]
     pub fn new(entries: u32) -> Self {
-        debug_assert!(entries > 0, "io_uring entries must be > 0");
+        assert!(entries > 0, "io_uring entries must be > 0");
         Self {
             entries,
             params: IoUringParams::default(),

@@ -109,6 +109,8 @@ bitflags! {
     /// Flags for `io_uring_enter`.
     pub struct EnterFlags(u32);
     const GETEVENTS = 1 << 0;
+    /// Wake a sleeping SQPOLL thread.
+    const SQ_WAKEUP = 1 << 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +366,30 @@ pub struct IoUringCqe {
     pub flags: u32,
 }
 
+// ---------------------------------------------------------------------------
+// CQE flags (returned by kernel in cqe.flags)
+// ---------------------------------------------------------------------------
+
+bitflags! {
+    /// Flags on a completed CQE, set by the kernel.
+    pub struct CqeFlags(u32);
+    /// The buffer index is stored in the upper 16 bits of `flags`.
+    const BUFFER = 1 << 0;
+    /// More completions will follow from this request (multishot).
+    const MORE = 1 << 1;
+    /// Socket has more data ready to read (recv/accept).
+    const SOCK_NONEMPTY = 1 << 2;
+    /// Notification-only CQE (e.g. zero-copy send confirmation).
+    const NOTIF = 1 << 3;
+}
+
+impl CqeFlags {
+    /// Construct from the raw value in the CQE.
+    pub(crate) const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+}
+
 /// Raw file descriptor type alias.
 pub type RawFd = i32;
 
@@ -391,7 +417,7 @@ impl Timespec {
     /// Panics in debug builds if `nsec` is not in `0..1_000_000_000`.
     #[must_use]
     pub const fn new(sec: i64, nsec: i64) -> Self {
-        debug_assert!(
+        assert!(
             nsec >= 0 && nsec < 1_000_000_000,
             "nsec out of range 0..1_000_000_000"
         );
