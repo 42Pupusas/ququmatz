@@ -2,6 +2,7 @@
 #![cfg(target_arch = "x86_64")]
 
 mod error;
+pub mod net;
 pub mod op;
 pub(crate) mod syscall;
 pub mod types;
@@ -9,6 +10,7 @@ pub mod types;
 mod ring;
 
 pub use error::Error;
+pub use net::Socket;
 pub use op::Sqe;
 pub use ring::{Completion, Completions, IoUring, IoUringBuilder};
 pub use types::{
