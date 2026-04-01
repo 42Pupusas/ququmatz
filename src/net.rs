@@ -37,6 +37,20 @@ impl Socket {
         self.fd
     }
 
+    /// Wrap an existing raw file descriptor in a `Socket`.
+    ///
+    /// This is the inverse of [`into_fd`](Socket::into_fd). Use it to adopt
+    /// fds returned by io\_uring accept SQEs or other sources.
+    ///
+    /// # Safety
+    ///
+    /// `fd` must be a valid, open socket file descriptor. The caller
+    /// transfers ownership — the `Socket` will close it on drop.
+    #[inline]
+    pub unsafe fn from_fd(fd: RawFd) -> Self {
+        Self { fd }
+    }
+
     /// Consume the `Socket` and return the raw fd **without** closing it.
     ///
     /// The caller assumes ownership and is responsible for closing the fd.
