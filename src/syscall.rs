@@ -13,6 +13,11 @@ const SYS_CLOSE: usize = 3;
 const SYS_MMAP: usize = 9;
 const SYS_MUNMAP: usize = 11;
 const SYS_SOCKET: usize = 41;
+const SYS_CONNECT: usize = 42;
+const SYS_ACCEPT4: usize = 288;
+const SYS_SENDTO: usize = 44;
+const SYS_RECVFROM: usize = 45;
+const SYS_SHUTDOWN: usize = 48;
 const SYS_BIND: usize = 49;
 const SYS_LISTEN: usize = 50;
 const SYS_GETSOCKNAME: usize = 51;
@@ -229,6 +234,22 @@ pub fn socket(domain: i32, sock_type: i32, protocol: i32) -> Result<usize, Error
     })
 }
 
+pub fn connect(fd: usize, addr: *const u8, addrlen: u32) -> Result<(), Error> {
+    check(unsafe { syscall3(SYS_CONNECT, fd, addr as usize, addrlen as usize) })?;
+    Ok(())
+}
+
+pub fn accept4(
+    fd: usize,
+    addr: *mut u8,
+    addrlen: *mut u32,
+    flags: i32,
+) -> Result<usize, Error> {
+    check(unsafe {
+        syscall4(SYS_ACCEPT4, fd, addr as usize, addrlen as usize, flags as usize)
+    })
+}
+
 pub fn bind(fd: usize, addr: *const u8, addrlen: u32) -> Result<(), Error> {
     check(unsafe { syscall3(SYS_BIND, fd, addr as usize, addrlen as usize) })?;
     Ok(())
@@ -274,6 +295,19 @@ pub fn io_uring_register(fd: usize, opcode: u32, arg: usize, nr_args: u32) -> Re
             nr_args as usize,
         )
     })
+}
+
+pub fn sendto(fd: usize, buf: *const u8, len: usize, flags: u32) -> Result<usize, Error> {
+    check(unsafe { syscall6(SYS_SENDTO, fd, buf as usize, len, flags as usize, 0, 0) })
+}
+
+pub fn recvfrom(fd: usize, buf: *mut u8, len: usize, flags: u32) -> Result<usize, Error> {
+    check(unsafe { syscall6(SYS_RECVFROM, fd, buf as usize, len, flags as usize, 0, 0) })
+}
+
+pub fn shutdown(fd: usize, how: u32) -> Result<(), Error> {
+    check(unsafe { syscall2(SYS_SHUTDOWN, fd, how as usize) })?;
+    Ok(())
 }
 
 pub fn close(fd: usize) -> Result<(), Error> {

@@ -7,7 +7,7 @@
 
 use crate::error::Error;
 use crate::syscall;
-use crate::types::{RawFd, SockAddrIn};
+use crate::types::{AcceptFlags, MsgFlags, RawFd, ShutdownHow, SockAddrIn};
 use core::mem;
 
 /// An owned socket file descriptor.
@@ -56,6 +56,31 @@ impl Socket {
         )
     }
 
+    /// Connect to a remote address.
+    pub fn connect(&self, addr: &SockAddrIn) -> Result<(), Error> {
+        syscall::connect(
+            self.fd as usize,
+            (addr as *const SockAddrIn).cast(),
+            mem::size_of::<SockAddrIn>() as u32,
+        )
+    }
+
+    /// Accept a connection, returning the new socket and peer address.
+    ///
+    /// `flags` can set properties on the returned socket (e.g.
+    /// `AcceptFlags::NONBLOCK`).
+    pub fn accept(&self, flags: AcceptFlags) -> Result<(Socket, SockAddrIn), Error> {
+        let mut addr = SockAddrIn::default();
+        let mut len = mem::size_of::<SockAddrIn>() as u32;
+        let fd = syscall::accept4(
+            self.fd as usize,
+            (&raw mut addr).cast(),
+            &raw mut len,
+            flags.bits() as i32,
+        )? as RawFd;
+        Ok((Socket { fd }, addr))
+    }
+
     /// Mark the socket as a passive listener with the given `backlog`.
     pub fn listen(&self, backlog: i32) -> Result<(), Error> {
         syscall::listen(self.fd as usize, backlog)
@@ -74,6 +99,30 @@ impl Socket {
             (value as *const T).cast(),
             mem::size_of::<T>() as u32,
         )
+    }
+
+    /// Send data on the socket. Returns the number of bytes sent.
+    pub fn send(&self, buf: &[u8], flags: MsgFlags) -> Result<usize, Error> {
+        syscall::sendto(self.fd as usize, buf.as_ptr(), buf.len(), flags.bits())
+    }
+
+    /// Receive data from the socket. Returns the number of bytes read.
+    pub fn recv(&self, buf: &mut [u8], flags: MsgFlags) -> Result<usize, Error> {
+        syscall::recvfrom(self.fd as usize, buf.as_mut_ptr(), buf.len(), flags.bits())
+    }
+
+    /// Shut down part or all of the connection.
+    pub fn shutdown(&self, how: ShutdownHow) -> Result<(), Error> {
+        syscall::shutdown(self.fd as usize, how as u32)
+    }
+
+    /// Close the socket, consuming it and returning any error.
+    ///
+    /// Unlike [`Drop`], this surfaces the error from `close(2)`.
+    pub fn close(self) -> Result<(), Error> {
+        let fd = self.fd;
+        mem::forget(self);
+        syscall::close(fd as usize)
     }
 
     /// Retrieve the local address the socket is bound to.
