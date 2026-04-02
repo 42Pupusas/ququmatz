@@ -6,145 +6,28 @@
     clippy::missing_errors_doc
 )]
 
+#[cfg(target_arch = "x86_64")]
+mod x86_64;
+#[cfg(target_arch = "x86_64")]
+use x86_64 as arch;
+
+#[cfg(target_arch = "aarch64")]
+mod aarch64;
+#[cfg(target_arch = "aarch64")]
+use aarch64 as arch;
+
+#[cfg(target_arch = "riscv64")]
+mod riscv64;
+#[cfg(target_arch = "riscv64")]
+use riscv64 as arch;
+
+#[cfg(target_arch = "arm")]
+mod arm;
+#[cfg(target_arch = "arm")]
+use arm as arch;
+
+use arch::*;
 use crate::error::Error;
-use core::arch::asm;
-
-const SYS_CLOSE: usize = 3;
-const SYS_MMAP: usize = 9;
-const SYS_MUNMAP: usize = 11;
-const SYS_SOCKET: usize = 41;
-const SYS_CONNECT: usize = 42;
-const SYS_ACCEPT4: usize = 288;
-const SYS_SENDTO: usize = 44;
-const SYS_RECVFROM: usize = 45;
-const SYS_SHUTDOWN: usize = 48;
-const SYS_BIND: usize = 49;
-const SYS_LISTEN: usize = 50;
-const SYS_GETSOCKNAME: usize = 51;
-const SYS_SETSOCKOPT: usize = 54;
-const SYS_OPENAT: usize = 257;
-const SYS_IO_URING_SETUP: usize = 425;
-const SYS_IO_URING_ENTER: usize = 426;
-const SYS_IO_URING_REGISTER: usize = 427;
-
-#[inline]
-unsafe fn syscall1(nr: usize, a1: usize) -> isize {
-    let ret: isize;
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") nr as isize => ret,
-            in("rdi") a1,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-#[inline]
-unsafe fn syscall2(nr: usize, a1: usize, a2: usize) -> isize {
-    let ret: isize;
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") nr as isize => ret,
-            in("rdi") a1,
-            in("rsi") a2,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-#[inline]
-unsafe fn syscall3(nr: usize, a1: usize, a2: usize, a3: usize) -> isize {
-    let ret: isize;
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") nr as isize => ret,
-            in("rdi") a1,
-            in("rsi") a2,
-            in("rdx") a3,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-#[inline]
-unsafe fn syscall4(nr: usize, a1: usize, a2: usize, a3: usize, a4: usize) -> isize {
-    let ret: isize;
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") nr as isize => ret,
-            in("rdi") a1,
-            in("rsi") a2,
-            in("rdx") a3,
-            in("r10") a4,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-#[inline]
-unsafe fn syscall5(nr: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
-    let ret: isize;
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") nr as isize => ret,
-            in("rdi") a1,
-            in("rsi") a2,
-            in("rdx") a3,
-            in("r10") a4,
-            in("r8") a5,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-#[inline]
-unsafe fn syscall6(
-    nr: usize,
-    a1: usize,
-    a2: usize,
-    a3: usize,
-    a4: usize,
-    a5: usize,
-    a6: usize,
-) -> isize {
-    let ret: isize;
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") nr as isize => ret,
-            in("rdi") a1,
-            in("rsi") a2,
-            in("rdx") a3,
-            in("r10") a4,
-            in("r8") a5,
-            in("r9") a6,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack),
-        );
-    }
-    ret
-}
 
 const fn check(ret: isize) -> Result<usize, Error> {
     if ret < 0 {
@@ -188,15 +71,26 @@ pub fn mmap(
     fd: usize,
     offset: u64,
 ) -> Result<usize, Error> {
+    // ARM 32-bit uses mmap2 which takes a page-granularity offset (offset / 4096)
+    #[cfg(target_arch = "arm")]
+    let nr = SYS_MMAP2;
+    #[cfg(not(target_arch = "arm"))]
+    let nr = SYS_MMAP;
+
+    #[cfg(target_arch = "arm")]
+    let off = (offset as usize) >> 12;
+    #[cfg(not(target_arch = "arm"))]
+    let off = offset as usize;
+
     check(unsafe {
         syscall6(
-            SYS_MMAP,
+            nr,
             addr,
             len,
             prot.bits() as usize,
             flags.bits() as usize,
             fd,
-            offset as usize,
+            off,
         )
     })
 }
