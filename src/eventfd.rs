@@ -8,7 +8,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use ququmatz::{EventFd, IoUring, Sqe};
+//! use ququmatz::{EventFd, IoUring};
 //!
 //! let efd = EventFd::new(0).unwrap();
 //!
@@ -18,13 +18,8 @@
 //! // Read the counter via io_uring
 //! let mut ring = IoUring::new(4).unwrap();
 //! let mut buf = [0u8; 8];
-//! ring.push(
-//!     unsafe { Sqe::read(efd.fd(), buf.as_mut_ptr(), 8, 0) }
-//!         .user_data(1),
-//! ).unwrap();
-//! ring.submit_and_wait(1).unwrap();
+//! ring.do_read(efd.fd(), &mut buf, 0).unwrap();
 //!
-//! let cqe = ring.complete().unwrap();
 //! let value = u64::from_ne_bytes(buf);
 //! assert_eq!(value, 1);
 //! ```

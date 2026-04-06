@@ -8,22 +8,16 @@
 //! # Example
 //!
 //! ```no_run
-//! use ququmatz::{Inotify, IoUring, Sqe, WatchMask};
+//! use ququmatz::{Inotify, IoUring, WatchMask};
 //! use ququmatz::types::InotifyEvent;
-//! use core::mem;
 //!
 //! let ino = Inotify::new().unwrap();
-//! let wd = ino.add_watch(c"/tmp".to_bytes_with_nul(), WatchMask::CREATE).unwrap();
+//! let wd = ino.add_watch(c"/tmp", WatchMask::CREATE).unwrap();
 //!
 //! let mut ring = IoUring::new(4).unwrap();
 //! let mut buf = [0u8; 4096];
-//! ring.push(
-//!     unsafe { Sqe::read(ino.fd(), buf.as_mut_ptr(), buf.len() as u32, 0) }
-//!         .user_data(1),
-//! ).unwrap();
-//! ring.submit_and_wait(1).unwrap();
+//! let n = ring.do_read(ino.fd(), &mut buf, 0).unwrap();
 //!
-//! let cqe = ring.complete().unwrap();
 //! let event: InotifyEvent =
 //!     unsafe { core::ptr::read_unaligned(buf.as_ptr().cast()) };
 //! ```
@@ -37,6 +31,7 @@
 use crate::error::Error;
 use crate::syscall;
 use crate::types::{IN_NONBLOCK, RawFd, WatchMask};
+use core::ffi::CStr;
 use core::mem;
 
 /// An owned inotify file descriptor.
@@ -84,8 +79,7 @@ impl Inotify {
 
     /// Add a watch for `path` with the given event `mask`.
     ///
-    /// `path` must be a null-terminated byte string (e.g. `c"/tmp"` or a
-    /// `CStr`). Returns the watch descriptor, which can be used later with
+    /// Returns the watch descriptor, which can be used later with
     /// [`remove_watch`](Self::remove_watch).
     ///
     /// # Errors
@@ -93,8 +87,8 @@ impl Inotify {
     /// Returns an [`Error`] if the `inotify_add_watch` syscall fails (e.g.
     /// `ENOENT` if the path does not exist, `EACCES` if the path is not
     /// readable).
-    pub fn add_watch(&self, path: &[u8], mask: WatchMask) -> Result<i32, Error> {
-        Ok(syscall::inotify_add_watch(self.fd as usize, path.as_ptr(), mask.bits())? as i32)
+    pub fn add_watch(&self, path: &CStr, mask: WatchMask) -> Result<i32, Error> {
+        Ok(syscall::inotify_add_watch(self.fd as usize, path.as_ptr().cast(), mask.bits())? as i32)
     }
 
     /// Remove a previously added watch.

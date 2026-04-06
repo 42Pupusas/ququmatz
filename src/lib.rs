@@ -156,7 +156,7 @@ mod tests {
     #[test]
     fn sqe_builder_read_places_fields_correctly() {
         let mut buf = [0u8; 32];
-        let sqe = unsafe { Sqe::read(42, buf.as_mut_ptr(), 32, 100) }.user_data(99);
+        let sqe = Sqe::read(42, &mut buf, 100).user_data(99);
         let inner = sqe.0;
 
         assert_eq!(Opcode::Read, inner.opcode);
@@ -170,7 +170,7 @@ mod tests {
     #[test]
     fn sqe_builder_write_places_fields_correctly() {
         let buf = [1u8; 16];
-        let sqe = unsafe { Sqe::write(7, buf.as_ptr(), 16, 0) }.user_data(55);
+        let sqe = Sqe::write(7, &buf, 0).user_data(55);
         let inner = sqe.0;
 
         assert_eq!(Opcode::Write, inner.opcode);
@@ -185,7 +185,7 @@ mod tests {
     fn sqe_builder_readv_places_fields_correctly() {
         let mut buf = [0u8; 8];
         let vecs = [unsafe { IoVec::new(buf.as_mut_ptr(), buf.len()) }];
-        let sqe = unsafe { Sqe::readv(3, vecs.as_ptr(), 1, 50) }.user_data(10);
+        let sqe = Sqe::readv(3, &vecs, 50).user_data(10);
         let inner = sqe.0;
 
         assert_eq!(Opcode::Readv, inner.opcode);
@@ -199,17 +199,15 @@ mod tests {
     #[test]
     fn sqe_builder_openat_places_fields_correctly() {
         let path = c"/tmp/test";
-        let sqe = unsafe {
-            Sqe::openat(
-                types::AT_FDCWD,
-                path.as_ptr().cast(),
-                OpenFlags::default(),
-                FileMode::OWNER_READ
-                    | FileMode::OWNER_WRITE
-                    | FileMode::GROUP_READ
-                    | FileMode::OTHER_READ,
-            )
-        }
+        let sqe = Sqe::openat(
+            types::AT_FDCWD,
+            path,
+            OpenFlags::default(),
+            FileMode::OWNER_READ
+                | FileMode::OWNER_WRITE
+                | FileMode::GROUP_READ
+                | FileMode::OTHER_READ,
+        )
         .user_data(77);
         let inner = sqe.0;
 
@@ -331,7 +329,7 @@ mod tests {
     #[test]
     fn sqe_builder_timeout_places_fields_correctly() {
         let ts = Timespec::new(1, 500_000_000);
-        let sqe = unsafe { Sqe::timeout(&raw const ts, 3, TimeoutFlags::default()) }.user_data(42);
+        let sqe = Sqe::timeout(&ts, 3, TimeoutFlags::default()).user_data(42);
         let inner = sqe.0;
 
         assert_eq!(Opcode::Timeout, inner.opcode);
@@ -421,7 +419,7 @@ mod tests {
 
         // Write some data first
         let buf = b"fsync test";
-        ring.push(unsafe { Sqe::write(fd, buf.as_ptr(), buf.len() as u32, 0) }.user_data(1))
+        ring.push(Sqe::write(fd, buf, 0).user_data(1))
             .expect("push write");
         ring.submit_and_wait(1).expect("submit");
         ring.complete().expect("write cqe");
@@ -445,15 +443,13 @@ mod tests {
         let mut buf = Statx::default();
 
         ring.push(
-            unsafe {
-                Sqe::statx(
-                    types::AT_FDCWD,
-                    c"/tmp".as_ptr().cast(),
-                    StatxFlags::default(),
-                    StatxMask::BASIC_STATS,
-                    &raw mut buf,
-                )
-            }
+            Sqe::statx(
+                types::AT_FDCWD,
+                c"/tmp",
+                StatxFlags::default(),
+                StatxMask::BASIC_STATS,
+                &mut buf,
+            )
             .user_data(1),
         )
         .expect("push statx");
@@ -475,7 +471,7 @@ mod tests {
 
         // 50ms timeout with count=0 (pure timer)
         let ts = Timespec::from_millis(50);
-        ring.push(unsafe { Sqe::timeout(&raw const ts, 0, TimeoutFlags::default()) }.user_data(1))
+        ring.push(Sqe::timeout(&ts, 0, TimeoutFlags::default()).user_data(1))
             .expect("push");
         ring.submit_and_wait(1).expect("submit");
 
@@ -581,10 +577,8 @@ mod tests {
         let fd = open_tmpfile();
 
         let write_buf = b"hello io_uring!";
-        ring.push(
-            unsafe { Sqe::write(fd, write_buf.as_ptr(), write_buf.len() as u32, 0) }.user_data(1),
-        )
-        .expect("failed to push write");
+        ring.push(Sqe::write(fd, write_buf, 0).user_data(1))
+            .expect("failed to push write");
         ring.submit_and_wait(1).expect("failed to submit write");
 
         let cqe = ring.complete().expect("expected write completion");
@@ -592,10 +586,8 @@ mod tests {
         assert_eq!(cqe.result, write_buf.len() as i32);
 
         let mut read_buf = [0u8; 64];
-        ring.push(
-            unsafe { Sqe::read(fd, read_buf.as_mut_ptr(), read_buf.len() as u32, 0) }.user_data(2),
-        )
-        .expect("failed to push read");
+        ring.push(Sqe::read(fd, &mut read_buf, 0).user_data(2))
+            .expect("failed to push read");
         ring.submit_and_wait(1).expect("failed to submit read");
 
         let cqe = ring.complete().expect("expected read completion");
@@ -624,7 +616,7 @@ mod tests {
             unsafe { IoVec::new(buf_a.as_mut_ptr(), buf_a.len()) },
             unsafe { IoVec::new(buf_b.as_mut_ptr(), buf_b.len()) },
         ];
-        ring.push(unsafe { Sqe::writev(fd, write_vecs.as_ptr(), 2, 0) }.user_data(1))
+        ring.push(Sqe::writev(fd, &write_vecs, 0).user_data(1))
             .expect("failed to push writev");
         ring.submit_and_wait(1).expect("failed to submit writev");
 
@@ -634,7 +626,7 @@ mod tests {
 
         let mut read_buf = [0u8; 64];
         let read_vecs = [unsafe { IoVec::new(read_buf.as_mut_ptr(), read_buf.len()) }];
-        ring.push(unsafe { Sqe::readv(fd, read_vecs.as_ptr(), 1, 0) }.user_data(2))
+        ring.push(Sqe::readv(fd, &read_vecs, 0).user_data(2))
             .expect("failed to push readv");
         ring.submit_and_wait(1).expect("failed to submit readv");
 
@@ -774,18 +766,8 @@ mod tests {
             .expect("client socket") as i32;
 
         // Accept + connect in parallel
-        ring.push(
-            unsafe {
-                Sqe::accept(
-                    listener,
-                    core::ptr::null_mut(),
-                    core::ptr::null_mut(),
-                    AcceptFlags::default(),
-                )
-            }
-            .user_data(1),
-        )
-        .expect("push accept");
+        ring.push(Sqe::accept(listener, AcceptFlags::default()).user_data(1))
+            .expect("push accept");
 
         let connect_addr = SockAddrIn {
             sin_family: types::AF_INET as u16,
@@ -793,17 +775,14 @@ mod tests {
             sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
             sin_zero: [0; 8],
         };
-        ring.push(
-            unsafe {
-                Sqe::connect(
-                    client,
-                    (&raw const connect_addr).cast(),
-                    core::mem::size_of::<SockAddrIn>() as u32,
-                )
-            }
-            .user_data(2),
-        )
-        .expect("push connect");
+        let addr_bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(
+                (&raw const connect_addr).cast(),
+                core::mem::size_of::<SockAddrIn>(),
+            )
+        };
+        ring.push(Sqe::connect(client, addr_bytes).user_data(2))
+            .expect("push connect");
 
         ring.submit_and_wait(2).expect("submit");
 
@@ -825,29 +804,16 @@ mod tests {
 
         // Send from client, recv on server
         let msg = b"hello from io_uring!";
-        ring.push(
-            unsafe { Sqe::send(client, msg.as_ptr(), msg.len() as u32, MsgFlags::default()) }
-                .user_data(3),
-        )
-        .expect("push send");
+        ring.push(Sqe::send(client, msg, MsgFlags::default()).user_data(3))
+            .expect("push send");
         ring.submit_and_wait(1).expect("submit send");
         let cqe = ring.complete().expect("send cqe");
         assert_eq!(cqe.user_data, 3);
         assert_eq!(cqe.result, msg.len() as i32);
 
         let mut recv_buf = [0u8; 64];
-        ring.push(
-            unsafe {
-                Sqe::recv(
-                    server_fd,
-                    recv_buf.as_mut_ptr(),
-                    recv_buf.len() as u32,
-                    MsgFlags::default(),
-                )
-            }
-            .user_data(4),
-        )
-        .expect("push recv");
+        ring.push(Sqe::recv(server_fd, &mut recv_buf, MsgFlags::default()).user_data(4))
+            .expect("push recv");
         ring.submit_and_wait(1).expect("submit recv");
         let cqe = ring.complete().expect("recv cqe");
         assert_eq!(cqe.user_data, 4);
@@ -936,10 +902,7 @@ mod tests {
     fn inotify_add_and_remove_watch() {
         let ino = Inotify::new().expect("inotify_init1");
         let wd = ino
-            .add_watch(
-                c"/tmp".to_bytes_with_nul(),
-                WatchMask::CREATE | WatchMask::DELETE,
-            )
+            .add_watch(c"/tmp", WatchMask::CREATE | WatchMask::DELETE)
             .expect("add_watch");
         assert!(wd >= 0);
         ino.remove_watch(wd).expect("remove_watch");
@@ -958,10 +921,7 @@ mod tests {
     fn inotify_add_watch_bad_path_returns_error() {
         let ino = Inotify::new().expect("inotify_init1");
         let err = ino
-            .add_watch(
-                c"/nonexistent_path_ququmatz_test".to_bytes_with_nul(),
-                WatchMask::MODIFY,
-            )
+            .add_watch(c"/nonexistent_path_ququmatz_test", WatchMask::MODIFY)
             .unwrap_err();
         assert_eq!(err, Error::ENOENT);
     }
@@ -979,8 +939,10 @@ mod tests {
         fs::create_dir_all(&dir).expect("mkdir");
 
         let watch_path = std::format!("{dir}\0");
+        let watch_cstr =
+            core::ffi::CStr::from_bytes_with_nul(watch_path.as_bytes()).expect("valid cstr");
         let wd = ino
-            .add_watch(watch_path.as_bytes(), WatchMask::CREATE)
+            .add_watch(watch_cstr, WatchMask::CREATE)
             .expect("add_watch");
 
         // Create a file inside the watched dir to trigger an event
@@ -990,15 +952,8 @@ mod tests {
         // Read the event via io_uring
         let mut ring = IoUring::new(4).expect("setup");
         let mut buf = [0u8; 256];
-        ring.push(
-            unsafe { Sqe::read(ino.fd(), buf.as_mut_ptr(), buf.len() as u32, 0) }.user_data(1),
-        )
-        .expect("push read");
-        ring.submit_and_wait(1).expect("submit");
-
-        let cqe = ring.complete().expect("read cqe");
-        assert_eq!(cqe.user_data, 1);
-        assert!(cqe.result > 0, "expected data, got {}", cqe.result);
+        let n = ring.do_read(ino.fd(), &mut buf, 0).expect("do_read");
+        assert!(n > 0, "expected data, got {n}");
 
         // Parse the event header
         let event: InotifyEvent =
@@ -1138,13 +1093,8 @@ mod tests {
 
         let mut ring = IoUring::new(4).expect("setup");
         let mut buf = [0u8; 8];
-        ring.push(unsafe { Sqe::read(efd.fd(), buf.as_mut_ptr(), 8, 0) }.user_data(1))
-            .expect("push read");
-        ring.submit_and_wait(1).expect("submit");
-
-        let cqe = ring.complete().expect("read cqe");
-        assert_eq!(cqe.user_data, 1);
-        assert_eq!(cqe.result, 8);
+        let n = ring.do_read(efd.fd(), &mut buf, 0).expect("do_read");
+        assert_eq!(n, 8);
         assert_eq!(u64::from_ne_bytes(buf), 7);
     }
 
@@ -1156,13 +1106,8 @@ mod tests {
         let mut ring = IoUring::new(4).expect("setup");
         let val: u64 = 42;
         let buf = val.to_ne_bytes();
-        ring.push(unsafe { Sqe::write(efd.fd(), buf.as_ptr(), 8, 0) }.user_data(1))
-            .expect("push write");
-        ring.submit_and_wait(1).expect("submit");
-
-        let cqe = ring.complete().expect("write cqe");
-        assert_eq!(cqe.user_data, 1);
-        assert_eq!(cqe.result, 8);
+        let n = ring.do_write(efd.fd(), &buf, 0).expect("do_write");
+        assert_eq!(n, 8);
 
         // Verify the counter was updated
         let counter = efd.read().expect("read");
