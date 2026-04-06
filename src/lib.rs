@@ -7,6 +7,7 @@
 ))]
 
 mod error;
+pub mod eventfd;
 pub mod inotify;
 pub mod net;
 pub mod op;
@@ -16,13 +17,14 @@ pub mod types;
 mod ring;
 
 pub use error::Error;
+pub use eventfd::EventFd;
 pub use inotify::Inotify;
 pub use net::Socket;
 pub use op::Sqe;
 pub use ring::{Completion, Completions, IoUring, IoUringBuilder};
 pub use types::{
-    CqeFlags, Features, InotifyEvent, IoVec, RawFd, SetupFlags, SocketFlags, SqeFlags,
-    TimeoutFlags, Timespec, WatchMask,
+    CqeFlags, EventFdFlags, Features, InotifyEvent, IoVec, RawFd, SetupFlags, SocketFlags,
+    SqeFlags, TimeoutFlags, Timespec, WatchMask,
 };
 
 #[cfg(test)]
@@ -37,10 +39,10 @@ mod tests {
 
     use super::*;
     use crate::types::{
-        AcceptFlags, FileMode, FsyncFlags, IN_CLOEXEC, IN_NONBLOCK, InotifyEvent, IoCqringOffsets,
-        IoSqringOffsets, IoUringCqe, IoUringParams, IoUringSqe, MsgFlags, MsgHdr, Opcode,
-        OpenFlags, PollMask, SockAddrIn, SqeFlags, Statx, StatxFlags, StatxMask, StatxTimestamp,
-        WatchMask,
+        AcceptFlags, EventFdFlags, FileMode, FsyncFlags, IN_CLOEXEC, IN_NONBLOCK, InotifyEvent,
+        IoCqringOffsets, IoSqringOffsets, IoUringCqe, IoUringParams, IoUringSqe, MsgFlags, MsgHdr,
+        Opcode, OpenFlags, PollMask, SockAddrIn, SqeFlags, Statx, StatxFlags, StatxMask,
+        StatxTimestamp, WatchMask,
     };
     use core::mem;
 
@@ -1023,5 +1025,147 @@ mod tests {
         // Cleanup
         let _ = fs::remove_file(&file_path);
         let _ = fs::remove_dir(&dir);
+    }
+
+    // ---------------------------------------------------------------
+    // EventFd tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn eventfd_flags_values() {
+        assert_eq!(EventFdFlags::NONBLOCK.bits(), 0o4000);
+        assert_eq!(EventFdFlags::CLOEXEC.bits(), 0o2_000_000);
+        assert_eq!(EventFdFlags::SEMAPHORE.bits(), 1);
+    }
+
+    #[test]
+    fn eventfd_flags_combine() {
+        let flags = EventFdFlags::NONBLOCK | EventFdFlags::CLOEXEC;
+        assert!(flags.contains(EventFdFlags::NONBLOCK));
+        assert!(flags.contains(EventFdFlags::CLOEXEC));
+        assert!(!flags.contains(EventFdFlags::SEMAPHORE));
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn eventfd_new_returns_valid_fd() {
+        let efd = EventFd::new(0).expect("eventfd2");
+        assert!(efd.fd() >= 0);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn eventfd_into_fd_prevents_double_close() {
+        let efd = EventFd::new(0).expect("eventfd2");
+        let fd = efd.into_fd();
+        assert!(fd >= 0);
+        syscall::close(fd as usize).expect("close");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn eventfd_with_flags() {
+        let efd = EventFd::with_flags(0, EventFdFlags::NONBLOCK | EventFdFlags::CLOEXEC)
+            .expect("eventfd2");
+        assert!(efd.fd() >= 0);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn eventfd_write_and_read() {
+        let efd = EventFd::new(0).expect("eventfd2");
+        efd.write(42).expect("write");
+        let val = efd.read().expect("read");
+        assert_eq!(val, 42);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn eventfd_write_accumulates() {
+        let efd = EventFd::new(0).expect("eventfd2");
+        efd.write(10).expect("write 1");
+        efd.write(20).expect("write 2");
+        let val = efd.read().expect("read");
+        assert_eq!(val, 30);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn eventfd_read_resets_counter() {
+        let efd = EventFd::new(0).expect("eventfd2");
+        efd.write(5).expect("write");
+        let _ = efd.read().expect("read");
+        // Counter is now 0 — reading again should return EAGAIN
+        let err = efd.read().unwrap_err();
+        assert_eq!(err, Error::EAGAIN);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn eventfd_initial_value() {
+        let efd = EventFd::new(99).expect("eventfd2");
+        let val = efd.read().expect("read");
+        assert_eq!(val, 99);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn eventfd_explicit_close() {
+        let efd = EventFd::new(0).expect("eventfd2");
+        efd.close().expect("close");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn eventfd_semaphore_mode() {
+        let efd = EventFd::with_flags(0, EventFdFlags::NONBLOCK | EventFdFlags::SEMAPHORE)
+            .expect("eventfd2");
+        efd.write(3).expect("write");
+        // In semaphore mode, each read returns 1 and decrements by 1
+        assert_eq!(efd.read().expect("read 1"), 1);
+        assert_eq!(efd.read().expect("read 2"), 1);
+        assert_eq!(efd.read().expect("read 3"), 1);
+        // Counter exhausted
+        let err = efd.read().unwrap_err();
+        assert_eq!(err, Error::EAGAIN);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn eventfd_read_via_io_uring() {
+        let efd = EventFd::new(0).expect("eventfd2");
+        efd.write(7).expect("write");
+
+        let mut ring = IoUring::new(4).expect("setup");
+        let mut buf = [0u8; 8];
+        ring.push(unsafe { Sqe::read(efd.fd(), buf.as_mut_ptr(), 8, 0) }.user_data(1))
+            .expect("push read");
+        ring.submit_and_wait(1).expect("submit");
+
+        let cqe = ring.complete().expect("read cqe");
+        assert_eq!(cqe.user_data, 1);
+        assert_eq!(cqe.result, 8);
+        assert_eq!(u64::from_ne_bytes(buf), 7);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn eventfd_write_via_io_uring() {
+        let efd = EventFd::new(0).expect("eventfd2");
+
+        let mut ring = IoUring::new(4).expect("setup");
+        let val: u64 = 42;
+        let buf = val.to_ne_bytes();
+        ring.push(unsafe { Sqe::write(efd.fd(), buf.as_ptr(), 8, 0) }.user_data(1))
+            .expect("push write");
+        ring.submit_and_wait(1).expect("submit");
+
+        let cqe = ring.complete().expect("write cqe");
+        assert_eq!(cqe.user_data, 1);
+        assert_eq!(cqe.result, 8);
+
+        // Verify the counter was updated
+        let counter = efd.read().expect("read");
+        assert_eq!(counter, 42);
     }
 }

@@ -206,9 +206,21 @@ pub fn shutdown(fd: usize, how: u32) -> Result<(), Error> {
     Ok(())
 }
 
+pub fn read(fd: usize, buf: *mut u8, len: usize) -> Result<usize, Error> {
+    check(unsafe { syscall3(SYS_READ, fd, buf as usize, len) })
+}
+
+pub fn write(fd: usize, buf: *const u8, len: usize) -> Result<usize, Error> {
+    check(unsafe { syscall3(SYS_WRITE, fd, buf as usize, len) })
+}
+
 pub fn close(fd: usize) -> Result<(), Error> {
     check(unsafe { syscall1(SYS_CLOSE, fd) })?;
     Ok(())
+}
+
+pub fn eventfd2(initval: u32, flags: i32) -> Result<usize, Error> {
+    check(unsafe { syscall2(SYS_EVENTFD2, initval as usize, flags as usize) })
 }
 
 pub fn inotify_init1(flags: i32) -> Result<usize, Error> {

@@ -1,5 +1,7 @@
 use core::arch::asm;
 
+pub const SYS_READ: usize = 0;
+pub const SYS_WRITE: usize = 1;
 pub const SYS_CLOSE: usize = 3;
 pub const SYS_MMAP: usize = 9;
 pub const SYS_MUNMAP: usize = 11;
@@ -14,6 +16,7 @@ pub const SYS_LISTEN: usize = 50;
 pub const SYS_GETSOCKNAME: usize = 51;
 pub const SYS_SETSOCKOPT: usize = 54;
 pub const SYS_OPENAT: usize = 257;
+pub const SYS_EVENTFD2: usize = 290;
 pub const SYS_INOTIFY_INIT1: usize = 294;
 pub const SYS_INOTIFY_ADD_WATCH: usize = 254;
 pub const SYS_INOTIFY_RM_WATCH: usize = 255;

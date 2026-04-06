@@ -829,3 +829,18 @@ pub struct InotifyEvent {
 pub const IN_NONBLOCK: i32 = 0o4000;
 /// `IN_CLOEXEC` flag for `inotify_init1`.
 pub const IN_CLOEXEC: i32 = 0o2_000_000;
+
+// ---------------------------------------------------------------------------
+// Eventfd
+// ---------------------------------------------------------------------------
+
+bitflags! {
+    /// Flags for `eventfd2`.
+    pub struct EventFdFlags(i32);
+    /// Set the file descriptor to non-blocking mode.
+    const NONBLOCK = 0o4000;
+    /// Set close-on-exec on the new file descriptor.
+    const CLOEXEC = 0o2_000_000;
+    /// Provide semaphore-like semantics: each `read` decrements by 1.
+    const SEMAPHORE = 1;
+}
