@@ -1,5 +1,4 @@
 #![allow(
-    dead_code,
     clippy::cast_possible_wrap,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -99,23 +98,6 @@ pub fn mmap(
 pub fn munmap(addr: usize, len: usize) -> Result<(), Error> {
     check(unsafe { syscall2(SYS_MUNMAP, addr, len) })?;
     Ok(())
-}
-
-pub fn openat(
-    dfd: i32,
-    path: *const u8,
-    flags: crate::types::OpenFlags,
-    mode: crate::types::FileMode,
-) -> Result<usize, Error> {
-    check(unsafe {
-        syscall4(
-            SYS_OPENAT,
-            dfd as usize,
-            path as usize,
-            flags.bits() as usize,
-            mode.bits() as usize,
-        )
-    })
 }
 
 pub fn socket(domain: i32, sock_type: i32, protocol: i32) -> Result<usize, Error> {

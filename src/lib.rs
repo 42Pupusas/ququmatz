@@ -415,7 +415,7 @@ mod tests {
     #[test]
     fn fsync_on_tmpfile() {
         let mut ring = IoUring::new(4).expect("setup");
-        let fd = open_tmpfile();
+        let fd = open_tmpfile(&mut ring);
 
         // Write some data first
         let buf = b"fsync test";
@@ -560,10 +560,10 @@ mod tests {
     }
 
     #[cfg(not(miri))]
-    fn open_tmpfile() -> i32 {
-        syscall::openat(
+    fn open_tmpfile(ring: &mut IoUring) -> i32 {
+        ring.do_openat(
             types::AT_FDCWD,
-            c"/tmp".as_ptr().cast(),
+            c"/tmp",
             OpenFlags::TMPFILE | OpenFlags::RDWR,
             FileMode::OWNER_READ | FileMode::OWNER_WRITE,
         )
@@ -574,7 +574,7 @@ mod tests {
     #[test]
     fn read_write_roundtrip() {
         let mut ring = IoUring::new(4).expect("failed to create io_uring");
-        let fd = open_tmpfile();
+        let fd = open_tmpfile(&mut ring);
 
         let write_buf = b"hello io_uring!";
         ring.push(Sqe::write(fd, write_buf, 0).user_data(1))
@@ -608,7 +608,7 @@ mod tests {
     #[test]
     fn vectored_read_write() {
         let mut ring = IoUring::new(4).expect("failed to create io_uring");
-        let fd = open_tmpfile();
+        let fd = open_tmpfile(&mut ring);
 
         let mut buf_a = *b"hello ";
         let mut buf_b = *b"world!";
@@ -671,7 +671,7 @@ mod tests {
     #[test]
     fn registered_buffers_read_write() {
         let mut ring = IoUring::new(4).expect("setup");
-        let fd = open_tmpfile();
+        let fd = open_tmpfile(&mut ring);
 
         // Create and register a buffer
         let mut buf = vec![0u8; 4096];
@@ -710,7 +710,7 @@ mod tests {
     #[test]
     fn registered_files() {
         let mut ring = IoUring::new(4).expect("setup");
-        let fd = open_tmpfile();
+        let fd = open_tmpfile(&mut ring);
 
         ring.register_files(&[fd]).expect("register_files");
         ring.unregister_files().expect("unregister_files");
