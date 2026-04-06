@@ -1,7 +1,13 @@
 #![no_std]
-#![cfg(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64", target_arch = "arm"))]
+#![cfg(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "riscv64",
+    target_arch = "arm"
+))]
 
 mod error;
+pub mod inotify;
 pub mod net;
 pub mod op;
 pub(crate) mod syscall;
@@ -10,11 +16,13 @@ pub mod types;
 mod ring;
 
 pub use error::Error;
+pub use inotify::Inotify;
 pub use net::Socket;
 pub use op::Sqe;
 pub use ring::{Completion, Completions, IoUring, IoUringBuilder};
 pub use types::{
-    CqeFlags, Features, IoVec, RawFd, SetupFlags, SocketFlags, SqeFlags, TimeoutFlags, Timespec,
+    CqeFlags, Features, InotifyEvent, IoVec, RawFd, SetupFlags, SocketFlags, SqeFlags,
+    TimeoutFlags, Timespec, WatchMask,
 };
 
 #[cfg(test)]
@@ -29,9 +37,10 @@ mod tests {
 
     use super::*;
     use crate::types::{
-        AcceptFlags, FileMode, FsyncFlags, IoCqringOffsets, IoSqringOffsets, IoUringCqe,
-        IoUringParams, IoUringSqe, MsgFlags, MsgHdr, Opcode, OpenFlags, PollMask, SockAddrIn,
-        SqeFlags, Statx, StatxFlags, StatxMask, StatxTimestamp,
+        AcceptFlags, FileMode, FsyncFlags, IN_CLOEXEC, IN_NONBLOCK, InotifyEvent, IoCqringOffsets,
+        IoSqringOffsets, IoUringCqe, IoUringParams, IoUringSqe, MsgFlags, MsgHdr, Opcode,
+        OpenFlags, PollMask, SockAddrIn, SqeFlags, Statx, StatxFlags, StatxMask, StatxTimestamp,
+        WatchMask,
     };
     use core::mem;
 
@@ -193,7 +202,10 @@ mod tests {
                 types::AT_FDCWD,
                 path.as_ptr().cast(),
                 OpenFlags::default(),
-                FileMode::OWNER_READ | FileMode::OWNER_WRITE | FileMode::GROUP_READ | FileMode::OTHER_READ,
+                FileMode::OWNER_READ
+                    | FileMode::OWNER_WRITE
+                    | FileMode::GROUP_READ
+                    | FileMode::OTHER_READ,
             )
         }
         .user_data(77);
@@ -843,5 +855,173 @@ mod tests {
         let _ = syscall::close(server_fd as usize);
         let _ = syscall::close(client as usize);
         let _ = syscall::close(listener as usize);
+    }
+
+    // ---------------------------------------------------------------
+    // Inotify layout tests — run under Miri.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn inotify_event_layout() {
+        assert_eq!(mem::size_of::<InotifyEvent>(), 16);
+        assert_eq!(mem::align_of::<InotifyEvent>(), 4);
+    }
+
+    #[test]
+    fn inotify_event_field_offsets() {
+        assert_eq!(mem::offset_of!(InotifyEvent, wd), 0);
+        assert_eq!(mem::offset_of!(InotifyEvent, mask), 4);
+        assert_eq!(mem::offset_of!(InotifyEvent, cookie), 8);
+        assert_eq!(mem::offset_of!(InotifyEvent, len), 12);
+    }
+
+    #[test]
+    fn watch_mask_bitflags() {
+        let mask = WatchMask::MODIFY | WatchMask::CREATE | WatchMask::DELETE;
+        assert!(mask.contains(WatchMask::MODIFY));
+        assert!(mask.contains(WatchMask::CREATE));
+        assert!(mask.contains(WatchMask::DELETE));
+        assert!(!mask.contains(WatchMask::ACCESS));
+    }
+
+    #[test]
+    fn watch_mask_close_shorthand() {
+        let close = WatchMask::CLOSE;
+        assert!(close.contains(WatchMask::CLOSE_WRITE));
+        assert!(close.contains(WatchMask::CLOSE_NOWRITE));
+    }
+
+    #[test]
+    fn watch_mask_move_shorthand() {
+        let mv = WatchMask::MOVE;
+        assert!(mv.contains(WatchMask::MOVED_FROM));
+        assert!(mv.contains(WatchMask::MOVED_TO));
+    }
+
+    #[test]
+    fn in_nonblock_value() {
+        assert_eq!(IN_NONBLOCK, 0o4000);
+    }
+
+    #[test]
+    fn in_cloexec_value() {
+        assert_eq!(IN_CLOEXEC, 0o2_000_000);
+    }
+
+    // ---------------------------------------------------------------
+    // Inotify kernel integration tests — skipped under Miri.
+    // ---------------------------------------------------------------
+
+    #[cfg(not(miri))]
+    #[test]
+    fn inotify_new_returns_valid_fd() {
+        let ino = Inotify::new().expect("inotify_init1");
+        assert!(ino.fd() >= 0);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn inotify_into_fd_prevents_double_close() {
+        let ino = Inotify::new().expect("inotify_init1");
+        let fd = ino.into_fd();
+        assert!(fd >= 0);
+        // Manually close — should succeed exactly once.
+        syscall::close(fd as usize).expect("close");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn inotify_add_and_remove_watch() {
+        let ino = Inotify::new().expect("inotify_init1");
+        let wd = ino
+            .add_watch(
+                c"/tmp".to_bytes_with_nul(),
+                WatchMask::CREATE | WatchMask::DELETE,
+            )
+            .expect("add_watch");
+        assert!(wd >= 0);
+        ino.remove_watch(wd).expect("remove_watch");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn inotify_remove_bad_wd_returns_error() {
+        let ino = Inotify::new().expect("inotify_init1");
+        let err = ino.remove_watch(9999).unwrap_err();
+        assert_eq!(err, Error::EINVAL);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn inotify_add_watch_bad_path_returns_error() {
+        let ino = Inotify::new().expect("inotify_init1");
+        let err = ino
+            .add_watch(
+                c"/nonexistent_path_ququmatz_test".to_bytes_with_nul(),
+                WatchMask::MODIFY,
+            )
+            .unwrap_err();
+        assert_eq!(err, Error::ENOENT);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn inotify_read_via_io_uring() {
+        use std::fs;
+
+        let ino = Inotify::new().expect("inotify_init1");
+
+        // Create a temp directory to watch
+        let pid = std::process::id();
+        let dir = std::format!("/tmp/ququmatz_inotify_test_{pid}");
+        fs::create_dir_all(&dir).expect("mkdir");
+
+        let watch_path = std::format!("{dir}\0");
+        let wd = ino
+            .add_watch(watch_path.as_bytes(), WatchMask::CREATE)
+            .expect("add_watch");
+
+        // Create a file inside the watched dir to trigger an event
+        let file_path = std::format!("{dir}/testfile");
+        fs::write(&file_path, b"hello").expect("write file");
+
+        // Read the event via io_uring
+        let mut ring = IoUring::new(4).expect("setup");
+        let mut buf = [0u8; 256];
+        ring.push(
+            unsafe { Sqe::read(ino.fd(), buf.as_mut_ptr(), buf.len() as u32, 0) }.user_data(1),
+        )
+        .expect("push read");
+        ring.submit_and_wait(1).expect("submit");
+
+        let cqe = ring.complete().expect("read cqe");
+        assert_eq!(cqe.user_data, 1);
+        assert!(cqe.result > 0, "expected data, got {}", cqe.result);
+
+        // Parse the event header
+        let event: InotifyEvent =
+            unsafe { core::ptr::read_unaligned(buf.as_ptr().cast::<InotifyEvent>()) };
+        assert_eq!(event.wd, wd);
+        assert_ne!(event.mask & WatchMask::CREATE.bits(), 0);
+
+        // Check the name if present
+        if event.len > 0 {
+            let name_start = mem::size_of::<InotifyEvent>();
+            let name_bytes = &buf[name_start..name_start + event.len as usize];
+            let name = core::str::from_utf8(
+                &name_bytes[..name_bytes
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(name_bytes.len())],
+            )
+            .expect("valid utf8");
+            assert_eq!(name, "testfile");
+        }
+
+        ino.remove_watch(wd).expect("remove_watch");
+
+        // Cleanup
+        let _ = fs::remove_file(&file_path);
+        let _ = fs::remove_dir(&dir);
     }
 }

@@ -26,8 +26,9 @@ mod arm;
 #[cfg(target_arch = "arm")]
 use arm as arch;
 
-use arch::*;
 use crate::error::Error;
+#[allow(clippy::wildcard_imports)]
+use arch::*;
 
 const fn check(ret: isize) -> Result<usize, Error> {
     if ret < 0 {
@@ -133,14 +134,15 @@ pub fn connect(fd: usize, addr: *const u8, addrlen: u32) -> Result<(), Error> {
     Ok(())
 }
 
-pub fn accept4(
-    fd: usize,
-    addr: *mut u8,
-    addrlen: *mut u32,
-    flags: i32,
-) -> Result<usize, Error> {
+pub fn accept4(fd: usize, addr: *mut u8, addrlen: *mut u32, flags: i32) -> Result<usize, Error> {
     check(unsafe {
-        syscall4(SYS_ACCEPT4, fd, addr as usize, addrlen as usize, flags as usize)
+        syscall4(
+            SYS_ACCEPT4,
+            fd,
+            addr as usize,
+            addrlen as usize,
+            flags as usize,
+        )
     })
 }
 
@@ -206,5 +208,18 @@ pub fn shutdown(fd: usize, how: u32) -> Result<(), Error> {
 
 pub fn close(fd: usize) -> Result<(), Error> {
     check(unsafe { syscall1(SYS_CLOSE, fd) })?;
+    Ok(())
+}
+
+pub fn inotify_init1(flags: i32) -> Result<usize, Error> {
+    check(unsafe { syscall1(SYS_INOTIFY_INIT1, flags as usize) })
+}
+
+pub fn inotify_add_watch(fd: usize, path: *const u8, mask: u32) -> Result<usize, Error> {
+    check(unsafe { syscall3(SYS_INOTIFY_ADD_WATCH, fd, path as usize, mask as usize) })
+}
+
+pub fn inotify_rm_watch(fd: usize, wd: i32) -> Result<(), Error> {
+    check(unsafe { syscall2(SYS_INOTIFY_RM_WATCH, fd, wd as usize) })?;
     Ok(())
 }
