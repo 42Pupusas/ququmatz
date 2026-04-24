@@ -844,6 +844,96 @@ mod tests {
 
     #[cfg(not(miri))]
     #[test]
+    fn provided_buffer_ring_buffer_mut_allows_inplace_edit() {
+        // Round-trips real kernel-delivered bytes through `buffer_mut`.
+        // Proves the mutable path works end-to-end and that edits to
+        // the returned `&mut [u8]` actually land in the backing region
+        // (the shared `buffer()` read afterwards sees them).
+        let mut ring = IoUring::new(8).expect("setup");
+        let (listener, port) = setup_tcp_listener();
+
+        let client = syscall::socket(types::AF_INET, types::SOCK_STREAM | types::SOCK_NONBLOCK, 0)
+            .expect("client socket") as i32;
+
+        let mut pbuf = ring
+            .register_provided_buffers(2, 4, 64)
+            .expect("register_provided_buffers");
+
+        ring.push(Sqe::accept(listener, AcceptFlags::default()).user_data(1))
+            .expect("push accept");
+        let connect_addr = SockAddrIn {
+            sin_family: types::AF_INET as u16,
+            sin_port: port.to_be(),
+            sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+            sin_zero: [0; 8],
+        };
+        let addr_bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(
+                (&raw const connect_addr).cast(),
+                core::mem::size_of::<SockAddrIn>(),
+            )
+        };
+        ring.push(Sqe::connect(client, addr_bytes).user_data(2))
+            .expect("push connect");
+        ring.submit_and_wait(2).expect("submit");
+
+        let mut server_fd = -1i32;
+        for _ in 0..2 {
+            let cqe = ring.complete().expect("cqe");
+            if cqe.user_data == 1 {
+                server_fd = cqe.result;
+            }
+        }
+        assert!(server_fd >= 0);
+
+        let msg = b"mutate me";
+        ring.push(Sqe::send(client, msg, MsgFlags::default()).user_data(3))
+            .expect("push send");
+        let recv_sqe =
+            unsafe { Sqe::recv_ptr(server_fd, core::ptr::null_mut(), 0, MsgFlags::default()) }
+                .buffer_select(2)
+                .user_data(4);
+        ring.push(recv_sqe).expect("push recv");
+        ring.submit_and_wait(2).expect("submit send+recv");
+
+        let mut buf_id = u16::MAX;
+        let mut len = 0u32;
+        for _ in 0..2 {
+            let cqe = ring.complete().expect("cqe");
+            if cqe.user_data == 4 {
+                assert!(cqe.result >= 0, "recv failed: {}", cqe.result);
+                buf_id = cqe.buffer_id().expect("buffer_id present");
+                #[allow(clippy::cast_sign_loss)]
+                {
+                    len = cqe.result as u32;
+                }
+            }
+        }
+        assert_ne!(buf_id, u16::MAX);
+
+        // Mutate in place: uppercase the payload via `buffer_mut`.
+        {
+            let payload = pbuf.buffer_mut(buf_id, len).expect("buffer_mut");
+            assert_eq!(payload, msg);
+            payload.make_ascii_uppercase();
+        }
+
+        // The shared view of the same slot should now reflect the edit.
+        let after = pbuf.buffer(buf_id, len).expect("buffer");
+        assert_eq!(after, b"MUTATE ME");
+
+        // Out-of-range ids / overlong lens return None, not a panic.
+        assert!(pbuf.buffer_mut(999, 1).is_none());
+        assert!(pbuf.buffer_mut(0, pbuf.buf_size() + 1).is_none());
+
+        pbuf.recycle_and_commit(buf_id);
+        let _ = syscall::close(server_fd as usize);
+        let _ = syscall::close(client as usize);
+        let _ = syscall::close(listener as usize);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
     fn provided_buffer_ring_register_only() {
         let mut ring = IoUring::new(4).expect("setup");
         let pbuf = ring
