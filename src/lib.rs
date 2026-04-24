@@ -21,10 +21,10 @@ pub use eventfd::EventFd;
 pub use inotify::Inotify;
 pub use net::Socket;
 pub use op::Sqe;
-pub use ring::{Completion, Completions, IoUring, IoUringBuilder};
+pub use ring::{Completion, Completions, IoUring, IoUringBuilder, ProvidedBufferRing};
 pub use types::{
-    CqeFlags, EventFdFlags, Features, InotifyEvent, IoVec, RawFd, SetupFlags, SocketFlags,
-    SqeFlags, TimeoutFlags, Timespec, WatchMask,
+    CqeFlags, EventFdFlags, Features, InotifyEvent, IoUringBuf, IoUringBufReg, IoVec, RawFd,
+    SetupFlags, SocketFlags, SqeFlags, TimeoutFlags, Timespec, WatchMask,
 };
 
 #[cfg(test)]
@@ -40,9 +40,9 @@ mod tests {
     use super::*;
     use crate::types::{
         AcceptFlags, EventFdFlags, FileMode, FsyncFlags, IN_CLOEXEC, IN_NONBLOCK, InotifyEvent,
-        IoCqringOffsets, IoSqringOffsets, IoUringCqe, IoUringParams, IoUringSqe, MsgFlags, MsgHdr,
-        Opcode, OpenFlags, PollMask, SockAddrIn, SqeFlags, Statx, StatxFlags, StatxMask,
-        StatxTimestamp, WatchMask,
+        IoCqringOffsets, IoSqringOffsets, IoUringBuf, IoUringBufReg, IoUringCqe, IoUringParams,
+        IoUringSqe, MsgFlags, MsgHdr, Opcode, OpenFlags, PollMask, SockAddrIn, SqeFlags, Statx,
+        StatxFlags, StatxMask, StatxTimestamp, WatchMask,
     };
     use core::mem;
 
@@ -103,6 +103,23 @@ mod tests {
     fn io_cqring_offsets_layout() {
         assert_eq!(mem::size_of::<IoCqringOffsets>(), 40);
         assert_eq!(mem::align_of::<IoCqringOffsets>(), 8);
+    }
+
+    #[test]
+    fn io_uring_buf_layout() {
+        assert_eq!(mem::size_of::<IoUringBuf>(), 16);
+        assert_eq!(mem::align_of::<IoUringBuf>(), 8);
+        assert_eq!(mem::offset_of!(IoUringBuf, addr), 0);
+        assert_eq!(mem::offset_of!(IoUringBuf, len), 8);
+        assert_eq!(mem::offset_of!(IoUringBuf, bid), 12);
+        // resv aliases the ring's producer tail — it MUST be at offset 14.
+        assert_eq!(mem::offset_of!(IoUringBuf, resv), 14);
+    }
+
+    #[test]
+    fn io_uring_buf_reg_layout() {
+        assert_eq!(mem::size_of::<IoUringBufReg>(), 40);
+        assert_eq!(mem::align_of::<IoUringBufReg>(), 8);
     }
 
     #[test]
@@ -819,6 +836,117 @@ mod tests {
         assert_eq!(cqe.user_data, 4);
         assert_eq!(cqe.result, msg.len() as i32);
         assert_eq!(&recv_buf[..msg.len()], msg);
+
+        let _ = syscall::close(server_fd as usize);
+        let _ = syscall::close(client as usize);
+        let _ = syscall::close(listener as usize);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn provided_buffer_ring_register_only() {
+        let mut ring = IoUring::new(4).expect("setup");
+        let pbuf = ring
+            .register_provided_buffers(7, 4, 64)
+            .expect("register_provided_buffers");
+        assert_eq!(pbuf.bgid(), 7);
+        assert_eq!(pbuf.entries(), 4);
+        assert_eq!(pbuf.buf_size(), 64);
+        // Drop unregisters and frees.
+        drop(pbuf);
+
+        // Re-registering the same bgid should now succeed.
+        let _pbuf2 = ring
+            .register_provided_buffers(7, 4, 64)
+            .expect("re-register");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn provided_buffer_ring_recv() {
+        let mut ring = IoUring::new(8).expect("setup");
+        let (listener, port) = setup_tcp_listener();
+
+        let client = syscall::socket(types::AF_INET, types::SOCK_STREAM | types::SOCK_NONBLOCK, 0)
+            .expect("client socket") as i32;
+
+        // Register a 4-entry provided-buffer ring of 64-byte buffers
+        // under group id 1. Dropping `pbuf` at end of scope
+        // unregisters and frees.
+        let mut pbuf = ring
+            .register_provided_buffers(1, 4, 64)
+            .expect("register_provided_buffers");
+
+        // Accept + connect
+        ring.push(Sqe::accept(listener, AcceptFlags::default()).user_data(1))
+            .expect("push accept");
+        let connect_addr = SockAddrIn {
+            sin_family: types::AF_INET as u16,
+            sin_port: port.to_be(),
+            sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+            sin_zero: [0; 8],
+        };
+        let addr_bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(
+                (&raw const connect_addr).cast(),
+                core::mem::size_of::<SockAddrIn>(),
+            )
+        };
+        ring.push(Sqe::connect(client, addr_bytes).user_data(2))
+            .expect("push connect");
+        ring.submit_and_wait(2).expect("submit");
+
+        let mut server_fd = -1i32;
+        for _ in 0..2 {
+            let cqe = ring.complete().expect("cqe");
+            if cqe.user_data == 1 {
+                assert!(cqe.result >= 0, "accept failed: {}", cqe.result);
+                server_fd = cqe.result;
+            } else {
+                assert!(
+                    cqe.result == 0 || cqe.result == -115,
+                    "connect failed: {}",
+                    cqe.result
+                );
+            }
+        }
+        assert!(server_fd >= 0);
+
+        // Send from client; recv on server using buffer select (len=0
+        // tells the kernel to use the selected buffer's length).
+        let msg = b"provided buffers!";
+        ring.push(Sqe::send(client, msg, MsgFlags::default()).user_data(3))
+            .expect("push send");
+        let recv_sqe =
+            unsafe { Sqe::recv_ptr(server_fd, core::ptr::null_mut(), 0, MsgFlags::default()) }
+                .buffer_select(1)
+                .user_data(4);
+        ring.push(recv_sqe).expect("push recv");
+
+        ring.submit_and_wait(2).expect("submit send+recv");
+
+        let mut got_send = false;
+        let mut got_recv = false;
+        for _ in 0..2 {
+            let cqe = ring.complete().expect("cqe");
+            if cqe.user_data == 3 {
+                assert_eq!(cqe.result, msg.len() as i32);
+                got_send = true;
+            } else {
+                assert_eq!(cqe.user_data, 4);
+                assert!(cqe.result >= 0, "recv failed: {}", cqe.result);
+                let buf_id = cqe.buffer_id().expect("buffer_id present");
+                #[allow(clippy::cast_sign_loss)]
+                let payload = pbuf
+                    .buffer(buf_id, cqe.result as u32)
+                    .expect("buffer slice");
+                assert_eq!(payload, msg);
+                // Return the buffer to the pool.
+                pbuf.recycle_and_commit(buf_id);
+                got_recv = true;
+            }
+        }
+        assert!(got_send && got_recv);
 
         let _ = syscall::close(server_fd as usize);
         let _ = syscall::close(client as usize);

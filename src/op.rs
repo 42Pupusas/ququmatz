@@ -751,4 +751,20 @@ impl Sqe {
         self.0.flags |= SqeFlags::IO_DRAIN.bits();
         self
     }
+
+    /// Select a buffer from a registered provided-buffer ring.
+    ///
+    /// Sets the `IOSQE_BUFFER_SELECT` flag and stores `group_id` in the
+    /// SQE's `buf_group` field (aliased with `buf_index`). On completion
+    /// the kernel reports the chosen buffer id in the upper 16 bits of
+    /// the CQE flags — use [`Completion::buffer_id`] to decode it.
+    ///
+    /// Only valid on operations that support buffer selection (notably
+    /// `recv`, `read`, `recvmsg`).
+    #[must_use]
+    pub const fn buffer_select(mut self, group_id: u16) -> Self {
+        self.0.flags |= SqeFlags::BUFFER_SELECT.bits();
+        self.0.buf_index = group_id;
+        self
+    }
 }

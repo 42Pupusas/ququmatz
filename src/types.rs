@@ -203,6 +203,12 @@ bitflags! {
     const IO_HARDLINK = 1 << 3;
     /// Force async execution even if the op could complete inline.
     const IO_ASYNC = 1 << 4;
+    /// Select a buffer from a registered provided-buffer ring.
+    ///
+    /// When set, the kernel picks a buffer from the group identified by
+    /// `sqe.buf_group` (aliased with `buf_index`) and reports the chosen
+    /// buffer id in the upper 16 bits of the CQE flags.
+    const BUFFER_SELECT = 1 << 5;
 }
 
 // ---------------------------------------------------------------------------
@@ -218,6 +224,10 @@ pub enum RegisterOp {
     RegisterFiles = 2,
     UnregisterFiles = 3,
     RegisterFilesUpdate = 6,
+    /// Register a provided-buffer ring (kernel 5.19+).
+    RegisterPbufRing = 22,
+    /// Unregister a provided-buffer ring.
+    UnregisterPbufRing = 23,
 }
 
 impl From<RegisterOp> for u32 {
@@ -245,6 +255,8 @@ bitflags! {
     /// Mapping flags for `mmap`.
     pub struct MapFlags(u32);
     const SHARED = 0x01;
+    const PRIVATE = 0x02;
+    const ANONYMOUS = 0x20;
     const POPULATE = 0x0000_8000;
 }
 
@@ -385,6 +397,43 @@ impl Default for IoUringSqe {
         // Safety: zero-initialized SQE is valid (opcode 0 = NOP)
         unsafe { core::mem::zeroed() }
     }
+}
+
+/// Argument struct for `IORING_REGISTER_PBUF_RING`.
+///
+/// The kernel treats this as a 40-byte struct; fields after `flags` are
+/// reserved and must be zero.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct IoUringBufReg {
+    /// User-space virtual address of the buffer ring (`ring_entries` × 16 bytes).
+    pub ring_addr: u64,
+    /// Number of entries in the ring. Must be a power of two.
+    pub ring_entries: u32,
+    /// Buffer group id that SQEs will reference via `buf_group`.
+    pub bgid: u16,
+    /// Reserved / flags — leave zero for user-allocated rings.
+    pub flags: u16,
+    pub(crate) resv: [u64; 3],
+}
+
+/// A single buffer descriptor inside a provided-buffer ring.
+///
+/// The first entry in the ring is special: its `resv` field aliases the
+/// ring's producer `tail` (the last 2 bytes). Callers should only write
+/// real buffers starting from index 1, or — if using index 0 — never
+/// touch its `resv` field.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct IoUringBuf {
+    /// User-space address of the buffer.
+    pub addr: u64,
+    /// Length of the buffer in bytes.
+    pub len: u32,
+    /// Buffer id — reported back in the upper 16 bits of CQE flags.
+    pub bid: u16,
+    /// Reserved (aliases the ring tail in entry 0).
+    pub resv: u16,
 }
 
 /// Completion queue entry.
