@@ -1,9 +1,10 @@
 #![allow(clippy::cast_sign_loss, clippy::checked_conversions)]
 
 use crate::types::{
-    AcceptFlags, FallocateMode, FileMode, FsyncFlags, IoUringSqe, IoVec, MsgFlags, MsgHdr, Opcode,
-    OpenFlags, PollMask, RenameFlags, ShutdownHow, SocketFlags, SqeFlags, StatxFlags, StatxMask,
-    TimeoutFlags, Timespec, UnlinkFlags,
+    AcceptFlags, EpollEvent, EpollOp, FadviseAdvice, FallocateMode, FileMode, FsyncFlags,
+    IORING_ACCEPT_MULTISHOT, IORING_RECV_MULTISHOT, IoUringSqe, IoVec, MadviseAdvice, MsgFlags,
+    MsgHdr, Opcode, OpenFlags, OpenHow, PollMask, RenameFlags, ShutdownHow, SocketFlags,
+    SpliceFlags, SqeFlags, StatxFlags, StatxMask, TimeoutFlags, Timespec, UnlinkFlags,
 };
 
 /// A prepared submission queue entry, ready to be pushed onto the ring.
@@ -701,6 +702,328 @@ impl Sqe {
     }
 
     // -----------------------------------------------------------------
+    // splice / tee
+    // -----------------------------------------------------------------
+
+    /// Prepare a splice operation (zero-copy between two fds).
+    ///
+    /// `fd_in` is the source; `off_in` is the read offset (`u64::MAX` for current pos).
+    /// `fd` (the SQE fd field) is the destination; `off` is the write offset.
+    /// Set `SpliceFlags::FD_IN_FIXED` in `flags` if `fd_in` is a registered fd.
+    #[must_use]
+    pub fn splice(
+        fd_out: i32,
+        off_out: u64,
+        fd_in: i32,
+        off_in: u64,
+        len: u32,
+        flags: SpliceFlags,
+    ) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Splice.into();
+        sqe.fd = fd_out;
+        sqe.off = off_out;
+        sqe.splice_fd_in = fd_in;
+        sqe.addr = off_in;
+        sqe.len = len;
+        sqe.op_flags = flags.bits();
+        Self(sqe)
+    }
+
+    /// Prepare a tee operation (duplicate pipe data without consuming it).
+    ///
+    /// Both `fd_in` and `fd` must be pipe fds.
+    #[must_use]
+    pub fn tee(fd_out: i32, fd_in: i32, len: u32, flags: SpliceFlags) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Tee.into();
+        sqe.fd = fd_out;
+        sqe.splice_fd_in = fd_in;
+        sqe.len = len;
+        sqe.op_flags = flags.bits();
+        Self(sqe)
+    }
+
+    // -----------------------------------------------------------------
+    // epoll_ctl
+    // -----------------------------------------------------------------
+
+    /// Prepare an `epoll_ctl` operation.
+    ///
+    /// `epfd` is the epoll fd, `op` is Add/Del/Mod, `fd` is the target fd,
+    /// and `event` is the event to register (ignored for `Del`).
+    #[must_use]
+    pub fn epoll_ctl(epfd: i32, op: EpollOp, fd: i32, event: &EpollEvent) -> Self {
+        unsafe { Self::epoll_ctl_ptr(epfd, op, fd, core::ptr::from_ref(event)) }
+    }
+
+    /// Prepare an `epoll_ctl` operation from a raw pointer.
+    ///
+    /// # Safety
+    ///
+    /// `event` must point to a valid `EpollEvent` that remains valid until
+    /// the operation completes.
+    #[must_use]
+    pub unsafe fn epoll_ctl_ptr(epfd: i32, op: EpollOp, fd: i32, event: *const EpollEvent) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::EpollCtl.into();
+        sqe.fd = epfd;
+        sqe.off = fd as u64;
+        sqe.addr = event as u64;
+        sqe.len = op.into();
+        Self(sqe)
+    }
+
+    // -----------------------------------------------------------------
+    // fadvise / madvise
+    // -----------------------------------------------------------------
+
+    /// Prepare a fadvise operation.
+    ///
+    /// Advises the kernel about the expected access pattern for the given
+    /// byte range `[offset, offset+len)` of `fd`.
+    #[must_use]
+    pub fn fadvise(fd: i32, offset: u64, len: u32, advice: FadviseAdvice) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Fadvise.into();
+        sqe.fd = fd;
+        sqe.off = offset;
+        sqe.len = len;
+        sqe.op_flags = advice.into();
+        Self(sqe)
+    }
+
+    /// Prepare a madvise operation.
+    ///
+    /// Advises the kernel about the expected usage of the memory range
+    /// starting at `addr` for `len` bytes.
+    ///
+    /// # Safety
+    ///
+    /// `addr` must be page-aligned and the range must be valid mapped memory.
+    #[must_use]
+    pub unsafe fn madvise(addr: *mut u8, len: u32, advice: MadviseAdvice) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Madvise.into();
+        sqe.addr = addr as u64;
+        sqe.len = len;
+        sqe.op_flags = advice.into();
+        Self(sqe)
+    }
+
+    // -----------------------------------------------------------------
+    // openat2
+    // -----------------------------------------------------------------
+
+    /// Prepare an openat2 operation.
+    ///
+    /// Like `openat` but accepts an [`OpenHow`] struct for extended control
+    /// over flags, mode, and path resolution.
+    #[must_use]
+    pub fn openat2(dfd: i32, path: &core::ffi::CStr, how: &OpenHow) -> Self {
+        unsafe {
+            Self::openat2_ptr(
+                dfd,
+                path.as_ptr().cast(),
+                core::ptr::from_ref(how),
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    core::mem::size_of::<OpenHow>() as u32
+                },
+            )
+        }
+    }
+
+    /// Prepare an openat2 operation from raw pointers.
+    ///
+    /// # Safety
+    ///
+    /// `path` must be a valid null-terminated C string and `how` must point
+    /// to a valid `OpenHow` of `how_size` bytes. Both must remain valid until
+    /// the operation completes.
+    #[must_use]
+    pub unsafe fn openat2_ptr(
+        dfd: i32,
+        path: *const u8,
+        how: *const OpenHow,
+        how_size: u32,
+    ) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Openat2.into();
+        sqe.fd = dfd;
+        sqe.addr = path as u64;
+        sqe.off = how as u64;
+        sqe.len = how_size;
+        Self(sqe)
+    }
+
+    // -----------------------------------------------------------------
+    // provide_buffers / remove_buffers (legacy pre-5.19 buffer API)
+    // -----------------------------------------------------------------
+
+    /// Prepare a `provide_buffers` operation (legacy buffer registration, pre-5.19).
+    ///
+    /// Registers `count` buffers of `buf_size` bytes each, starting at `addr`,
+    /// under group id `bgid`. The first buffer gets id `buf_id`.
+    ///
+    /// # Safety
+    ///
+    /// `addr` must point to at least `count * buf_size` bytes of valid memory
+    /// that remains valid until the buffers are consumed or removed.
+    #[must_use]
+    #[allow(clippy::similar_names)]
+    pub unsafe fn provide_buffers(
+        addr: *mut u8,
+        buf_size: u32,
+        count: u16,
+        bgid: u16,
+        buf_id: u16,
+    ) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::ProvideBuffers.into();
+        sqe.fd = i32::from(count);
+        sqe.addr = addr as u64;
+        sqe.len = buf_size;
+        sqe.off = u64::from(buf_id);
+        sqe.buf_index = bgid;
+        Self(sqe)
+    }
+
+    /// Prepare a `remove_buffers` operation (legacy buffer removal, pre-5.19).
+    ///
+    /// Removes up to `count` buffers from group `bgid`.
+    #[must_use]
+    pub fn remove_buffers(count: u16, bgid: u16) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::RemoveBuffers.into();
+        sqe.fd = i32::from(count);
+        sqe.buf_index = bgid;
+        Self(sqe)
+    }
+
+    // -----------------------------------------------------------------
+    // send_zc (zero-copy send, 6.0+)
+    // -----------------------------------------------------------------
+
+    /// Prepare a zero-copy send operation (kernel 6.0+).
+    ///
+    /// Like `send`, but the kernel maps the buffer directly into the NIC
+    /// without copying. The CQE with `CqeFlags::NOTIF` set confirms when
+    /// the kernel has released the buffer — do not free `buf` before then.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn send_zc(fd: i32, buf: &[u8], flags: MsgFlags) -> Self {
+        debug_assert!(buf.len() <= u32::MAX as usize);
+        unsafe { Self::send_zc_ptr(fd, buf.as_ptr(), buf.len() as u32, flags) }
+    }
+
+    /// Prepare a zero-copy send from a raw pointer.
+    ///
+    /// # Safety
+    ///
+    /// `buf` must point to at least `len` bytes of valid readable memory that
+    /// remains valid until the kernel sends a `CqeFlags::NOTIF` completion.
+    #[must_use]
+    pub unsafe fn send_zc_ptr(fd: i32, buf: *const u8, len: u32, flags: MsgFlags) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::SendZc.into();
+        sqe.fd = fd;
+        sqe.addr = buf as u64;
+        sqe.len = len;
+        sqe.op_flags = flags.bits();
+        Self(sqe)
+    }
+
+    // -----------------------------------------------------------------
+    // files_update
+    // -----------------------------------------------------------------
+
+    /// Prepare a `files_update` operation.
+    ///
+    /// Updates a slice of the registered file table starting at `offset`
+    /// without re-registering the entire table. Each element of `fds` that
+    /// is `-1` is interpreted as a slot to clear.
+    ///
+    /// # Safety
+    ///
+    /// `fds` must remain valid until the operation completes.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub unsafe fn files_update_ptr(fds: *const i32, nr_fds: u32, offset: u32) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::FilesUpdate.into();
+        sqe.addr = fds as u64;
+        sqe.len = nr_fds;
+        sqe.off = u64::from(offset);
+        Self(sqe)
+    }
+
+    /// Prepare a `files_update` operation from a slice.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn files_update(fds: &[i32], offset: u32) -> Self {
+        debug_assert!(fds.len() <= u32::MAX as usize);
+        unsafe { Self::files_update_ptr(fds.as_ptr(), fds.len() as u32, offset) }
+    }
+
+    // -----------------------------------------------------------------
+    // accept_multishot / recv_multishot
+    // -----------------------------------------------------------------
+
+    /// Prepare a multishot accept operation.
+    ///
+    /// A single SQE generates a CQE for every accepted connection. Each CQE
+    /// has `CqeFlags::MORE` set until the multishot is cancelled or errors.
+    #[must_use]
+    pub fn accept_multishot(fd: i32, flags: AcceptFlags) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Accept.into();
+        sqe.fd = fd;
+        sqe.op_flags = flags.bits();
+        sqe.ioprio = IORING_ACCEPT_MULTISHOT;
+        Self(sqe)
+    }
+
+    /// Prepare a multishot recv operation.
+    ///
+    /// A single SQE generates a CQE for every received message. Requires
+    /// buffer selection (`buffer_select`) to be set — the kernel picks a
+    /// buffer from the group for each arrival.
+    #[must_use]
+    pub fn recv_multishot(fd: i32, flags: MsgFlags) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Recv.into();
+        sqe.fd = fd;
+        sqe.op_flags = flags.bits() | IORING_RECV_MULTISHOT;
+        Self(sqe)
+    }
+
+    // -----------------------------------------------------------------
+    // accept_with_addr — safe wrapper capturing peer address
+    // -----------------------------------------------------------------
+
+    /// Prepare an accept that captures the peer address into `addr`.
+    ///
+    /// On completion `addr` is populated with the peer's `SockAddrIn` and
+    /// `addrlen` is updated to the actual address length.
+    #[must_use]
+    pub fn accept_with_addr(
+        fd: i32,
+        addr: &mut crate::types::SockAddrIn,
+        addrlen: &mut u32,
+        flags: AcceptFlags,
+    ) -> Self {
+        unsafe {
+            Self::accept_ptr(
+                fd,
+                core::ptr::from_mut(addr).cast(),
+                core::ptr::from_mut(addrlen),
+                flags,
+            )
+        }
+    }
+
+    // -----------------------------------------------------------------
     // SQE modifiers (chainable)
     // -----------------------------------------------------------------
 
@@ -749,6 +1072,17 @@ impl Sqe {
     #[must_use]
     pub const fn drain(mut self) -> Self {
         self.0.flags |= SqeFlags::IO_DRAIN.bits();
+        self
+    }
+
+    /// Suppress the CQE when this request succeeds (fire-and-forget).
+    ///
+    /// No completion is posted if the operation succeeds; a CQE is still
+    /// posted on failure. Useful for write/send chains where you only care
+    /// about errors, not byte counts.
+    #[must_use]
+    pub const fn cqe_skip_success(mut self) -> Self {
+        self.0.flags |= SqeFlags::CQE_SKIP_SUCCESS.bits();
         self
     }
 

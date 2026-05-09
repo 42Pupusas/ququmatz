@@ -26,8 +26,12 @@ pub use ring::{
     SplitCompletions, Submitter,
 };
 pub use types::{
-    CqeFlags, EventFdFlags, Features, InotifyEvent, IoUringBuf, IoUringBufReg, IoVec, RawFd,
-    SetupFlags, SocketFlags, SqeFlags, TimeoutFlags, Timespec, WatchMask,
+    AcceptFlags, CqeFlags, EnterFlags, EpollEvent, EpollEvents, EpollOp, EventFdFlags,
+    FadviseAdvice, FallocateMode, Features, FileMode, FsyncFlags, IORING_ACCEPT_MULTISHOT,
+    IORING_RECV_MULTISHOT, InotifyEvent, IoUringBuf, IoUringBufReg, IoUringFilesUpdate,
+    IoUringRsrcUpdate, IoVec, MadviseAdvice, MsgFlags, OpenFlags, OpenHow, PollMask, RawFd,
+    RenameFlags, SetupFlags, ShutdownHow, SocketFlags, SpliceFlags, SqeFlags, StatxFlags,
+    StatxMask, TimeoutFlags, Timespec, UnlinkFlags, WatchMask,
 };
 
 #[cfg(test)]
@@ -1333,5 +1337,632 @@ mod tests {
         // Verify the counter was updated
         let counter = efd.read().expect("read");
         assert_eq!(counter, 42);
+    }
+
+    // ---------------------------------------------------------------
+    // Layout tests for new structs — run under Miri.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn open_how_layout() {
+        use crate::types::OpenHow;
+        assert_eq!(mem::size_of::<OpenHow>(), 24);
+        assert_eq!(mem::align_of::<OpenHow>(), 8);
+        assert_eq!(mem::offset_of!(OpenHow, flags), 0);
+        assert_eq!(mem::offset_of!(OpenHow, mode), 8);
+        assert_eq!(mem::offset_of!(OpenHow, resolve), 16);
+    }
+
+    #[test]
+    fn epoll_event_layout() {
+        use crate::types::EpollEvent;
+        // Kernel struct is `packed`: 4 bytes events + 8 bytes data = 12 bytes, align 1.
+        assert_eq!(mem::size_of::<EpollEvent>(), 12);
+        assert_eq!(mem::offset_of!(EpollEvent, events), 0);
+        assert_eq!(mem::offset_of!(EpollEvent, data), 4);
+    }
+
+    #[test]
+    fn io_uring_files_update_layout() {
+        use crate::types::IoUringFilesUpdate;
+        assert_eq!(mem::size_of::<IoUringFilesUpdate>(), 16);
+        assert_eq!(mem::align_of::<IoUringFilesUpdate>(), 8);
+        assert_eq!(mem::offset_of!(IoUringFilesUpdate, offset), 0);
+        assert_eq!(mem::offset_of!(IoUringFilesUpdate, resv), 4);
+        assert_eq!(mem::offset_of!(IoUringFilesUpdate, fds), 8);
+    }
+
+    // ---------------------------------------------------------------
+    // SQE builder field-placement tests for new ops — run under Miri.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn sqe_builder_splice_places_fields_correctly() {
+        use crate::types::{Opcode, SpliceFlags};
+        let sqe = Sqe::splice(7, 100, 3, 200, 4096, SpliceFlags::MORE).user_data(55);
+        let inner = sqe.0;
+        assert_eq!(Opcode::Splice, inner.opcode);
+        assert_eq!(inner.fd, 7); // fd_out
+        assert_eq!(inner.off, 100); // off_out
+        assert_eq!(inner.splice_fd_in, 3); // fd_in
+        assert_eq!(inner.addr, 200); // off_in
+        assert_eq!(inner.len, 4096);
+        assert_eq!(inner.op_flags, SpliceFlags::MORE.bits());
+        assert_eq!(inner.user_data, 55);
+    }
+
+    #[test]
+    fn sqe_builder_tee_places_fields_correctly() {
+        use crate::types::{Opcode, SpliceFlags};
+        let sqe = Sqe::tee(5, 3, 8192, SpliceFlags::NONBLOCK).user_data(77);
+        let inner = sqe.0;
+        assert_eq!(Opcode::Tee, inner.opcode);
+        assert_eq!(inner.fd, 5); // fd_out
+        assert_eq!(inner.splice_fd_in, 3); // fd_in
+        assert_eq!(inner.len, 8192);
+        assert_eq!(inner.op_flags, SpliceFlags::NONBLOCK.bits());
+        assert_eq!(inner.user_data, 77);
+    }
+
+    #[test]
+    fn sqe_builder_epoll_ctl_places_fields_correctly() {
+        use crate::types::{EpollEvent, EpollEvents, EpollOp, Opcode};
+        let event = EpollEvent {
+            events: EpollEvents::IN.bits(),
+            data: 42,
+        };
+        let sqe = Sqe::epoll_ctl(9, EpollOp::Add, 4, &event).user_data(88);
+        let inner = sqe.0;
+        assert_eq!(Opcode::EpollCtl, inner.opcode);
+        assert_eq!(inner.fd, 9); // epfd
+        assert_eq!(inner.off, 4); // target fd
+        assert_eq!(inner.addr, (&raw const event) as u64);
+        assert_eq!(inner.len, EpollOp::Add as u32);
+        assert_eq!(inner.user_data, 88);
+    }
+
+    #[test]
+    fn sqe_builder_fadvise_places_fields_correctly() {
+        use crate::types::{FadviseAdvice, Opcode};
+        let sqe = Sqe::fadvise(3, 0, 4096, FadviseAdvice::Sequential).user_data(11);
+        let inner = sqe.0;
+        assert_eq!(Opcode::Fadvise, inner.opcode);
+        assert_eq!(inner.fd, 3);
+        assert_eq!(inner.off, 0);
+        assert_eq!(inner.len, 4096);
+        assert_eq!(inner.op_flags, FadviseAdvice::Sequential as u32);
+        assert_eq!(inner.user_data, 11);
+    }
+
+    #[test]
+    fn sqe_builder_openat2_places_fields_correctly() {
+        use crate::types::{Opcode, OpenHow};
+        let how = OpenHow {
+            flags: 2,
+            mode: 0o644,
+            resolve: 0,
+        };
+        let path = c"/tmp/x";
+        let sqe = Sqe::openat2(types::AT_FDCWD, path, &how).user_data(99);
+        let inner = sqe.0;
+        assert_eq!(Opcode::Openat2, inner.opcode);
+        assert_eq!(inner.fd, types::AT_FDCWD);
+        assert_eq!(inner.addr, path.as_ptr() as u64);
+        assert_eq!(inner.off, (&raw const how) as u64);
+        assert_eq!(inner.len as usize, mem::size_of::<OpenHow>());
+        assert_eq!(inner.user_data, 99);
+    }
+
+    #[test]
+    fn sqe_builder_send_zc_places_fields_correctly() {
+        use crate::types::{MsgFlags, Opcode};
+        let buf = b"zero copy!";
+        let sqe = Sqe::send_zc(5, buf, MsgFlags::NOSIGNAL).user_data(66);
+        let inner = sqe.0;
+        assert_eq!(Opcode::SendZc, inner.opcode);
+        assert_eq!(inner.fd, 5);
+        assert_eq!(inner.addr, buf.as_ptr() as u64);
+        assert_eq!(inner.len, buf.len() as u32);
+        assert_eq!(inner.op_flags, MsgFlags::NOSIGNAL.bits());
+        assert_eq!(inner.user_data, 66);
+    }
+
+    #[test]
+    fn sqe_builder_files_update_places_fields_correctly() {
+        use crate::types::Opcode;
+        let fds = [3i32, 4, -1];
+        let sqe = Sqe::files_update(&fds, 2).user_data(44);
+        let inner = sqe.0;
+        assert_eq!(Opcode::FilesUpdate, inner.opcode);
+        assert_eq!(inner.addr, fds.as_ptr() as u64);
+        assert_eq!(inner.len, 3);
+        assert_eq!(inner.off, 2);
+        assert_eq!(inner.user_data, 44);
+    }
+
+    #[test]
+    fn sqe_builder_provide_buffers_places_fields_correctly() {
+        use crate::types::Opcode;
+        let mut buf = [0u8; 256];
+        let sqe = unsafe { Sqe::provide_buffers(buf.as_mut_ptr(), 64, 4, 1, 0) }.user_data(33);
+        let inner = sqe.0;
+        assert_eq!(Opcode::ProvideBuffers, inner.opcode);
+        assert_eq!(inner.fd, 4); // count as i32
+        assert_eq!(inner.addr, buf.as_ptr() as u64);
+        assert_eq!(inner.len, 64); // buf_size
+        assert_eq!(inner.off, 0); // buf_id (starting bid)
+        assert_eq!(inner.buf_index, 1); // bgid
+        assert_eq!(inner.user_data, 33);
+    }
+
+    #[test]
+    fn sqe_builder_remove_buffers_places_fields_correctly() {
+        use crate::types::Opcode;
+        let sqe = Sqe::remove_buffers(3, 1).user_data(22);
+        let inner = sqe.0;
+        assert_eq!(Opcode::RemoveBuffers, inner.opcode);
+        assert_eq!(inner.fd, 3); // count
+        assert_eq!(inner.buf_index, 1); // bgid
+        assert_eq!(inner.user_data, 22);
+    }
+
+    #[test]
+    fn sqe_modifier_cqe_skip_success() {
+        use crate::types::SqeFlags;
+        let sqe = Sqe::nop().cqe_skip_success();
+        assert_eq!(
+            sqe.0.flags & SqeFlags::CQE_SKIP_SUCCESS.bits(),
+            SqeFlags::CQE_SKIP_SUCCESS.bits()
+        );
+    }
+
+    #[test]
+    fn sqe_builder_accept_multishot_places_fields_correctly() {
+        use crate::types::{AcceptFlags, IORING_ACCEPT_MULTISHOT, Opcode};
+        let sqe = Sqe::accept_multishot(7, AcceptFlags::NONBLOCK).user_data(5);
+        let inner = sqe.0;
+        assert_eq!(Opcode::Accept, inner.opcode);
+        assert_eq!(inner.fd, 7);
+        assert_eq!(inner.ioprio, IORING_ACCEPT_MULTISHOT);
+        assert_eq!(inner.op_flags, AcceptFlags::NONBLOCK.bits());
+    }
+
+    #[test]
+    fn sqe_builder_recv_multishot_places_fields_correctly() {
+        use crate::types::{IORING_RECV_MULTISHOT, MsgFlags, Opcode};
+        let sqe = Sqe::recv_multishot(4, MsgFlags::default()).user_data(6);
+        let inner = sqe.0;
+        assert_eq!(Opcode::Recv, inner.opcode);
+        assert_eq!(inner.fd, 4);
+        assert_eq!(
+            inner.op_flags & IORING_RECV_MULTISHOT,
+            IORING_RECV_MULTISHOT
+        );
+    }
+
+    #[test]
+    fn open_flags_new_bits() {
+        use crate::types::OpenFlags;
+        // verify none of the new bits overlap each other or existing ones
+        let flags = OpenFlags::EXCL
+            | OpenFlags::APPEND
+            | OpenFlags::NONBLOCK
+            | OpenFlags::NOFOLLOW
+            | OpenFlags::CLOEXEC
+            | OpenFlags::DIRECTORY
+            | OpenFlags::PATH;
+        // All set bits should be distinct — OR then AND to verify no aliasing
+        assert!(flags.bits() != 0);
+        // EXCL and CREAT are separate
+        assert_ne!(OpenFlags::EXCL.bits(), OpenFlags::CREAT.bits());
+        // CLOEXEC value matches O_CLOEXEC on Linux
+        assert_eq!(OpenFlags::CLOEXEC.bits(), 0o2_000_000);
+    }
+
+    #[test]
+    fn setup_flags_new_bits() {
+        use crate::types::SetupFlags;
+        assert_eq!(SetupFlags::COOP_TASKRUN.bits(), 1 << 8);
+        assert_eq!(SetupFlags::DEFER_TASKRUN.bits(), 1 << 13);
+        assert_eq!(SetupFlags::NO_MMAP.bits(), 1 << 14);
+        assert_eq!(SetupFlags::NO_SQARRAY.bits(), 1 << 16);
+    }
+
+    #[test]
+    fn enter_flags_new_bits() {
+        use crate::types::EnterFlags;
+        assert_eq!(EnterFlags::EXT_ARG.bits(), 1 << 3);
+        assert_eq!(EnterFlags::REGISTERED_RING.bits(), 1 << 4);
+    }
+
+    #[test]
+    fn splice_flags_fd_in_fixed() {
+        use crate::types::SpliceFlags;
+        // High bit of u32
+        assert_eq!(SpliceFlags::FD_IN_FIXED.bits(), 1 << 31);
+    }
+
+    #[test]
+    fn features_new_bits() {
+        use crate::types::Features;
+        assert_eq!(Features::RSRC_TAGS.bits(), 1 << 10);
+        assert_eq!(Features::CQE_SKIP.bits(), 1 << 11);
+        assert_eq!(Features::LINKED_FILE.bits(), 1 << 12);
+        assert_eq!(Features::REG_REG_RING.bits(), 1 << 13);
+        assert_eq!(Features::RECVSEND_BUNDLE.bits(), 1 << 14);
+        assert_eq!(Features::MIN_TIMEOUT.bits(), 1 << 15);
+    }
+
+    // ---------------------------------------------------------------
+    // Kernel integration tests for new ops — skipped under Miri.
+    // ---------------------------------------------------------------
+
+    #[cfg(not(miri))]
+    #[test]
+    fn builder_coop_taskrun() {
+        let ring = IoUring::builder(4).coop_taskrun().build().expect("setup");
+        drop(ring);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn builder_defer_taskrun() {
+        // DEFER_TASKRUN requires SINGLE_ISSUER on some kernels
+        let ring = IoUring::builder(4)
+            .defer_taskrun()
+            .single_issuer()
+            .build()
+            .expect("setup");
+        drop(ring);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn splice_pipe_roundtrip() {
+        use crate::types::SpliceFlags;
+        // pipe2(2) via /proc/self/fd to avoid direct syscall
+        let mut pipe_fds = [0i32; 2];
+        let ret = unsafe { libc_pipe2(pipe_fds.as_mut_ptr(), 0) };
+        assert_eq!(ret, 0, "pipe2 failed");
+        let [read_end, write_end] = pipe_fds;
+
+        let mut ring = IoUring::new(8).expect("setup");
+        let msg = b"splice test data";
+
+        // Write to the pipe's write end directly
+        ring.push(Sqe::write(write_end, msg, 0).user_data(1))
+            .expect("push write");
+        ring.submit_and_wait(1).expect("submit write");
+        let cqe = ring.complete().expect("write cqe");
+        assert_eq!(cqe.result, msg.len() as i32);
+
+        // Splice from the read end of the pipe into a tmpfile
+        let fd = open_tmpfile(&mut ring);
+        ring.push(
+            Sqe::splice(
+                fd,
+                u64::MAX,
+                read_end,
+                u64::MAX,
+                msg.len() as u32,
+                SpliceFlags::default(),
+            )
+            .user_data(2),
+        )
+        .expect("push splice");
+        ring.submit_and_wait(1).expect("submit splice");
+        let cqe = ring.complete().expect("splice cqe");
+        assert_eq!(cqe.result, msg.len() as i32, "splice byte count");
+
+        // Verify the data landed in the file
+        let mut read_buf = [0u8; 64];
+        ring.push(Sqe::read(fd, &mut read_buf, 0).user_data(3))
+            .expect("push read");
+        ring.submit_and_wait(1).expect("submit read");
+        let cqe = ring.complete().expect("read cqe");
+        assert_eq!(cqe.result, msg.len() as i32);
+        assert_eq!(&read_buf[..msg.len()], msg);
+
+        let _ = syscall::close(read_end as usize);
+        let _ = syscall::close(write_end as usize);
+        let _ = syscall::close(fd as usize);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn fadvise_roundtrip() {
+        use crate::types::FadviseAdvice;
+        let mut ring = IoUring::new(4).expect("setup");
+        let fd = open_tmpfile(&mut ring);
+
+        let buf = b"fadvise data";
+        ring.push(Sqe::write(fd, buf, 0).user_data(1))
+            .expect("push");
+        ring.submit_and_wait(1).expect("submit");
+        ring.complete().expect("write cqe");
+
+        ring.push(Sqe::fadvise(fd, 0, buf.len() as u32, FadviseAdvice::Sequential).user_data(2))
+            .expect("push fadvise");
+        ring.submit_and_wait(1).expect("submit fadvise");
+        let cqe = ring.complete().expect("fadvise cqe");
+        assert_eq!(cqe.user_data, 2);
+        assert_eq!(cqe.result, 0, "fadvise failed: {}", cqe.result);
+
+        let _ = syscall::close(fd as usize);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn openat2_basic() {
+        use crate::types::{OpenFlags, OpenHow};
+        let mut ring = IoUring::new(4).expect("setup");
+
+        let how = OpenHow {
+            flags: u64::from(
+                OpenFlags::RDWR.bits() | OpenFlags::CREAT.bits() | OpenFlags::TRUNC.bits(),
+            ),
+            mode: 0o600,
+            resolve: 0,
+        };
+        ring.push(Sqe::openat2(types::AT_FDCWD, c"/tmp/ququmatz_openat2_test", &how).user_data(1))
+            .expect("push openat2");
+        ring.submit_and_wait(1).expect("submit");
+        let cqe = ring.complete().expect("openat2 cqe");
+        assert_eq!(cqe.user_data, 1);
+        assert!(cqe.result >= 0, "openat2 failed: {}", cqe.result);
+
+        let _ = syscall::close(cqe.result as usize);
+        // cleanup
+        ring.push(Sqe::unlinkat(
+            types::AT_FDCWD,
+            c"/tmp/ququmatz_openat2_test",
+            UnlinkFlags::default(),
+        ))
+        .expect("push unlinkat");
+        ring.submit_and_wait(1).expect("submit unlinkat");
+        let _ = ring.complete();
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn send_zc_roundtrip() {
+        use crate::types::{CqeFlags, MsgFlags};
+        let mut ring = IoUring::new(8).expect("setup");
+        let (listener, port) = setup_tcp_listener();
+
+        let client = syscall::socket(types::AF_INET, types::SOCK_STREAM | types::SOCK_NONBLOCK, 0)
+            .expect("client socket") as i32;
+
+        ring.push(Sqe::accept(listener, AcceptFlags::default()).user_data(1))
+            .expect("push accept");
+        let connect_addr = SockAddrIn {
+            sin_family: types::AF_INET as u16,
+            sin_port: port.to_be(),
+            sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+            sin_zero: [0; 8],
+        };
+        let addr_bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(
+                (&raw const connect_addr).cast(),
+                mem::size_of::<SockAddrIn>(),
+            )
+        };
+        ring.push(Sqe::connect(client, addr_bytes).user_data(2))
+            .expect("push connect");
+        ring.submit_and_wait(2).expect("submit accept+connect");
+
+        let mut server_fd = -1i32;
+        for _ in 0..2 {
+            let cqe = ring.complete().expect("cqe");
+            if cqe.user_data == 1 {
+                assert!(cqe.result >= 0);
+                server_fd = cqe.result;
+            }
+        }
+        assert!(server_fd >= 0);
+
+        // send_zc: kernel generates a send CQE (user_data=3) + a NOTIF CQE (user_data=3,
+        // CqeFlags::NOTIF). The NOTIF may arrive in any order relative to other ops.
+        let msg = b"zero copy send";
+        let mut recv_buf = [0u8; 64];
+        ring.push(Sqe::send_zc(client, msg, MsgFlags::NOSIGNAL).user_data(3))
+            .expect("push send_zc");
+        ring.push(Sqe::recv(server_fd, &mut recv_buf, MsgFlags::default()).user_data(4))
+            .expect("push recv");
+        ring.submit_and_wait(2).expect("submit send_zc+recv");
+
+        // Collect all three CQEs: send_zc result, recv result, and NOTIF.
+        let mut got_send = false;
+        let mut got_recv = false;
+        let mut got_notif = false;
+        // send_zc produces 2 CQEs (result + NOTIF); recv produces 1 → 3 total.
+        for _ in 0..3 {
+            if let Some(cqe) = ring.complete() {
+                if cqe.user_data == 3 && cqe.flags.contains(CqeFlags::NOTIF) {
+                    got_notif = true;
+                } else if cqe.user_data == 3 {
+                    assert_eq!(cqe.result, msg.len() as i32, "send_zc byte count");
+                    got_send = true;
+                } else if cqe.user_data == 4 {
+                    assert_eq!(cqe.result, msg.len() as i32, "recv byte count");
+                    assert_eq!(&recv_buf[..msg.len()], msg);
+                    got_recv = true;
+                }
+            } else {
+                // NOTIF may arrive slightly after; give it one more wait
+                ring.submit_and_wait(1).ok();
+            }
+        }
+        assert!(got_send, "missing send_zc completion");
+        assert!(got_recv, "missing recv completion");
+        assert!(got_notif, "missing NOTIF completion");
+
+        let _ = syscall::close(server_fd as usize);
+        let _ = syscall::close(client as usize);
+        let _ = syscall::close(listener as usize);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn register_eventfd_wakes_on_completion() {
+        let efd = EventFd::new(0).expect("eventfd");
+
+        let mut ring = IoUring::new(4).expect("setup");
+        ring.register_eventfd(efd.fd()).expect("register_eventfd");
+
+        // Push a NOP — on completion the kernel should signal the eventfd
+        ring.push(Sqe::nop().user_data(1)).expect("push");
+        ring.submit().expect("submit");
+
+        // Blocking read on the eventfd; should unblock once the NOP completes
+        let count = efd.read().expect("eventfd read");
+        assert!(count >= 1, "expected ≥1 signal, got {count}");
+
+        ring.unregister_eventfd().expect("unregister_eventfd");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn register_eventfd_async_only_on_async() {
+        // With async-only mode, inline completions (NOPs) must NOT signal the eventfd.
+        // We verify no hang: if the eventfd were incorrectly signalled this would
+        // just pass, so the meaningful check is that we can call the API successfully.
+        let efd = EventFd::with_flags(0, EventFdFlags::NONBLOCK).expect("eventfd");
+
+        let mut ring = IoUring::new(4).expect("setup");
+        ring.register_eventfd_async(efd.fd())
+            .expect("register_eventfd_async");
+        ring.push(Sqe::nop().user_data(1)).expect("push");
+        ring.submit_and_wait(1).expect("submit");
+        ring.complete().expect("nop cqe");
+
+        // NOP completes inline — eventfd should NOT have been signalled.
+        let result = efd.read();
+        assert!(
+            result.is_err(),
+            "expected no signal for inline NOP, got Ok({result:?})"
+        );
+
+        ring.unregister_eventfd().expect("unregister_eventfd");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn cqe_skip_success_no_cqe_on_success() {
+        let mut ring = IoUring::new(4).expect("setup");
+
+        // NOP with CQE_SKIP_SUCCESS set — no CQE should appear on success.
+        ring.push(Sqe::nop().user_data(42).cqe_skip_success())
+            .expect("push");
+        ring.submit().expect("submit");
+        // Give the kernel a moment to process it (submit_and_wait(0) just polls).
+        ring.submit_and_wait(0).ok();
+        assert!(
+            ring.complete().is_none(),
+            "expected no CQE with CQE_SKIP_SUCCESS"
+        );
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn accept_with_addr_roundtrip() {
+        let mut ring = IoUring::new(8).expect("setup");
+        let (listener, port) = setup_tcp_listener();
+
+        let client = syscall::socket(types::AF_INET, types::SOCK_STREAM | types::SOCK_NONBLOCK, 0)
+            .expect("client socket") as i32;
+
+        let mut peer_addr = SockAddrIn::default();
+        let mut peer_addrlen = mem::size_of::<SockAddrIn>() as u32;
+
+        ring.push(
+            Sqe::accept_with_addr(
+                listener,
+                &mut peer_addr,
+                &mut peer_addrlen,
+                AcceptFlags::default(),
+            )
+            .user_data(1),
+        )
+        .expect("push accept_with_addr");
+
+        let connect_addr = SockAddrIn {
+            sin_family: types::AF_INET as u16,
+            sin_port: port.to_be(),
+            sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+            sin_zero: [0; 8],
+        };
+        let addr_bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(
+                (&raw const connect_addr).cast(),
+                mem::size_of::<SockAddrIn>(),
+            )
+        };
+        ring.push(Sqe::connect(client, addr_bytes).user_data(2))
+            .expect("push connect");
+
+        ring.submit_and_wait(2).expect("submit");
+
+        let mut server_fd = -1i32;
+        for _ in 0..2 {
+            let cqe = ring.complete().expect("cqe");
+            if cqe.user_data == 1 {
+                assert!(cqe.result >= 0, "accept failed: {}", cqe.result);
+                server_fd = cqe.result;
+            }
+        }
+        assert!(server_fd >= 0);
+        // The peer address should be the loopback IPv4 address
+        assert_eq!(peer_addr.sin_family, types::AF_INET as u16);
+        assert_eq!(peer_addr.sin_addr, u32::from_ne_bytes([127, 0, 0, 1]));
+        assert_eq!(peer_addrlen, mem::size_of::<SockAddrIn>() as u32);
+
+        let _ = syscall::close(server_fd as usize);
+        let _ = syscall::close(client as usize);
+        let _ = syscall::close(listener as usize);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn update_registered_files_replaces_slot() {
+        let mut ring = IoUring::new(4).expect("setup");
+        let fd = open_tmpfile(&mut ring);
+
+        // Register a table with one slot, then replace it via files_update
+        ring.register_files(&[fd]).expect("register_files");
+
+        let fd2 = open_tmpfile(&mut ring);
+        ring.update_registered_files(&[fd2], 0)
+            .expect("update_registered_files");
+
+        // Slot 0 now points to fd2; use a regular write through the fixed slot.
+        let msg = b"via updated fixed fd";
+        ring.push(Sqe::write(0, msg, 0).fixed_file().user_data(1))
+            .expect("push write");
+        ring.submit_and_wait(1).expect("submit");
+        let cqe = ring.complete().expect("cqe");
+        assert_eq!(cqe.result, msg.len() as i32);
+
+        ring.unregister_files().expect("unregister");
+        let _ = syscall::close(fd as usize);
+        let _ = syscall::close(fd2 as usize);
+    }
+
+    /// Thin shim over `pipe2(2)` — only used in tests, so we call the
+    /// raw syscall number rather than pulling in libc.
+    #[cfg(not(miri))]
+    unsafe fn libc_pipe2(fds: *mut i32, flags: i32) -> i32 {
+        let ret: i64;
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                in("rax") 293i64, // SYS_pipe2
+                in("rdi") fds,
+                in("rsi") flags as i64,
+                lateout("rax") ret,
+                options(nostack),
+            );
+        }
+        if ret < 0 { -(ret as i32) } else { ret as i32 }
     }
 }

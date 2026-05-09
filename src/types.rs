@@ -103,16 +103,27 @@ pub enum Opcode {
     Fallocate = 17,
     Openat = 18,
     Close = 19,
+    FilesUpdate = 20,
     Statx = 21,
     Read = 22,
     Write = 23,
+    Fadvise = 24,
+    Madvise = 25,
     Send = 26,
     Recv = 27,
+    Openat2 = 28,
+    EpollCtl = 29,
+    Splice = 30,
+    ProvideBuffers = 31,
+    RemoveBuffers = 32,
+    Tee = 33,
     Shutdown = 34,
     Renameat = 35,
     Unlinkat = 36,
     Mkdirat = 37,
     Socket = 45,
+    UringCmd = 46,
+    SendZc = 47,
 }
 
 impl PartialEq<u8> for Opcode {
@@ -137,6 +148,10 @@ bitflags! {
     const GETEVENTS = 1 << 0;
     /// Wake a sleeping SQPOLL thread.
     const SQ_WAKEUP = 1 << 1;
+    /// Pass an `io_uring_getevents_arg` struct for timeout without a SQE (6.0+).
+    const EXT_ARG = 1 << 3;
+    /// Use the registered ring fd (saved file-table lookup on each enter).
+    const REGISTERED_RING = 1 << 4;
 }
 
 // ---------------------------------------------------------------------------
@@ -156,8 +171,16 @@ bitflags! {
     const CLAMP = 1 << 4;
     /// Attach to an existing workqueue.
     const ATTACH_WQ = 1 << 5;
+    /// Cooperative task-run: don't force preemption when processing completions (6.0+).
+    const COOP_TASKRUN = 1 << 8;
     /// Single-issuer hint (5.18+).
     const SINGLE_ISSUER = 1 << 12;
+    /// Defer task-run work to `io_uring_enter` — biggest latency win on 6.1+.
+    const DEFER_TASKRUN = 1 << 13;
+    /// Don't mmap the rings; user provides the memory.
+    const NO_MMAP = 1 << 14;
+    /// Abolish the indirection SQ array; kernel reads SQEs directly (6.6+).
+    const NO_SQARRAY = 1 << 16;
 }
 
 // ---------------------------------------------------------------------------
@@ -177,6 +200,12 @@ bitflags! {
     const SQPOLL_NONFIXED = 1 << 7;
     const EXT_ARG = 1 << 8;
     const NATIVE_WORKERS = 1 << 9;
+    const RSRC_TAGS = 1 << 10;
+    const CQE_SKIP = 1 << 11;
+    const LINKED_FILE = 1 << 12;
+    const REG_REG_RING = 1 << 13;
+    const RECVSEND_BUNDLE = 1 << 14;
+    const MIN_TIMEOUT = 1 << 15;
 }
 
 impl Features {
@@ -209,6 +238,8 @@ bitflags! {
     /// `sqe.buf_group` (aliased with `buf_index`) and reports the chosen
     /// buffer id in the upper 16 bits of the CQE flags.
     const BUFFER_SELECT = 1 << 5;
+    /// Suppress the CQE when this request succeeds (fire-and-forget chains).
+    const CQE_SKIP_SUCCESS = 1 << 6;
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +254,15 @@ pub enum RegisterOp {
     UnregisterBuffers = 1,
     RegisterFiles = 2,
     UnregisterFiles = 3,
+    RegisterEventFd = 4,
+    UnregisterEventFd = 5,
     RegisterFilesUpdate = 6,
+    RegisterEventFdAsync = 7,
+    RegisterRestrictions = 11,
+    RegisterBuffersUpdate = 16,
+    RegisterIowqMaxWorkers = 19,
+    /// Register the ring fd itself as a fixed fd (saves file-table lookup on enter).
+    RegisterRingFds = 20,
     /// Register a provided-buffer ring (kernel 5.19+).
     RegisterPbufRing = 22,
     /// Unregister a provided-buffer ring.
@@ -290,7 +329,7 @@ impl From<RingOffset> for u64 {
 // ---------------------------------------------------------------------------
 
 bitflags! {
-    /// File open flags for `openat`.
+    /// File open flags for `openat` / `openat2`.
     ///
     /// Note: `O_RDONLY` (0) is not included because it is the *absence* of
     /// `WRONLY` and `RDWR`, not a flag bit. Use `OpenFlags::default()` for
@@ -300,7 +339,14 @@ bitflags! {
     const WRONLY = 1;
     const RDWR = 2;
     const CREAT = 0o100;
+    const EXCL = 0o200;
     const TRUNC = 0o1000;
+    const APPEND = 0o2000;
+    const NONBLOCK = 0o4000;
+    const NOFOLLOW = 0o400_000;
+    const CLOEXEC = 0o2_000_000;
+    const DIRECTORY = 0o200_000;
+    const PATH = 0o10_000_000;
     const TMPFILE = 0o20_200_000;
 }
 
@@ -878,6 +924,176 @@ pub struct InotifyEvent {
 pub const IN_NONBLOCK: i32 = 0o4000;
 /// `IN_CLOEXEC` flag for `inotify_init1`.
 pub const IN_CLOEXEC: i32 = 0o2_000_000;
+
+// ---------------------------------------------------------------------------
+// openat2 — open_how struct
+// ---------------------------------------------------------------------------
+
+/// Arguments for `IORING_OP_OPENAT2` (mirrors kernel `struct open_how`).
+///
+/// Pass to [`Sqe::openat2`](crate::op::Sqe::openat2) / [`Sqe::openat2_ptr`](crate::op::Sqe::openat2_ptr).
+/// The `flags` field accepts the same bits as [`OpenFlags`]; `mode` is only
+/// meaningful when `flags` includes `OpenFlags::CREAT` or `OpenFlags::TMPFILE`.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct OpenHow {
+    /// Open flags (same bits as [`OpenFlags`], but stored as `u64`).
+    pub flags: u64,
+    /// File mode (only used with `O_CREAT` / `O_TMPFILE`).
+    pub mode: u64,
+    /// Path resolution restrictions (`RESOLVE_*` constants).
+    pub resolve: u64,
+}
+
+/// `resolve` field constants for [`OpenHow`].
+pub mod resolve {
+    /// Block mount-point crossings.
+    pub const NO_XDEV: u64 = 0x01;
+    /// Block traversal through magic-links (e.g. `/proc/self/fd/*`).
+    pub const NO_MAGICLINKS: u64 = 0x02;
+    /// Block symlink traversal entirely.
+    pub const NO_SYMLINKS: u64 = 0x04;
+    /// Treat the path as relative to `dfd` even if it starts with `/`.
+    pub const BENEATH: u64 = 0x08;
+    /// Require the path to be inside `dfd` (implies `BENEATH`).
+    pub const IN_ROOT: u64 = 0x10;
+    /// Avoid blocking on slow filesystems (returns `EAGAIN` instead).
+    pub const CACHED: u64 = 0x20;
+}
+
+// ---------------------------------------------------------------------------
+// splice / tee flags
+// ---------------------------------------------------------------------------
+
+bitflags! {
+    /// Flags for `IORING_OP_SPLICE` and `IORING_OP_TEE`.
+    pub struct SpliceFlags(u32);
+    /// Move pages instead of copying (best-effort).
+    const MOVE = 1;
+    /// Don't block if the pipe is full/empty.
+    const NONBLOCK = 2;
+    /// Hint that more data will follow (like `MSG_MORE`).
+    const MORE = 4;
+    /// The source fd is a fixed (registered) fd.
+    const FD_IN_FIXED = 1 << 31;
+}
+
+// ---------------------------------------------------------------------------
+// epoll
+// ---------------------------------------------------------------------------
+
+/// epoll control operations for `IORING_OP_EPOLL_CTL`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum EpollOp {
+    Add = 1,
+    Del = 2,
+    Mod = 3,
+}
+
+impl From<EpollOp> for u32 {
+    fn from(op: EpollOp) -> Self {
+        op as Self
+    }
+}
+
+bitflags! {
+    /// Event mask for epoll (matches `EPOLLIN`, `EPOLLOUT`, etc.).
+    pub struct EpollEvents(u32);
+    const IN = 0x0001;
+    const OUT = 0x0004;
+    const ERR = 0x0008;
+    const HUP = 0x0010;
+    const RDHUP = 0x2000;
+    const ET = 1 << 31;
+    const ONESHOT = 1 << 30;
+}
+
+/// Kernel `epoll_event` struct (packed: 4-byte events + 8-byte data).
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C, packed)]
+pub struct EpollEvent {
+    pub events: u32,
+    /// User data associated with this event (fd, pointer, etc.).
+    pub data: u64,
+}
+
+// ---------------------------------------------------------------------------
+// fadvise / madvise
+// ---------------------------------------------------------------------------
+
+/// Advice values for `IORING_OP_FADVISE` (mirrors `posix_fadvise` advice).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum FadviseAdvice {
+    Normal = 0,
+    Random = 1,
+    Sequential = 2,
+    WillNeed = 3,
+    DontNeed = 4,
+    NoReuse = 5,
+}
+
+impl From<FadviseAdvice> for u32 {
+    fn from(a: FadviseAdvice) -> Self {
+        a as Self
+    }
+}
+
+/// Advice values for `IORING_OP_MADVISE` (mirrors `madvise` advice).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum MadviseAdvice {
+    Normal = 0,
+    Random = 1,
+    Sequential = 2,
+    WillNeed = 3,
+    DontNeed = 4,
+    Free = 8,
+    DontDump = 16,
+    DoFork = 11,
+    DontFork = 10,
+}
+
+impl From<MadviseAdvice> for u32 {
+    fn from(a: MadviseAdvice) -> Self {
+        a as Self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multishot op-flags
+// ---------------------------------------------------------------------------
+
+/// `op_flags` bit for `IORING_OP_ACCEPT`: keep issuing CQEs for each new connection.
+pub const IORING_ACCEPT_MULTISHOT: u16 = 1 << 0;
+
+/// `op_flags` bit for `IORING_OP_RECV`: keep issuing CQEs on each receive.
+pub const IORING_RECV_MULTISHOT: u32 = 1 << 1;
+
+// ---------------------------------------------------------------------------
+// Register helper structs
+// ---------------------------------------------------------------------------
+
+/// Argument for `IORING_REGISTER_FILES_UPDATE`.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct IoUringFilesUpdate {
+    pub offset: u32,
+    pub resv: u32,
+    /// Pointer to the array of fds (as `u64` to match the kernel ABI).
+    pub fds: u64,
+}
+
+/// Generic resource-update argument (used for `IORING_REGISTER_RING_FDS`).
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct IoUringRsrcUpdate {
+    /// Slot offset; pass `u32::MAX` to let the kernel pick one.
+    pub offset: u32,
+    pub resv: u32,
+    pub data: u64,
+}
 
 // ---------------------------------------------------------------------------
 // Eventfd
