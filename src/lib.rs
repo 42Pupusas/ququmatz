@@ -21,7 +21,10 @@ pub use eventfd::EventFd;
 pub use inotify::Inotify;
 pub use net::Socket;
 pub use op::Sqe;
-pub use ring::{Completion, Completions, IoUring, IoUringBuilder, ProvidedBufferRing};
+pub use ring::{
+    Completer, Completion, Completions, IoUring, IoUringBuilder, ProvidedBufferRing,
+    SplitCompletions, Submitter,
+};
 pub use types::{
     CqeFlags, EventFdFlags, Features, InotifyEvent, IoUringBuf, IoUringBufReg, IoVec, RawFd,
     SetupFlags, SocketFlags, SqeFlags, TimeoutFlags, Timespec, WatchMask,

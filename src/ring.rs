@@ -5,7 +5,89 @@ use crate::types::{
     CqeFlags, EnterFlags, Features, IoUringCqe, IoUringParams, IoUringSqe, IoVec, MapFlags, Prot,
     RegisterOp, RingOffset, SetupFlags,
 };
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
+// ---------------------------------------------------------------------------
+// Shared ring resources — refcounted without alloc
+// ---------------------------------------------------------------------------
+
+/// Shared ownership of the kernel resources that both `Submitter` and
+/// `Completer` need to keep alive: the ring fd and the three mmap regions.
+///
+/// The refcount and the resource fields are stored in a single anonymous
+/// mmap page so that no heap allocator is required. The page is allocated
+/// in `RingResources::alloc` and freed (along with the ring's own mmaps and
+/// fd) when the last reference is dropped.
+struct RingResources {
+    refcount: AtomicUsize,
+    fd: usize,
+    sq_ring: MappedRegion,
+    cq_ring: MappedRegion,
+    sqes_region: MappedRegion,
+    /// The mmap page that holds `self`. Freed last in `release`.
+    self_page: MappedRegion,
+}
+
+impl RingResources {
+    /// Allocate one anonymous page, write `self` into it, and return a
+    /// raw pointer. The caller owns the only reference (refcount = 1).
+    fn alloc(
+        fd: usize,
+        sq_ring: MappedRegion,
+        cq_ring: MappedRegion,
+        sqes_region: MappedRegion,
+    ) -> Result<*mut Self, Error> {
+        let page_size = 4096usize;
+        let len = core::mem::size_of::<Self>().next_multiple_of(page_size);
+        let addr = syscall::mmap(
+            0,
+            len,
+            Prot::READ | Prot::WRITE,
+            MapFlags::PRIVATE | MapFlags::ANONYMOUS,
+            usize::MAX,
+            0,
+        )?;
+        let ptr = addr as *mut Self;
+        unsafe {
+            ptr.write(Self {
+                refcount: AtomicUsize::new(1),
+                fd,
+                sq_ring,
+                cq_ring,
+                sqes_region,
+                self_page: MappedRegion::new(addr, len),
+            });
+        }
+        Ok(ptr)
+    }
+
+    /// Increment the refcount. Called when producing a second owner.
+    unsafe fn retain(ptr: *mut Self) {
+        unsafe { &(*ptr).refcount }.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Decrement the refcount. When it reaches zero, unmaps ring memory,
+    /// closes the fd, and finally unmaps the page that holds `self`.
+    unsafe fn release(ptr: *mut Self) {
+        // AcqRel so that any writes in the dying half are visible to
+        // whoever runs the cleanup (mirrors std::Arc drop semantics).
+        if unsafe { &(*ptr).refcount }.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        // We are the last owner — clean up.
+        // SAFETY: no other references exist at this point.
+        let res = unsafe { &*ptr };
+        let _ = syscall::munmap(res.sqes_region.addr, res.sqes_region.len);
+        if res.cq_ring.len > 0 {
+            let _ = syscall::munmap(res.cq_ring.addr, res.cq_ring.len);
+        }
+        let _ = syscall::munmap(res.sq_ring.addr, res.sq_ring.len);
+        let _ = syscall::close(res.fd);
+        // Free the page last — `res` must not be used after this point.
+        let self_page = MappedRegion::new(res.self_page.addr, res.self_page.len);
+        let _ = syscall::munmap(self_page.addr, self_page.len);
+    }
+}
 
 /// A completed `io_uring` operation.
 #[derive(Debug, Clone, Copy)]
@@ -133,6 +215,10 @@ impl Drop for SetupGuard {
 /// safe to share across threads without external synchronization. Create one
 /// ring per thread, or wrap in a `Mutex` if you must share.
 ///
+/// To split submission and completion across threads, use
+/// [`split`](Self::split) to obtain a [`Submitter`] and a [`Completer`],
+/// both of which are `Send`.
+///
 /// # Drop Behavior
 ///
 /// When dropped, any SQEs that have been [`push`](Self::push)ed but not yet
@@ -169,10 +255,232 @@ pub struct IoUring {
     // Kernel-reported features
     features: Features,
 
-    // For cleanup
-    sq_ring: MappedRegion,
-    cq_ring: MappedRegion,
-    sqes_region: MappedRegion,
+    // Shared cleanup resources
+    resources: *mut RingResources,
+}
+
+// ---------------------------------------------------------------------------
+// Submitter / Completer — Send halves produced by IoUring::split
+// ---------------------------------------------------------------------------
+
+/// The submission half of a split `io_uring`.
+///
+/// Produced by [`IoUring::split`]. Owns exclusive access to the submission
+/// queue and is `Send`, so it can be moved to a dedicated IO submission thread.
+///
+/// # Drop
+///
+/// Dropping the `Submitter` releases its share of the ring resources. The
+/// kernel mmaps and fd are freed only when both the `Submitter` and the
+/// paired [`Completer`] have been dropped.
+pub struct Submitter {
+    fd: usize,
+
+    sq_head: *const AtomicU32,
+    sq_tail: *const AtomicU32,
+    sq_mask: u32,
+    sq_flags: *const AtomicU32,
+
+    sqes: *mut IoUringSqe,
+    sq_tail_local: u32,
+    sq_submitted: u32,
+
+    features: Features,
+
+    resources: *mut RingResources,
+}
+
+/// The completion half of a split `io_uring`.
+///
+/// Produced by [`IoUring::split`]. Owns exclusive access to the completion
+/// queue and is `Send`, so it can be moved to a dedicated IO completion thread.
+///
+/// # Drop
+///
+/// Dropping the `Completer` flushes the CQ head to the kernel and releases its
+/// share of the ring resources. The kernel mmaps and fd are freed only when
+/// both the paired [`Submitter`] and the `Completer` have been dropped.
+pub struct Completer {
+    cq_head: *const AtomicU32,
+    cq_tail: *const AtomicU32,
+    cq_mask: u32,
+    cqes: *const IoUringCqe,
+    cq_head_local: u32,
+
+    resources: *mut RingResources,
+}
+
+// SAFETY: Submitter owns exclusive access to the SQ-side fields (sq_tail_local,
+// sq_submitted) and writes to kernel-shared atomics only through Release stores.
+// The raw pointers into mmap'd memory are stable for the lifetime of the ring.
+// No other type aliases these fields concurrently without synchronization.
+unsafe impl Send for Submitter {}
+
+// SAFETY: Same reasoning for the CQ side. cq_head_local is exclusively owned
+// by Completer; the kernel-shared CQ tail is read-only from userspace.
+unsafe impl Send for Completer {}
+
+impl Submitter {
+    /// Push a prepared SQE onto the submission queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EAGAIN` if the submission queue is full.
+    #[inline]
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn push(&mut self, sqe: Sqe) -> Result<(), Error> {
+        let head = unsafe { &*self.sq_head }.load(Ordering::Acquire);
+        let next_tail = self.sq_tail_local.wrapping_add(1);
+        if next_tail.wrapping_sub(head) > self.sq_mask + 1 {
+            return Err(Error::EAGAIN);
+        }
+        let idx = self.sq_tail_local & self.sq_mask;
+        unsafe { *self.sqes.add(idx as usize) = sqe.0 };
+        self.sq_tail_local = next_tail;
+        Ok(())
+    }
+
+    /// Push a NOP onto the submission queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EAGAIN` if the submission queue is full.
+    pub fn push_nop(&mut self, user_data: u64) -> Result<(), Error> {
+        self.push(Sqe::nop().user_data(user_data))
+    }
+
+    /// Publish the local SQ tail to the kernel-visible atomic.
+    #[inline]
+    pub fn flush_sq_tail(&self) {
+        unsafe { &*self.sq_tail }.store(self.sq_tail_local, Ordering::Release);
+    }
+
+    /// Check if the SQPOLL kernel thread needs a wakeup.
+    #[must_use]
+    pub fn sq_need_wakeup(&self) -> bool {
+        const IORING_SQ_NEED_WAKEUP: u32 = 1 << 0;
+        let flags = unsafe { &*self.sq_flags }.load(Ordering::Acquire);
+        flags & IORING_SQ_NEED_WAKEUP != 0
+    }
+
+    /// Returns the feature flags reported by the kernel.
+    #[must_use]
+    pub const fn features(&self) -> Features {
+        self.features
+    }
+
+    /// Submit all queued entries to the kernel.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the kernel rejects the submission.
+    #[inline]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn submit(&mut self) -> Result<u32, Error> {
+        let to_submit = self.sq_tail_local.wrapping_sub(self.sq_submitted);
+        self.flush_sq_tail();
+        if to_submit == 0 {
+            return Ok(0);
+        }
+        let ret = syscall::io_uring_enter(self.fd, to_submit, 0, EnterFlags::default())?;
+        self.sq_submitted = self.sq_tail_local;
+        Ok(ret as u32)
+    }
+
+    /// Submit all queued entries and wait for at least `min_complete` completions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the kernel rejects the submission.
+    #[inline]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn submit_and_wait(&mut self, min_complete: u32) -> Result<u32, Error> {
+        let to_submit = self.sq_tail_local.wrapping_sub(self.sq_submitted);
+        self.flush_sq_tail();
+        let ret = syscall::io_uring_enter(self.fd, to_submit, min_complete, EnterFlags::GETEVENTS)?;
+        self.sq_submitted = self.sq_tail_local;
+        Ok(ret as u32)
+    }
+
+    /// Submit in SQPOLL mode, waking the kernel thread if necessary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the wakeup syscall fails.
+    #[inline]
+    pub fn submit_sqpoll(&mut self) -> Result<(), Error> {
+        self.flush_sq_tail();
+        self.sq_submitted = self.sq_tail_local;
+        if self.sq_need_wakeup() {
+            syscall::io_uring_enter(self.fd, 0, 0, EnterFlags::SQ_WAKEUP)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Submitter {
+    fn drop(&mut self) {
+        unsafe { RingResources::release(self.resources) };
+    }
+}
+
+impl Completer {
+    /// Reap one completion from the completion queue, if available.
+    #[inline]
+    #[must_use]
+    pub fn complete(&mut self) -> Option<Completion> {
+        let tail = unsafe { &*self.cq_tail }.load(Ordering::Acquire);
+        if self.cq_head_local == tail {
+            return None;
+        }
+        let idx = self.cq_head_local & self.cq_mask;
+        let cqe = unsafe { &*self.cqes.add(idx as usize) };
+        let completion = Completion {
+            user_data: cqe.user_data,
+            result: cqe.res,
+            flags: CqeFlags::from_raw(cqe.flags),
+        };
+        self.cq_head_local = self.cq_head_local.wrapping_add(1);
+        Some(completion)
+    }
+
+    /// Publish consumed CQ slots back to the kernel.
+    #[inline]
+    pub fn sync_cq(&self) {
+        unsafe { &*self.cq_head }.store(self.cq_head_local, Ordering::Release);
+    }
+
+    /// Return an iterator that drains all currently available completions.
+    pub const fn completions(&mut self) -> SplitCompletions<'_> {
+        SplitCompletions { completer: self }
+    }
+}
+
+impl Drop for Completer {
+    fn drop(&mut self) {
+        // Flush CQ head so the kernel can reuse completed slots.
+        self.sync_cq();
+        unsafe { RingResources::release(self.resources) };
+    }
+}
+
+/// Iterator over completions from a [`Completer`].
+pub struct SplitCompletions<'a> {
+    completer: &'a mut Completer,
+}
+
+impl Iterator for SplitCompletions<'_> {
+    type Item = Completion;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.completer.complete()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let tail = unsafe { &*self.completer.cq_tail }.load(Ordering::Acquire);
+        let pending = tail.wrapping_sub(self.completer.cq_head_local) as usize;
+        (pending, None)
+    }
 }
 
 impl IoUring {
@@ -304,9 +612,25 @@ impl IoUring {
         let sq_tail_local = unsafe { &*sq_tail }.load(Ordering::Acquire);
         let cq_head_local = unsafe { &*cq_head }.load(Ordering::Acquire);
 
-        // All resources acquired — disarm the guard so Drop doesn't
-        // clean up what we're about to hand to the IoUring struct.
+        // All resources acquired — disarm the guard and hand them to
+        // RingResources. If alloc fails the guard would have already been
+        // disarmed, so we re-clean manually on error.
         guard.disarm();
+
+        let resources = match RingResources::alloc(
+            fd,
+            MappedRegion::new(sq_ring_ptr, mmap_sz),
+            cq_ring_region,
+            MappedRegion::new(sqes_ptr, sqes_sz),
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = syscall::munmap(sqes_ptr, sqes_sz);
+                let _ = syscall::munmap(sq_ring_ptr, mmap_sz);
+                let _ = syscall::close(fd);
+                return Err(e);
+            }
+        };
 
         Ok(Self {
             fd,
@@ -323,9 +647,7 @@ impl IoUring {
             cqes,
             cq_head_local,
             features,
-            sq_ring: MappedRegion::new(sq_ring_ptr, mmap_sz),
-            cq_ring: cq_ring_region,
-            sqes_region: MappedRegion::new(sqes_ptr, sqes_sz),
+            resources,
         })
     }
 
@@ -804,6 +1126,47 @@ impl IoUring {
     pub fn do_fsync(&mut self, fd: i32, flags: crate::types::FsyncFlags) -> Result<u32, Error> {
         self.run_one(Sqe::fsync(fd, flags))
     }
+
+    /// Split the ring into a [`Submitter`] and a [`Completer`].
+    ///
+    /// Both halves are `Send` and can be moved to separate threads. The
+    /// underlying kernel resources (fd and mmap regions) are freed only
+    /// when **both** halves have been dropped.
+    ///
+    /// `self` is consumed — use the returned halves instead of the original
+    /// `IoUring`.
+    #[must_use]
+    pub fn split(self) -> (Submitter, Completer) {
+        // Bump refcount: resources starts at 1 (from IoUring), we need 2.
+        unsafe { RingResources::retain(self.resources) };
+
+        let submitter = Submitter {
+            fd: self.fd,
+            sq_head: self.sq_head,
+            sq_tail: self.sq_tail,
+            sq_mask: self.sq_mask,
+            sq_flags: self.sq_flags,
+            sqes: self.sqes,
+            sq_tail_local: self.sq_tail_local,
+            sq_submitted: self.sq_submitted,
+            features: self.features,
+            resources: self.resources,
+        };
+
+        let completer = Completer {
+            cq_head: self.cq_head,
+            cq_tail: self.cq_tail,
+            cq_mask: self.cq_mask,
+            cqes: self.cqes,
+            cq_head_local: self.cq_head_local,
+            resources: self.resources,
+        };
+
+        // Don't run IoUring's Drop — the two halves now own the resources.
+        core::mem::forget(self);
+
+        (submitter, completer)
+    }
 }
 
 /// An iterator that drains available completions from the ring.
@@ -829,12 +1192,7 @@ impl Iterator for Completions<'_> {
 impl Drop for IoUring {
     fn drop(&mut self) {
         self.flush_cq_head();
-        let _ = syscall::munmap(self.sqes_region.addr, self.sqes_region.len);
-        if self.cq_ring.len > 0 {
-            let _ = syscall::munmap(self.cq_ring.addr, self.cq_ring.len);
-        }
-        let _ = syscall::munmap(self.sq_ring.addr, self.sq_ring.len);
-        let _ = syscall::close(self.fd);
+        unsafe { RingResources::release(self.resources) };
     }
 }
 
