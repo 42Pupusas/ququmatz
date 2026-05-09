@@ -1958,7 +1958,7 @@ mod tests {
                 "syscall",
                 in("rax") 293i64, // SYS_pipe2
                 in("rdi") fds,
-                in("rsi") flags as i64,
+                in("rsi") i64::from(flags),
                 lateout("rax") ret,
                 options(nostack),
             );

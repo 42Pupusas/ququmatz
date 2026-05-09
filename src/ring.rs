@@ -1675,6 +1675,7 @@ mod buffer_slice_tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn round_trip_write_then_read() {
         let mut mem = backing();
         let base = mem.as_mut_ptr();
@@ -1726,6 +1727,7 @@ mod buffer_slice_tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn out_of_range_buf_id_returns_none() {
         let mut mem = backing();
         let base = mem.as_mut_ptr();
