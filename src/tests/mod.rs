@@ -696,6 +696,26 @@ fn registered_files() {
 }
 
 #[cfg(not(miri))]
+#[test]
+fn socket_with_typed_flags_creates_nonblocking_fd() {
+    use crate::Socket;
+    use crate::types::{AddressFamily, SocketFlags, SocketType};
+
+    let sock = Socket::with_typed_flags(
+        AddressFamily::Inet,
+        SocketType::Stream,
+        0,
+        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+    )
+    .expect("socket");
+    assert!(sock.fd() >= 0);
+    // No syscall to inspect flags here — we trust the kernel applied them
+    // because socket(2) returned success with that argument layout. The
+    // round-trip test (`tcp_send_recv_roundtrip`) exercises NONBLOCK end
+    // to end via the io_uring accept path.
+}
+
+#[cfg(not(miri))]
 fn setup_tcp_listener() -> (i32, u16) {
     let fd = syscall::socket(types::AF_INET, types::SOCK_STREAM | types::SOCK_NONBLOCK, 0)
         .expect("socket") as i32;
@@ -1571,6 +1591,42 @@ fn sqe_builder_recvmsg_multishot_places_fields_correctly() {
         inner.op_flags & IORING_RECV_MULTISHOT,
         IORING_RECV_MULTISHOT
     );
+}
+
+#[test]
+fn sqe_builder_socket_places_fields_correctly() {
+    use crate::types::{AddressFamily, Opcode, SocketFlags, SocketType};
+    let sqe = Sqe::socket(
+        AddressFamily::Inet,
+        SocketType::Stream,
+        0,
+        SocketFlags::NONBLOCK,
+    );
+    let inner = sqe.0;
+    assert_eq!(Opcode::Socket, inner.opcode);
+    assert_eq!(inner.fd, AddressFamily::Inet.as_raw());
+    assert_eq!(inner.off, SocketType::Stream.as_raw() as u64);
+    assert_eq!(inner.op_flags, SocketFlags::NONBLOCK.bits());
+    // Plain socket op does NOT set splice_fd_in.
+    assert_eq!(inner.splice_fd_in, 0);
+}
+
+#[test]
+fn sqe_builder_socket_direct_sets_file_index_alloc() {
+    use crate::types::{AddressFamily, Opcode, SocketFlags, SocketType};
+    let sqe = Sqe::socket_direct(
+        AddressFamily::Inet,
+        SocketType::Stream,
+        0,
+        SocketFlags::NONBLOCK,
+    );
+    let inner = sqe.0;
+    assert_eq!(Opcode::Socket, inner.opcode);
+    assert_eq!(inner.fd, AddressFamily::Inet.as_raw());
+    assert_eq!(inner.off, SocketType::Stream.as_raw() as u64);
+    assert_eq!(inner.op_flags, SocketFlags::NONBLOCK.bits());
+    // IORING_FILE_INDEX_ALLOC: kernel reads splice_fd_in as ~0u32.
+    assert_eq!(inner.splice_fd_in, -1);
 }
 
 #[test]

@@ -13,7 +13,9 @@
 
 use crate::error::Error;
 use crate::syscall;
-use crate::types::{AcceptFlags, MsgFlags, RawFd, ShutdownHow, SockAddrIn};
+use crate::types::{
+    AcceptFlags, AddressFamily, MsgFlags, RawFd, ShutdownHow, SockAddrIn, SocketFlags, SocketType,
+};
 use core::mem;
 
 /// An owned socket file descriptor.
@@ -25,17 +27,42 @@ pub struct Socket {
 }
 
 impl Socket {
-    /// Create a new socket.
+    /// Create a new socket from raw kernel arguments.
     ///
     /// `domain`, `sock_type`, and `protocol` are passed directly to the
-    /// `socket(2)` syscall. Use the constants in [`crate::types`]
-    /// (e.g. `AF_INET`, `SOCK_STREAM | SOCK_NONBLOCK`).
+    /// `socket(2)` syscall. Prefer [`with_typed_flags`](Self::with_typed_flags)
+    /// for the common AF/SOCK combinations.
     ///
     /// # Errors
     ///
     /// Returns an [`Error`] if the `socket` syscall fails.
     pub fn new(domain: i32, sock_type: i32, protocol: i32) -> Result<Self, Error> {
         let fd = syscall::socket(domain, sock_type, protocol)? as RawFd;
+        Ok(Self { fd })
+    }
+
+    /// Create a new socket using the typed wrappers.
+    ///
+    /// `flags` is OR'd into the `sock_type` argument of `socket(2)` —
+    /// `SOCK_NONBLOCK` and `SOCK_CLOEXEC` share their bit values with
+    /// the corresponding [`SocketFlags`] variants, so this matches
+    /// the kernel's expected layering. `protocol` is the protocol
+    /// number (`0` for the default).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if the `socket` syscall fails.
+    pub fn with_typed_flags(
+        domain: AddressFamily,
+        sock_type: SocketType,
+        protocol: i32,
+        flags: SocketFlags,
+    ) -> Result<Self, Error> {
+        let fd = syscall::socket(
+            domain.as_raw(),
+            sock_type.as_raw() | flags.bits() as i32,
+            protocol,
+        )? as RawFd;
         Ok(Self { fd })
     }
 

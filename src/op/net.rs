@@ -12,7 +12,7 @@ impl Sqe {
     /// `protocol` is the kernel protocol number (e.g. `IPPROTO_TCP = 6`,
     /// `IPPROTO_UDP = 17`). Pass `0` for the default protocol of the
     /// chosen `sock_type`. `flags` controls fd-level options like
-    /// `NONBLOCK` and `CLOEXEC`.
+    /// `NONBLOCK` and `CLOEXEC`. The CQE result is the new fd.
     #[must_use]
     pub fn socket(
         domain: AddressFamily,
@@ -26,6 +26,39 @@ impl Sqe {
         sqe.off = sock_type.as_raw() as u64;
         sqe.len = protocol as u32;
         sqe.op_flags = flags.bits();
+        Self(sqe)
+    }
+
+    /// Prepare a socket creation that allocates a fixed-file slot directly.
+    ///
+    /// Same as [`socket`](Self::socket) but sets `IORING_FILE_INDEX_ALLOC`
+    /// in `splice_fd_in`, telling the kernel to auto-allocate a slot in
+    /// the registered-files table and return its index in `cqe.res`.
+    /// The returned index can be used directly with [`fixed_file`](Self::fixed_file)
+    /// on a linked `connect` (or any subsequent op) — no userspace fd is
+    /// ever materialized, saving a file-table lookup and avoiding the
+    /// race window between syscall return and registration.
+    ///
+    /// Requires a registered-files table to be set up via
+    /// [`IoUring::register_files`](crate::IoUring::register_files) (an
+    /// empty sparse table works:
+    /// `register_files(&[-1; N])`). Available on Linux 5.19+.
+    #[must_use]
+    pub fn socket_direct(
+        domain: AddressFamily,
+        sock_type: SocketType,
+        protocol: i32,
+        flags: SocketFlags,
+    ) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Socket.into();
+        sqe.fd = domain.as_raw();
+        sqe.off = sock_type.as_raw() as u64;
+        sqe.len = protocol as u32;
+        sqe.op_flags = flags.bits();
+        // `IORING_FILE_INDEX_ALLOC` — kernel reads splice_fd_in as the
+        // fixed-file index; ~0u32 means "allocate one for me".
+        sqe.splice_fd_in = -1;
         Self(sqe)
     }
 
