@@ -85,6 +85,7 @@ impl Socket {
             core::ptr::from_ref::<SockAddrIn>(addr).cast(),
             mem::size_of::<SockAddrIn>() as u32,
         )
+        .map_err(Into::into)
     }
 
     /// Connect to a remote address.
@@ -98,6 +99,7 @@ impl Socket {
             core::ptr::from_ref::<SockAddrIn>(addr).cast(),
             mem::size_of::<SockAddrIn>() as u32,
         )
+        .map_err(Into::into)
     }
 
     /// Accept a connection, returning the new socket and peer address.
@@ -126,7 +128,7 @@ impl Socket {
     ///
     /// Returns an [`Error`] if the `listen` syscall fails.
     pub fn listen(&self, backlog: i32) -> Result<(), Error> {
-        syscall::listen(self.fd as usize, backlog)
+        syscall::listen(self.fd as usize, backlog).map_err(Into::into)
     }
 
     /// Set a socket option.
@@ -146,6 +148,7 @@ impl Socket {
             core::ptr::from_ref::<T>(value).cast(),
             mem::size_of::<T>() as u32,
         )
+        .map_err(Into::into)
     }
 
     /// Send data on the socket. Returns the number of bytes sent.
@@ -154,7 +157,7 @@ impl Socket {
     ///
     /// Returns an [`Error`] if the `sendto` syscall fails.
     pub fn send(&self, buf: &[u8], flags: MsgFlags) -> Result<usize, Error> {
-        syscall::sendto(self.fd as usize, buf.as_ptr(), buf.len(), flags.bits())
+        syscall::sendto(self.fd as usize, buf.as_ptr(), buf.len(), flags.bits()).map_err(Into::into)
     }
 
     /// Receive data from the socket. Returns the number of bytes read.
@@ -164,6 +167,7 @@ impl Socket {
     /// Returns an [`Error`] if the `recvfrom` syscall fails.
     pub fn recv(&self, buf: &mut [u8], flags: MsgFlags) -> Result<usize, Error> {
         syscall::recvfrom(self.fd as usize, buf.as_mut_ptr(), buf.len(), flags.bits())
+            .map_err(Into::into)
     }
 
     /// Shut down part or all of the connection.
@@ -172,7 +176,7 @@ impl Socket {
     ///
     /// Returns an [`Error`] if the `shutdown` syscall fails.
     pub fn shutdown(&self, how: ShutdownHow) -> Result<(), Error> {
-        syscall::shutdown(self.fd as usize, how as u32)
+        syscall::shutdown(self.fd as usize, how as u32).map_err(Into::into)
     }
 
     /// Close the socket, consuming it and returning any error.
@@ -185,7 +189,7 @@ impl Socket {
     pub fn close(self) -> Result<(), Error> {
         let fd = self.fd;
         mem::forget(self);
-        syscall::close(fd as usize)
+        syscall::close(fd as usize).map_err(Into::into)
     }
 
     /// Retrieve the local address the socket is bound to.

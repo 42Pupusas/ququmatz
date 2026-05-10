@@ -133,7 +133,7 @@ impl EventFd {
     pub fn close(self) -> Result<(), Error> {
         let fd = self.fd;
         mem::forget(self);
-        syscall::close(fd as usize)
+        syscall::close(fd as usize).map_err(Into::into)
     }
 }
 

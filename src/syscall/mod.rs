@@ -25,13 +25,13 @@ mod arm;
 #[cfg(target_arch = "arm")]
 use arm as arch;
 
-use crate::error::Error;
+use crate::error::Errno;
 #[allow(clippy::wildcard_imports)]
 use arch::*;
 
-const fn check(ret: isize) -> Result<usize, Error> {
+const fn check(ret: isize) -> Result<usize, Errno> {
     if ret < 0 {
-        Err(Error((-ret) as i32))
+        Err(Errno((-ret) as i32))
     } else {
         Ok(ret as usize)
     }
@@ -40,7 +40,7 @@ const fn check(ret: isize) -> Result<usize, Error> {
 pub fn io_uring_setup(
     entries: u32,
     params: *mut crate::types::IoUringParams,
-) -> Result<usize, Error> {
+) -> Result<usize, Errno> {
     check(unsafe { syscall2(SYS_IO_URING_SETUP, entries as usize, params as usize) })
 }
 
@@ -49,7 +49,7 @@ pub fn io_uring_enter(
     to_submit: u32,
     min_complete: u32,
     flags: crate::types::EnterFlags,
-) -> Result<usize, Error> {
+) -> Result<usize, Errno> {
     check(unsafe {
         syscall6(
             SYS_IO_URING_ENTER,
@@ -70,7 +70,7 @@ pub fn mmap(
     flags: crate::types::MapFlags,
     fd: usize,
     offset: u64,
-) -> Result<usize, Error> {
+) -> Result<usize, Errno> {
     // ARM 32-bit uses mmap2 which takes a page-granularity offset (offset / 4096)
     #[cfg(target_arch = "arm")]
     let nr = SYS_MMAP2;
@@ -95,12 +95,12 @@ pub fn mmap(
     })
 }
 
-pub fn munmap(addr: usize, len: usize) -> Result<(), Error> {
+pub fn munmap(addr: usize, len: usize) -> Result<(), Errno> {
     check(unsafe { syscall2(SYS_MUNMAP, addr, len) })?;
     Ok(())
 }
 
-pub fn socket(domain: i32, sock_type: i32, protocol: i32) -> Result<usize, Error> {
+pub fn socket(domain: i32, sock_type: i32, protocol: i32) -> Result<usize, Errno> {
     check(unsafe {
         syscall3(
             SYS_SOCKET,
@@ -111,12 +111,12 @@ pub fn socket(domain: i32, sock_type: i32, protocol: i32) -> Result<usize, Error
     })
 }
 
-pub fn connect(fd: usize, addr: *const u8, addrlen: u32) -> Result<(), Error> {
+pub fn connect(fd: usize, addr: *const u8, addrlen: u32) -> Result<(), Errno> {
     check(unsafe { syscall3(SYS_CONNECT, fd, addr as usize, addrlen as usize) })?;
     Ok(())
 }
 
-pub fn accept4(fd: usize, addr: *mut u8, addrlen: *mut u32, flags: i32) -> Result<usize, Error> {
+pub fn accept4(fd: usize, addr: *mut u8, addrlen: *mut u32, flags: i32) -> Result<usize, Errno> {
     check(unsafe {
         syscall4(
             SYS_ACCEPT4,
@@ -128,17 +128,17 @@ pub fn accept4(fd: usize, addr: *mut u8, addrlen: *mut u32, flags: i32) -> Resul
     })
 }
 
-pub fn bind(fd: usize, addr: *const u8, addrlen: u32) -> Result<(), Error> {
+pub fn bind(fd: usize, addr: *const u8, addrlen: u32) -> Result<(), Errno> {
     check(unsafe { syscall3(SYS_BIND, fd, addr as usize, addrlen as usize) })?;
     Ok(())
 }
 
-pub fn listen(fd: usize, backlog: i32) -> Result<(), Error> {
+pub fn listen(fd: usize, backlog: i32) -> Result<(), Errno> {
     check(unsafe { syscall2(SYS_LISTEN, fd, backlog as usize) })?;
     Ok(())
 }
 
-pub fn getsockname(fd: usize, addr: *mut u8, addrlen: *mut u32) -> Result<(), Error> {
+pub fn getsockname(fd: usize, addr: *mut u8, addrlen: *mut u32) -> Result<(), Errno> {
     check(unsafe { syscall3(SYS_GETSOCKNAME, fd, addr as usize, addrlen as usize) })?;
     Ok(())
 }
@@ -149,7 +149,7 @@ pub fn setsockopt(
     optname: i32,
     optval: *const u8,
     optlen: u32,
-) -> Result<(), Error> {
+) -> Result<(), Errno> {
     check(unsafe {
         syscall5(
             SYS_SETSOCKOPT,
@@ -163,7 +163,7 @@ pub fn setsockopt(
     Ok(())
 }
 
-pub fn io_uring_register(fd: usize, opcode: u32, arg: usize, nr_args: u32) -> Result<usize, Error> {
+pub fn io_uring_register(fd: usize, opcode: u32, arg: usize, nr_args: u32) -> Result<usize, Errno> {
     check(unsafe {
         syscall4(
             SYS_IO_URING_REGISTER,
@@ -175,45 +175,45 @@ pub fn io_uring_register(fd: usize, opcode: u32, arg: usize, nr_args: u32) -> Re
     })
 }
 
-pub fn sendto(fd: usize, buf: *const u8, len: usize, flags: u32) -> Result<usize, Error> {
+pub fn sendto(fd: usize, buf: *const u8, len: usize, flags: u32) -> Result<usize, Errno> {
     check(unsafe { syscall6(SYS_SENDTO, fd, buf as usize, len, flags as usize, 0, 0) })
 }
 
-pub fn recvfrom(fd: usize, buf: *mut u8, len: usize, flags: u32) -> Result<usize, Error> {
+pub fn recvfrom(fd: usize, buf: *mut u8, len: usize, flags: u32) -> Result<usize, Errno> {
     check(unsafe { syscall6(SYS_RECVFROM, fd, buf as usize, len, flags as usize, 0, 0) })
 }
 
-pub fn shutdown(fd: usize, how: u32) -> Result<(), Error> {
+pub fn shutdown(fd: usize, how: u32) -> Result<(), Errno> {
     check(unsafe { syscall2(SYS_SHUTDOWN, fd, how as usize) })?;
     Ok(())
 }
 
-pub fn read(fd: usize, buf: *mut u8, len: usize) -> Result<usize, Error> {
+pub fn read(fd: usize, buf: *mut u8, len: usize) -> Result<usize, Errno> {
     check(unsafe { syscall3(SYS_READ, fd, buf as usize, len) })
 }
 
-pub fn write(fd: usize, buf: *const u8, len: usize) -> Result<usize, Error> {
+pub fn write(fd: usize, buf: *const u8, len: usize) -> Result<usize, Errno> {
     check(unsafe { syscall3(SYS_WRITE, fd, buf as usize, len) })
 }
 
-pub fn close(fd: usize) -> Result<(), Error> {
+pub fn close(fd: usize) -> Result<(), Errno> {
     check(unsafe { syscall1(SYS_CLOSE, fd) })?;
     Ok(())
 }
 
-pub fn eventfd2(initval: u32, flags: i32) -> Result<usize, Error> {
+pub fn eventfd2(initval: u32, flags: i32) -> Result<usize, Errno> {
     check(unsafe { syscall2(SYS_EVENTFD2, initval as usize, flags as usize) })
 }
 
-pub fn inotify_init1(flags: i32) -> Result<usize, Error> {
+pub fn inotify_init1(flags: i32) -> Result<usize, Errno> {
     check(unsafe { syscall1(SYS_INOTIFY_INIT1, flags as usize) })
 }
 
-pub fn inotify_add_watch(fd: usize, path: *const u8, mask: u32) -> Result<usize, Error> {
+pub fn inotify_add_watch(fd: usize, path: *const u8, mask: u32) -> Result<usize, Errno> {
     check(unsafe { syscall3(SYS_INOTIFY_ADD_WATCH, fd, path as usize, mask as usize) })
 }
 
-pub fn inotify_rm_watch(fd: usize, wd: i32) -> Result<(), Error> {
+pub fn inotify_rm_watch(fd: usize, wd: i32) -> Result<(), Errno> {
     check(unsafe { syscall2(SYS_INOTIFY_RM_WATCH, fd, wd as usize) })?;
     Ok(())
 }

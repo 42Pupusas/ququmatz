@@ -30,7 +30,7 @@
 
 use crate::error::Error;
 use crate::syscall;
-use crate::types::{IN_NONBLOCK, RawFd, WatchMask};
+use crate::types::{InotifyInitFlags, RawFd, WatchMask};
 use core::ffi::CStr;
 use core::mem;
 
@@ -43,7 +43,7 @@ pub struct Inotify {
 }
 
 impl Inotify {
-    /// Create a new inotify instance with `IN_NONBLOCK`.
+    /// Create a new inotify instance with [`InotifyInitFlags::NONBLOCK`].
     ///
     /// The returned fd is set to non-blocking mode so it can be driven by
     /// io\_uring without risking a blocking read.
@@ -53,7 +53,19 @@ impl Inotify {
     /// Returns an [`Error`] if the `inotify_init1` syscall fails (e.g.
     /// `EMFILE` when the per-process inotify instance limit is reached).
     pub fn new() -> Result<Self, Error> {
-        let fd = syscall::inotify_init1(IN_NONBLOCK)? as RawFd;
+        Self::with_flags(InotifyInitFlags::NONBLOCK)
+    }
+
+    /// Create a new inotify instance with the given flags.
+    ///
+    /// Use this when you need a behavior other than the default (e.g.
+    /// `NONBLOCK | CLOEXEC`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`Error`] if the `inotify_init1` syscall fails.
+    pub fn with_flags(flags: InotifyInitFlags) -> Result<Self, Error> {
+        let fd = syscall::inotify_init1(flags.bits())? as RawFd;
         Ok(Self { fd })
     }
 
@@ -98,7 +110,7 @@ impl Inotify {
     /// Returns an [`Error`] if the `inotify_rm_watch` syscall fails (e.g.
     /// `EINVAL` if `wd` is not a valid watch descriptor for this instance).
     pub fn remove_watch(&self, wd: i32) -> Result<(), Error> {
-        syscall::inotify_rm_watch(self.fd as usize, wd)
+        syscall::inotify_rm_watch(self.fd as usize, wd).map_err(Into::into)
     }
 }
 
