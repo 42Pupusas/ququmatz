@@ -5,7 +5,11 @@
 // part of the public API. The submodule is private; `mod.rs` controls
 // crate-level visibility via `pub(crate) use`.
 pub const IORING_ACCEPT_MULTISHOT: u16 = 1 << 0;
-pub const IORING_RECV_MULTISHOT: u32 = 1 << 1;
+// IORING_RECV_MULTISHOT lives in `sqe.ioprio` (a u16) — NOT in `op_flags`.
+// The kernel's `op_flags` field for recv aliases `msg_flags`, where bit 1
+// is `MSG_PEEK` (0x2). Setting this in op_flags would silently turn the
+// op into a peek recv. See linux/io_uring.h.
+pub const IORING_RECV_MULTISHOT: u16 = 1 << 1;
 
 // `ioprio` bits used by `SendRecvFlag`. Internal — callers reach these
 // through `Sqe::with(SendRecvFlag::…)`.

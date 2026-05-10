@@ -1508,10 +1508,11 @@ fn sqe_builder_recv_multishot_places_fields_correctly() {
     let inner = sqe.0;
     assert_eq!(Opcode::Recv, inner.opcode);
     assert_eq!(inner.fd, 4);
-    assert_eq!(
-        inner.op_flags & IORING_RECV_MULTISHOT,
-        IORING_RECV_MULTISHOT
-    );
+    // Multishot bit must be in `ioprio`, NOT `op_flags`. Putting it in
+    // `op_flags` would alias `MSG_PEEK` (0x2) on recv and silently turn
+    // every multishot recv into a peek that doesn't consume data.
+    assert_eq!(inner.ioprio & IORING_RECV_MULTISHOT, IORING_RECV_MULTISHOT);
+    assert_eq!(inner.op_flags, MsgFlags::default().bits());
 }
 
 #[test]
@@ -1587,10 +1588,10 @@ fn sqe_builder_recvmsg_multishot_places_fields_correctly() {
     assert_eq!(Opcode::RecvMsg, inner.opcode);
     assert_eq!(inner.fd, 11);
     assert_eq!(inner.len, 1);
-    assert_eq!(
-        inner.op_flags & IORING_RECV_MULTISHOT,
-        IORING_RECV_MULTISHOT
-    );
+    // Multishot bit must be in `ioprio`, NOT `op_flags`. Same MSG_PEEK
+    // alias hazard as `recv_multishot`.
+    assert_eq!(inner.ioprio & IORING_RECV_MULTISHOT, IORING_RECV_MULTISHOT);
+    assert_eq!(inner.op_flags, MsgFlags::default().bits());
 }
 
 #[test]

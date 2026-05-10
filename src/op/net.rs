@@ -221,7 +221,10 @@ impl Sqe {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Recv.into();
         sqe.fd = fd;
-        sqe.op_flags = flags.bits() | IORING_RECV_MULTISHOT;
+        sqe.op_flags = flags.bits();
+        // Multishot bit lives in `ioprio`, NOT `op_flags` — the latter
+        // aliases `msg_flags` for recv, where bit 1 is `MSG_PEEK`.
+        sqe.ioprio = IORING_RECV_MULTISHOT;
         Self(sqe)
     }
 
@@ -288,7 +291,10 @@ impl Sqe {
         sqe.fd = fd;
         sqe.addr = msg as u64;
         sqe.len = 1;
-        sqe.op_flags = flags.bits() | IORING_RECV_MULTISHOT;
+        sqe.op_flags = flags.bits();
+        // Multishot bit lives in `ioprio`, NOT `op_flags` — same reasoning
+        // as `recv_multishot`.
+        sqe.ioprio = IORING_RECV_MULTISHOT;
         Self(sqe)
     }
 
