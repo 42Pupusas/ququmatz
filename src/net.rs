@@ -37,7 +37,7 @@ impl Socket {
     ///
     /// Returns an [`Error`] if the `socket` syscall fails.
     pub fn new(domain: i32, sock_type: i32, protocol: i32) -> Result<Self, Error> {
-        let fd = syscall::socket(domain, sock_type, protocol)? as RawFd;
+        let fd = syscall::socket(domain, sock_type, protocol)?;
         Ok(Self { fd })
     }
 
@@ -62,7 +62,7 @@ impl Socket {
             domain.as_raw(),
             sock_type.as_raw() | flags.bits() as i32,
             protocol,
-        )? as RawFd;
+        )?;
         Ok(Self { fd })
     }
 
@@ -108,7 +108,7 @@ impl Socket {
     /// Returns an [`Error`] if the `bind` syscall fails.
     pub fn bind(&self, addr: &SockAddrIn) -> Result<(), Error> {
         syscall::bind(
-            self.fd as usize,
+            self.fd,
             core::ptr::from_ref::<SockAddrIn>(addr).cast(),
             mem::size_of::<SockAddrIn>() as u32,
         )
@@ -122,7 +122,7 @@ impl Socket {
     /// Returns an [`Error`] if the `connect` syscall fails.
     pub fn connect(&self, addr: &SockAddrIn) -> Result<(), Error> {
         syscall::connect(
-            self.fd as usize,
+            self.fd,
             core::ptr::from_ref::<SockAddrIn>(addr).cast(),
             mem::size_of::<SockAddrIn>() as u32,
         )
@@ -141,11 +141,11 @@ impl Socket {
         let mut addr = SockAddrIn::default();
         let mut len = mem::size_of::<SockAddrIn>() as u32;
         let fd = syscall::accept4(
-            self.fd as usize,
+            self.fd,
             (&raw mut addr).cast(),
             &raw mut len,
             flags.bits() as i32,
-        )? as RawFd;
+        )?;
         Ok((Self { fd }, addr))
     }
 
@@ -155,7 +155,7 @@ impl Socket {
     ///
     /// Returns an [`Error`] if the `listen` syscall fails.
     pub fn listen(&self, backlog: i32) -> Result<(), Error> {
-        syscall::listen(self.fd as usize, backlog).map_err(Into::into)
+        syscall::listen(self.fd, backlog).map_err(Into::into)
     }
 
     /// Set a socket option.
@@ -169,7 +169,7 @@ impl Socket {
     /// Returns an [`Error`] if the `setsockopt` syscall fails.
     pub fn set_option<T: Sized>(&self, level: i32, optname: i32, value: &T) -> Result<(), Error> {
         syscall::setsockopt(
-            self.fd as usize,
+            self.fd,
             level,
             optname,
             core::ptr::from_ref::<T>(value).cast(),
@@ -184,7 +184,7 @@ impl Socket {
     ///
     /// Returns an [`Error`] if the `sendto` syscall fails.
     pub fn send(&self, buf: &[u8], flags: MsgFlags) -> Result<usize, Error> {
-        syscall::sendto(self.fd as usize, buf.as_ptr(), buf.len(), flags.bits()).map_err(Into::into)
+        syscall::sendto(self.fd, buf.as_ptr(), buf.len(), flags.bits()).map_err(Into::into)
     }
 
     /// Receive data from the socket. Returns the number of bytes read.
@@ -193,8 +193,7 @@ impl Socket {
     ///
     /// Returns an [`Error`] if the `recvfrom` syscall fails.
     pub fn recv(&self, buf: &mut [u8], flags: MsgFlags) -> Result<usize, Error> {
-        syscall::recvfrom(self.fd as usize, buf.as_mut_ptr(), buf.len(), flags.bits())
-            .map_err(Into::into)
+        syscall::recvfrom(self.fd, buf.as_mut_ptr(), buf.len(), flags.bits()).map_err(Into::into)
     }
 
     /// Shut down part or all of the connection.
@@ -203,7 +202,7 @@ impl Socket {
     ///
     /// Returns an [`Error`] if the `shutdown` syscall fails.
     pub fn shutdown(&self, how: ShutdownHow) -> Result<(), Error> {
-        syscall::shutdown(self.fd as usize, how as u32).map_err(Into::into)
+        syscall::shutdown(self.fd, how as u32).map_err(Into::into)
     }
 
     /// Close the socket, consuming it and returning any error.
@@ -216,7 +215,7 @@ impl Socket {
     pub fn close(self) -> Result<(), Error> {
         let fd = self.fd;
         mem::forget(self);
-        syscall::close(fd as usize).map_err(Into::into)
+        syscall::close(fd).map_err(Into::into)
     }
 
     /// Retrieve the local address the socket is bound to.
@@ -227,13 +226,13 @@ impl Socket {
     pub fn local_addr(&self) -> Result<SockAddrIn, Error> {
         let mut addr = SockAddrIn::default();
         let mut len = mem::size_of::<SockAddrIn>() as u32;
-        syscall::getsockname(self.fd as usize, (&raw mut addr).cast(), &raw mut len)?;
+        syscall::getsockname(self.fd, (&raw mut addr).cast(), &raw mut len)?;
         Ok(addr)
     }
 }
 
 impl Drop for Socket {
     fn drop(&mut self) {
-        let _ = syscall::close(self.fd as usize);
+        let _ = syscall::close(self.fd);
     }
 }

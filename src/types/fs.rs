@@ -48,7 +48,7 @@ impl DirFd {
     pub const fn as_raw(self) -> i32 {
         match self {
             Self::Cwd => AT_FDCWD,
-            Self::Fd(fd) => fd,
+            Self::Fd(fd) => fd.as_i32(),
         }
     }
 }

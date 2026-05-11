@@ -18,7 +18,7 @@
 //! // Read the counter via io_uring
 //! let mut ring = IoUring::new(4).unwrap();
 //! let mut buf = [0u8; 8];
-//! ring.do_read(efd.fd(), &mut buf, 0).unwrap();
+//! ring.do_read(efd.fd().as_i32(), &mut buf, 0).unwrap();
 //!
 //! let value = u64::from_ne_bytes(buf);
 //! assert_eq!(value, 1);
@@ -59,7 +59,7 @@ impl EventFd {
     /// Returns an [`Error`] if the `eventfd2` syscall fails (e.g. `EMFILE`
     /// when the per-process fd limit is reached).
     pub fn new(initval: u32) -> Result<Self, Error> {
-        let fd = syscall::eventfd2(initval, EventFdFlags::NONBLOCK.bits())? as RawFd;
+        let fd = syscall::eventfd2(initval, EventFdFlags::NONBLOCK.bits())?;
         Ok(Self { fd })
     }
 
@@ -69,7 +69,7 @@ impl EventFd {
     ///
     /// Returns an [`Error`] if the `eventfd2` syscall fails.
     pub fn with_flags(initval: u32, flags: EventFdFlags) -> Result<Self, Error> {
-        let fd = syscall::eventfd2(initval, flags.bits())? as RawFd;
+        let fd = syscall::eventfd2(initval, flags.bits())?;
         Ok(Self { fd })
     }
 
@@ -104,7 +104,7 @@ impl EventFd {
     /// the counter would overflow).
     pub fn write(&self, value: u64) -> Result<(), Error> {
         let buf = value.to_ne_bytes();
-        syscall::write(self.fd as usize, buf.as_ptr(), 8)?;
+        syscall::write(self.fd, buf.as_ptr(), 8)?;
         Ok(())
     }
 
@@ -119,7 +119,7 @@ impl EventFd {
     /// the counter is zero and the fd is non-blocking).
     pub fn read(&self) -> Result<u64, Error> {
         let mut buf = [0u8; 8];
-        syscall::read(self.fd as usize, buf.as_mut_ptr(), 8)?;
+        syscall::read(self.fd, buf.as_mut_ptr(), 8)?;
         Ok(u64::from_ne_bytes(buf))
     }
 
@@ -133,12 +133,12 @@ impl EventFd {
     pub fn close(self) -> Result<(), Error> {
         let fd = self.fd;
         mem::forget(self);
-        syscall::close(fd as usize).map_err(Into::into)
+        syscall::close(fd).map_err(Into::into)
     }
 }
 
 impl Drop for EventFd {
     fn drop(&mut self) {
-        let _ = syscall::close(self.fd as usize);
+        let _ = syscall::close(self.fd);
     }
 }

@@ -16,7 +16,7 @@
 //!
 //! let mut ring = IoUring::new(4).unwrap();
 //! let mut buf = [0u8; 4096];
-//! let n = ring.do_read(ino.fd(), &mut buf, 0).unwrap();
+//! let n = ring.do_read(ino.fd().as_i32(), &mut buf, 0).unwrap();
 //!
 //! let event: InotifyEvent =
 //!     unsafe { core::ptr::read_unaligned(buf.as_ptr().cast()) };
@@ -65,7 +65,7 @@ impl Inotify {
     ///
     /// Returns an [`Error`] if the `inotify_init1` syscall fails.
     pub fn with_flags(flags: InotifyInitFlags) -> Result<Self, Error> {
-        let fd = syscall::inotify_init1(flags.bits())? as RawFd;
+        let fd = syscall::inotify_init1(flags.bits())?;
         Ok(Self { fd })
     }
 
@@ -100,7 +100,7 @@ impl Inotify {
     /// `ENOENT` if the path does not exist, `EACCES` if the path is not
     /// readable).
     pub fn add_watch(&self, path: &CStr, mask: WatchMask) -> Result<i32, Error> {
-        Ok(syscall::inotify_add_watch(self.fd as usize, path.as_ptr().cast(), mask.bits())? as i32)
+        Ok(syscall::inotify_add_watch(self.fd, path.as_ptr().cast(), mask.bits())? as i32)
     }
 
     /// Remove a previously added watch.
@@ -110,12 +110,12 @@ impl Inotify {
     /// Returns an [`Error`] if the `inotify_rm_watch` syscall fails (e.g.
     /// `EINVAL` if `wd` is not a valid watch descriptor for this instance).
     pub fn remove_watch(&self, wd: i32) -> Result<(), Error> {
-        syscall::inotify_rm_watch(self.fd as usize, wd).map_err(Into::into)
+        syscall::inotify_rm_watch(self.fd, wd).map_err(Into::into)
     }
 }
 
 impl Drop for Inotify {
     fn drop(&mut self) {
-        let _ = syscall::close(self.fd as usize);
+        let _ = syscall::close(self.fd);
     }
 }

@@ -40,6 +40,7 @@ mod net;
 /// until the io\_uring operation completes. The [`IoUring::do_read`] family
 /// of methods enforces this automatically by borrowing across the full
 /// submit-and-wait cycle.
+#[derive(Clone, Copy)]
 pub struct Sqe(pub(crate) IoUringSqe);
 
 /// Create a zeroed SQE. All fields are integer primitives, so zero-init is

@@ -65,8 +65,34 @@ pub struct IoUringBuf {
     pub resv: u16,
 }
 
-/// Raw file descriptor type alias.
-pub type RawFd = i32;
+/// An owned raw file descriptor.
+///
+/// A newtype wrapping `usize` so that file descriptors cannot be accidentally
+/// mixed with arbitrary integers. Construct with [`RawFd::from_raw`]; convert
+/// back with [`RawFd::as_usize`] or [`RawFd::as_i32`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawFd(usize);
+
+impl RawFd {
+    /// Wrap a raw fd value.
+    #[must_use]
+    pub const fn from_raw(fd: usize) -> Self {
+        Self(fd)
+    }
+
+    /// Return the fd as a `usize` (for passing to syscall wrappers).
+    #[must_use]
+    pub const fn as_usize(self) -> usize {
+        self.0
+    }
+
+    /// Return the fd as an `i32` (for kernel ABI fields such as SQE `fd`).
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    pub const fn as_i32(self) -> i32 {
+        self.0 as i32
+    }
+}
 
 /// I/O vector for vectored read/write operations.
 ///

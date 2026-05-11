@@ -10,7 +10,7 @@ use crate::error::{CompletionError, Errno, Error, SubmitError};
 use crate::op::Sqe;
 use crate::syscall;
 use crate::types::{
-    CqeFlags, EnterFlags, Features, IoUringCqe, IoUringParams, IoUringSqe, MapFlags, Prot,
+    CqeFlags, EnterFlags, Features, IoUringCqe, IoUringParams, IoUringSqe, MapFlags, Prot, RawFd,
     RingOffset,
 };
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -36,7 +36,7 @@ pub use pbuf::ProvidedBufferRing;
 /// fd) when the last reference is dropped.
 struct RingResources {
     refcount: AtomicUsize,
-    fd: usize,
+    fd: RawFd,
     sq_ring: MappedRegion,
     cq_ring: MappedRegion,
     sqes_region: MappedRegion,
@@ -48,7 +48,7 @@ impl RingResources {
     /// Allocate one anonymous page, write `self` into it, and return a
     /// raw pointer. The caller owns the only reference (refcount = 1).
     fn alloc(
-        fd: usize,
+        fd: RawFd,
         sq_ring: MappedRegion,
         cq_ring: MappedRegion,
         sqes_region: MappedRegion,
@@ -187,14 +187,14 @@ impl MappedRegion {
 /// path can just `drop(guard)` instead of manually unwinding each
 /// prior allocation. Call `disarm()` on success to prevent cleanup.
 struct SetupGuard {
-    fd: usize,
+    fd: RawFd,
     sq_ring: MappedRegion,
     cq_ring: MappedRegion,
     sqes: MappedRegion,
 }
 
 impl SetupGuard {
-    const fn new(fd: usize) -> Self {
+    const fn new(fd: RawFd) -> Self {
         Self {
             fd,
             sq_ring: MappedRegion { addr: 0, len: 0 },
@@ -248,7 +248,7 @@ impl Drop for SetupGuard {
 /// submissions. Always submit before dropping if you need those operations
 /// to execute.
 pub struct IoUring {
-    pub(super) fd: usize,
+    pub(super) fd: RawFd,
 
     // SQ ring pointers (into mmap'd memory)
     sq_head: *const AtomicU32,
@@ -293,7 +293,7 @@ pub struct IoUring {
 /// kernel mmaps and fd are freed only when both the `Submitter` and the
 /// paired [`Completer`] have been dropped.
 pub struct Submitter {
-    fd: usize,
+    fd: RawFd,
 
     sq_head: *const AtomicU32,
     sq_tail: *const AtomicU32,
@@ -314,12 +314,22 @@ pub struct Submitter {
 /// Produced by [`IoUring::split`]. Owns exclusive access to the completion
 /// queue and is `Send`, so it can be moved to a dedicated IO completion thread.
 ///
+/// # Waiting for completions
+///
+/// [`complete`](Self::complete) and [`completions`](Self::completions) are
+/// non-blocking: they return what is already in the CQ ring without calling
+/// into the kernel. To block until at least `n` completions are ready, use
+/// [`wait`](Self::wait), which issues `io_uring_enter(GETEVENTS)` directly.
+/// The paired [`Submitter`] does not need to be involved.
+///
 /// # Drop
 ///
 /// Dropping the `Completer` flushes the CQ head to the kernel and releases its
 /// share of the ring resources. The kernel mmaps and fd are freed only when
 /// both the paired [`Submitter`] and the `Completer` have been dropped.
 pub struct Completer {
+    fd: RawFd,
+
     cq_head: *const AtomicU32,
     cq_tail: *const AtomicU32,
     cq_mask: u32,
@@ -474,6 +484,26 @@ impl Completer {
     pub const fn completions(&mut self) -> SplitCompletions<'_> {
         SplitCompletions { completer: self }
     }
+
+    /// Block until at least `min_complete` completions are available.
+    ///
+    /// Issues `io_uring_enter(GETEVENTS)` directly — no submission occurs.
+    /// Use this on the completion thread when you want to sleep in the kernel
+    /// rather than spin-poll [`complete`](Self::complete).
+    ///
+    /// After `wait` returns, drain completions with [`complete`](Self::complete)
+    /// or [`completions`](Self::completions), then call [`sync_cq`](Self::sync_cq)
+    /// to publish the updated head back to the kernel.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the kernel rejects the `io_uring_enter` call.
+    #[inline]
+    pub fn wait(&mut self, min_complete: u32) -> Result<(), Error> {
+        self.sync_cq();
+        syscall::io_uring_enter(self.fd, 0, min_complete, EnterFlags::GETEVENTS)?;
+        Ok(())
+    }
 }
 
 impl Drop for Completer {
@@ -575,14 +605,28 @@ impl IoUring {
         } else {
             sq_ring_sz
         };
-        let sq_ring_ptr = syscall::mmap(0, mmap_sz, prot, map, fd, RingOffset::SqRing.into())?;
+        let sq_ring_ptr = syscall::mmap(
+            0,
+            mmap_sz,
+            prot,
+            map,
+            fd.as_usize(),
+            RingOffset::SqRing.into(),
+        )?;
         guard.sq_ring = MappedRegion::new(sq_ring_ptr, mmap_sz);
 
         // Map the CQ ring (reuse SQ mmap if SINGLE_MMAP)
         let (cq_ring_ptr, cq_ring_region) = if single_mmap {
             (sq_ring_ptr, MappedRegion::new(0, 0))
         } else {
-            let ptr = syscall::mmap(0, cq_ring_sz, prot, map, fd, RingOffset::CqRing.into())?;
+            let ptr = syscall::mmap(
+                0,
+                cq_ring_sz,
+                prot,
+                map,
+                fd.as_usize(),
+                RingOffset::CqRing.into(),
+            )?;
             let region = MappedRegion::new(ptr, cq_ring_sz);
             guard.cq_ring = MappedRegion::new(ptr, cq_ring_sz);
             (ptr, region)
@@ -590,7 +634,14 @@ impl IoUring {
 
         // Map the SQE array
         let sqes_sz = params.sq_entries as usize * core::mem::size_of::<IoUringSqe>();
-        let sqes_ptr = syscall::mmap(0, sqes_sz, prot, map, fd, RingOffset::Sqes.into())?;
+        let sqes_ptr = syscall::mmap(
+            0,
+            sqes_sz,
+            prot,
+            map,
+            fd.as_usize(),
+            RingOffset::Sqes.into(),
+        )?;
         guard.sqes = MappedRegion::new(sqes_ptr, sqes_sz);
 
         let sq_base = sq_ring_ptr as *const u8;
@@ -880,6 +931,7 @@ impl IoUring {
         };
 
         let completer = Completer {
+            fd: self.fd,
             cq_head: self.cq_head,
             cq_tail: self.cq_tail,
             cq_mask: self.cq_mask,

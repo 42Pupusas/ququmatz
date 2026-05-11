@@ -3,7 +3,7 @@
 use super::IoUring;
 use crate::error::{Error, InvalidArgKind, SetupError};
 use crate::syscall;
-use crate::types::{IoUringBuf, IoUringBufReg, MapFlags, Prot, RegisterOp};
+use crate::types::{IoUringBuf, IoUringBufReg, MapFlags, Prot, RawFd, RegisterOp};
 
 impl IoUring {
     /// Register a provided-buffer ring for buffer-selectable operations.
@@ -147,7 +147,7 @@ impl IoUring {
 /// buffer from a thread other than the one draining completions would
 /// race on `tail_local` and on the kernel-visible tail atomic.
 pub struct ProvidedBufferRing {
-    fd: usize,
+    fd: RawFd,
     bgid: u16,
     mask: u32,
     entries: u32,

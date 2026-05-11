@@ -4,7 +4,7 @@
 use super::IoUring;
 use crate::error::Error;
 use crate::syscall;
-use crate::types::{IoUringFilesUpdate, IoUringRsrcUpdate, IoVec, RegisterOp};
+use crate::types::{IoUringFilesUpdate, IoUringRsrcUpdate, IoVec, RawFd, RegisterOp};
 
 impl IoUring {
     /// Register buffers for zero-copy I/O with `read_fixed`/`write_fixed`.
@@ -92,11 +92,12 @@ impl IoUring {
     /// # Errors
     ///
     /// Returns an error if registration fails.
-    pub fn register_eventfd(&mut self, efd: i32) -> Result<(), Error> {
+    pub fn register_eventfd(&mut self, efd: RawFd) -> Result<(), Error> {
+        let raw: i32 = efd.as_i32();
         syscall::io_uring_register(
             self.fd,
             RegisterOp::RegisterEventFd.into(),
-            core::ptr::addr_of!(efd) as usize,
+            core::ptr::addr_of!(raw) as usize,
             1,
         )?;
         Ok(())
@@ -108,11 +109,12 @@ impl IoUring {
     /// # Errors
     ///
     /// Returns an error if registration fails.
-    pub fn register_eventfd_async(&mut self, efd: i32) -> Result<(), Error> {
+    pub fn register_eventfd_async(&mut self, efd: RawFd) -> Result<(), Error> {
+        let raw: i32 = efd.as_i32();
         syscall::io_uring_register(
             self.fd,
             RegisterOp::RegisterEventFdAsync.into(),
-            core::ptr::addr_of!(efd) as usize,
+            core::ptr::addr_of!(raw) as usize,
             1,
         )?;
         Ok(())
@@ -165,7 +167,7 @@ impl IoUring {
         let mut reg = IoUringRsrcUpdate {
             offset: u32::MAX,
             resv: 0,
-            data: self.fd as u64,
+            data: self.fd.as_usize() as u64,
         };
         syscall::io_uring_register(
             self.fd,

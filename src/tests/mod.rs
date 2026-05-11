@@ -412,7 +412,7 @@ fn fsync_on_tmpfile() {
     assert_eq!(cqe.user_data, 2);
     assert_eq!(cqe.result, 0);
 
-    let _ = syscall::close(fd as usize);
+    let _ = syscall::close(RawFd::from_raw(fd as usize));
 }
 
 #[cfg(not(miri))]
@@ -615,7 +615,7 @@ fn vectored_read_write() {
     assert_eq!(cqe.result as usize, total);
     assert_eq!(&read_buf[..total], b"hello world!");
 
-    let _ = syscall::close(fd as usize);
+    let _ = syscall::close(RawFd::from_raw(fd as usize));
 }
 
 #[cfg(not(miri))]
@@ -680,7 +680,7 @@ fn registered_buffers_read_write() {
     assert_eq!(&buf[..msg.len()], msg);
 
     ring.unregister_buffers().expect("unregister");
-    let _ = syscall::close(fd as usize);
+    let _ = syscall::close(RawFd::from_raw(fd as usize));
 }
 
 #[cfg(not(miri))]
@@ -692,7 +692,7 @@ fn registered_files() {
     ring.register_files(&[fd]).expect("register_files");
     ring.unregister_files().expect("unregister_files");
 
-    let _ = syscall::close(fd as usize);
+    let _ = syscall::close(RawFd::from_raw(fd as usize));
 }
 
 #[cfg(not(miri))]
@@ -708,7 +708,8 @@ fn socket_with_typed_flags_creates_nonblocking_fd() {
         SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
     )
     .expect("socket");
-    assert!(sock.fd() >= 0);
+    // fd() returns RawFd(usize); a successful socket() guarantees it's valid
+    let _ = sock.fd();
     // No syscall to inspect flags here — we trust the kernel applied them
     // because socket(2) returned success with that argument layout. The
     // round-trip test (`tcp_send_recv_roundtrip`) exercises NONBLOCK end
@@ -717,14 +718,15 @@ fn socket_with_typed_flags_creates_nonblocking_fd() {
 
 #[cfg(not(miri))]
 fn setup_tcp_listener() -> (i32, u16) {
-    let fd = syscall::socket(types::AF_INET, types::SOCK_STREAM | types::SOCK_NONBLOCK, 0)
-        .expect("socket") as i32;
+    let rawfd = syscall::socket(types::AF_INET, types::SOCK_STREAM | types::SOCK_NONBLOCK, 0)
+        .expect("socket");
+    let fd = rawfd.as_i32();
 
     let one: i32 = 1;
     // SOL_SOCKET=1, SO_REUSEADDR=2 — kernel constants, inlined here
     // because they're only needed by this test.
     syscall::setsockopt(
-        fd as usize,
+        rawfd,
         1,
         2,
         (&raw const one).cast(),
@@ -739,17 +741,17 @@ fn setup_tcp_listener() -> (i32, u16) {
         sin_zero: [0; 8],
     };
     syscall::bind(
-        fd as usize,
+        rawfd,
         (&raw const addr).cast(),
         core::mem::size_of::<SockAddrIn>() as u32,
     )
     .expect("bind");
-    syscall::listen(fd as usize, 1).expect("listen");
+    syscall::listen(rawfd, 1).expect("listen");
 
     // Retrieve the actual port assigned by the kernel
     let mut bound_addr = SockAddrIn::default();
     let mut addrlen = core::mem::size_of::<SockAddrIn>() as u32;
-    syscall::getsockname(fd as usize, (&raw mut bound_addr).cast(), &raw mut addrlen)
+    syscall::getsockname(rawfd, (&raw mut bound_addr).cast(), &raw mut addrlen)
         .expect("getsockname");
 
     (fd, u16::from_be(bound_addr.sin_port))
@@ -762,7 +764,8 @@ fn tcp_send_recv_roundtrip() {
     let (listener, port) = setup_tcp_listener();
 
     let client = syscall::socket(types::AF_INET, types::SOCK_STREAM | types::SOCK_NONBLOCK, 0)
-        .expect("client socket") as i32;
+        .expect("client socket")
+        .as_i32();
 
     // Accept + connect in parallel
     ring.push(Sqe::accept(listener, AcceptFlags::default()).user_data(1))
@@ -819,9 +822,9 @@ fn tcp_send_recv_roundtrip() {
     assert_eq!(cqe.result, msg.len() as i32);
     assert_eq!(&recv_buf[..msg.len()], msg);
 
-    let _ = syscall::close(server_fd as usize);
-    let _ = syscall::close(client as usize);
-    let _ = syscall::close(listener as usize);
+    let _ = syscall::close(RawFd::from_raw(server_fd as usize));
+    let _ = syscall::close(RawFd::from_raw(client as usize));
+    let _ = syscall::close(RawFd::from_raw(listener as usize));
 }
 
 #[cfg(not(miri))]
@@ -835,7 +838,8 @@ fn provided_buffer_ring_buffer_mut_allows_inplace_edit() {
     let (listener, port) = setup_tcp_listener();
 
     let client = syscall::socket(types::AF_INET, types::SOCK_STREAM | types::SOCK_NONBLOCK, 0)
-        .expect("client socket") as i32;
+        .expect("client socket")
+        .as_i32();
 
     let mut pbuf = ring
         .register_provided_buffers(2, 4, 64)
@@ -909,9 +913,9 @@ fn provided_buffer_ring_buffer_mut_allows_inplace_edit() {
     assert!(pbuf.buffer_mut(0, pbuf.buf_size() + 1).is_none());
 
     pbuf.recycle_and_commit(buf_id);
-    let _ = syscall::close(server_fd as usize);
-    let _ = syscall::close(client as usize);
-    let _ = syscall::close(listener as usize);
+    let _ = syscall::close(RawFd::from_raw(server_fd as usize));
+    let _ = syscall::close(RawFd::from_raw(client as usize));
+    let _ = syscall::close(RawFd::from_raw(listener as usize));
 }
 
 #[cfg(not(miri))]
@@ -940,7 +944,8 @@ fn provided_buffer_ring_recv() {
     let (listener, port) = setup_tcp_listener();
 
     let client = syscall::socket(types::AF_INET, types::SOCK_STREAM | types::SOCK_NONBLOCK, 0)
-        .expect("client socket") as i32;
+        .expect("client socket")
+        .as_i32();
 
     // Register a 4-entry provided-buffer ring of 64-byte buffers
     // under group id 1. Dropping `pbuf` at end of scope
@@ -1020,9 +1025,9 @@ fn provided_buffer_ring_recv() {
     }
     assert!(got_send && got_recv);
 
-    let _ = syscall::close(server_fd as usize);
-    let _ = syscall::close(client as usize);
-    let _ = syscall::close(listener as usize);
+    let _ = syscall::close(RawFd::from_raw(server_fd as usize));
+    let _ = syscall::close(RawFd::from_raw(client as usize));
+    let _ = syscall::close(RawFd::from_raw(listener as usize));
 }
 
 // ---------------------------------------------------------------
@@ -1080,7 +1085,8 @@ fn inotify_init_flag_bits() {
 #[test]
 fn inotify_new_returns_valid_fd() {
     let ino = Inotify::new().expect("inotify_init1");
-    assert!(ino.fd() >= 0);
+    // fd() returns RawFd; successful inotify_init1 guarantees it's valid
+    let _ = ino.fd();
 }
 
 #[cfg(not(miri))]
@@ -1088,9 +1094,8 @@ fn inotify_new_returns_valid_fd() {
 fn inotify_into_fd_prevents_double_close() {
     let ino = Inotify::new().expect("inotify_init1");
     let fd = ino.into_fd();
-    assert!(fd >= 0);
-    // Manually close — should succeed exactly once.
-    syscall::close(fd as usize).expect("close");
+    // fd is RawFd(usize); successful inotify_init1 guarantees it's valid
+    syscall::close(fd).expect("close");
 }
 
 #[cfg(not(miri))]
@@ -1150,7 +1155,9 @@ fn inotify_read_via_io_uring() {
     // Read the event via io_uring
     let mut ring = IoUring::new(4).expect("setup");
     let mut buf = [0u8; 256];
-    let n = ring.do_read(ino.fd(), &mut buf, 0).expect("do_read");
+    let n = ring
+        .do_read(ino.fd().as_i32(), &mut buf, 0)
+        .expect("do_read");
     assert!(n > 0, "expected data, got {n}");
 
     // Parse the event header
@@ -1203,7 +1210,8 @@ fn eventfd_flags_combine() {
 #[test]
 fn eventfd_new_returns_valid_fd() {
     let efd = EventFd::new(0).expect("eventfd2");
-    assert!(efd.fd() >= 0);
+    // fd() returns RawFd; successful eventfd2 guarantees it's valid
+    let _ = efd.fd();
 }
 
 #[cfg(not(miri))]
@@ -1211,8 +1219,8 @@ fn eventfd_new_returns_valid_fd() {
 fn eventfd_into_fd_prevents_double_close() {
     let efd = EventFd::new(0).expect("eventfd2");
     let fd = efd.into_fd();
-    assert!(fd >= 0);
-    syscall::close(fd as usize).expect("close");
+    // fd is RawFd; successful eventfd2 guarantees it's valid
+    syscall::close(fd).expect("close");
 }
 
 #[cfg(not(miri))]
@@ -1220,7 +1228,7 @@ fn eventfd_into_fd_prevents_double_close() {
 fn eventfd_with_flags() {
     let efd =
         EventFd::with_flags(0, EventFdFlags::NONBLOCK | EventFdFlags::CLOEXEC).expect("eventfd2");
-    assert!(efd.fd() >= 0);
+    let _ = efd.fd();
 }
 
 #[cfg(not(miri))]
@@ -1292,7 +1300,9 @@ fn eventfd_read_via_io_uring() {
 
     let mut ring = IoUring::new(4).expect("setup");
     let mut buf = [0u8; 8];
-    let n = ring.do_read(efd.fd(), &mut buf, 0).expect("do_read");
+    let n = ring
+        .do_read(efd.fd().as_i32(), &mut buf, 0)
+        .expect("do_read");
     assert_eq!(n, 8);
     assert_eq!(u64::from_ne_bytes(buf), 7);
 }
@@ -1305,7 +1315,7 @@ fn eventfd_write_via_io_uring() {
     let mut ring = IoUring::new(4).expect("setup");
     let val: u64 = 42;
     let buf = val.to_ne_bytes();
-    let n = ring.do_write(efd.fd(), &buf, 0).expect("do_write");
+    let n = ring.do_write(efd.fd().as_i32(), &buf, 0).expect("do_write");
     assert_eq!(n, 8);
 
     // Verify the counter was updated
@@ -1753,9 +1763,9 @@ fn splice_pipe_roundtrip() {
     assert_eq!(cqe.result, msg.len() as i32);
     assert_eq!(&read_buf[..msg.len()], msg);
 
-    let _ = syscall::close(read_end as usize);
-    let _ = syscall::close(write_end as usize);
-    let _ = syscall::close(fd as usize);
+    let _ = syscall::close(RawFd::from_raw(read_end as usize));
+    let _ = syscall::close(RawFd::from_raw(write_end as usize));
+    let _ = syscall::close(RawFd::from_raw(fd as usize));
 }
 
 #[cfg(not(miri))]
@@ -1778,7 +1788,7 @@ fn fadvise_roundtrip() {
     assert_eq!(cqe.user_data, 2);
     assert_eq!(cqe.result, 0, "fadvise failed: {}", cqe.result);
 
-    let _ = syscall::close(fd as usize);
+    let _ = syscall::close(RawFd::from_raw(fd as usize));
 }
 
 #[cfg(not(miri))]
@@ -1801,7 +1811,7 @@ fn openat2_basic() {
     assert_eq!(cqe.user_data, 1);
     assert!(cqe.result >= 0, "openat2 failed: {}", cqe.result);
 
-    let _ = syscall::close(cqe.result as usize);
+    let _ = syscall::close(RawFd::from_raw(cqe.result as usize));
     // cleanup
     ring.push(Sqe::unlinkat(
         crate::types::DirFd::Cwd,
@@ -1821,7 +1831,8 @@ fn send_zc_roundtrip() {
     let (listener, port) = setup_tcp_listener();
 
     let client = syscall::socket(types::AF_INET, types::SOCK_STREAM | types::SOCK_NONBLOCK, 0)
-        .expect("client socket") as i32;
+        .expect("client socket")
+        .as_i32();
 
     ring.push(Sqe::accept(listener, AcceptFlags::default()).user_data(1))
         .expect("push accept");
@@ -1887,9 +1898,9 @@ fn send_zc_roundtrip() {
     assert!(got_recv, "missing recv completion");
     assert!(got_notif, "missing NOTIF completion");
 
-    let _ = syscall::close(server_fd as usize);
-    let _ = syscall::close(client as usize);
-    let _ = syscall::close(listener as usize);
+    let _ = syscall::close(RawFd::from_raw(server_fd as usize));
+    let _ = syscall::close(RawFd::from_raw(client as usize));
+    let _ = syscall::close(RawFd::from_raw(listener as usize));
 }
 
 #[cfg(not(miri))]
@@ -1960,7 +1971,8 @@ fn accept_with_addr_roundtrip() {
     let (listener, port) = setup_tcp_listener();
 
     let client = syscall::socket(types::AF_INET, types::SOCK_STREAM | types::SOCK_NONBLOCK, 0)
-        .expect("client socket") as i32;
+        .expect("client socket")
+        .as_i32();
 
     let mut peer_addr = SockAddrIn::default();
     let mut peer_addrlen = mem::size_of::<SockAddrIn>() as u32;
@@ -2007,9 +2019,9 @@ fn accept_with_addr_roundtrip() {
     assert_eq!(peer_addr.sin_addr, u32::from_ne_bytes([127, 0, 0, 1]));
     assert_eq!(peer_addrlen, mem::size_of::<SockAddrIn>() as u32);
 
-    let _ = syscall::close(server_fd as usize);
-    let _ = syscall::close(client as usize);
-    let _ = syscall::close(listener as usize);
+    let _ = syscall::close(RawFd::from_raw(server_fd as usize));
+    let _ = syscall::close(RawFd::from_raw(client as usize));
+    let _ = syscall::close(RawFd::from_raw(listener as usize));
 }
 
 #[cfg(not(miri))]
@@ -2034,8 +2046,8 @@ fn update_registered_files_replaces_slot() {
     assert_eq!(cqe.result, msg.len() as i32);
 
     ring.unregister_files().expect("unregister");
-    let _ = syscall::close(fd as usize);
-    let _ = syscall::close(fd2 as usize);
+    let _ = syscall::close(RawFd::from_raw(fd as usize));
+    let _ = syscall::close(RawFd::from_raw(fd2 as usize));
 }
 
 /// Thin shim over `pipe2(2)` — only used in tests, so we call the
