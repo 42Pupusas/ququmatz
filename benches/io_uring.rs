@@ -5,7 +5,7 @@
 )]
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use ququmatz::{IoUring, IoVec, Sqe};
+use ququmatz::{IoUring, IoVec, Sqe, types::RawFd};
 use std::os::unix::io::IntoRawFd;
 
 fn open_tmpfile() -> i32 {
@@ -37,11 +37,15 @@ fn bench_sqe_construction(c: &mut Criterion) {
     });
 
     c.bench_function("sqe_build_read", |b| {
-        b.iter(|| black_box(unsafe { Sqe::read_ptr(3, ptr, 4096, 0) }.user_data(1)));
+        b.iter(|| {
+            black_box(unsafe { Sqe::read_ptr(RawFd::from_raw(3), ptr, 4096, 0) }.user_data(1))
+        });
     });
 
     c.bench_function("sqe_build_write", |b| {
-        b.iter(|| black_box(unsafe { Sqe::write_ptr(3, ptr, 4096, 0) }.user_data(1)));
+        b.iter(|| {
+            black_box(unsafe { Sqe::write_ptr(RawFd::from_raw(3), ptr, 4096, 0) }.user_data(1))
+        });
     });
 }
 
@@ -89,15 +93,23 @@ fn bench_read_write(c: &mut Criterion) {
 
     // Pre-write some data so reads have something to return
     let write_buf = [0xABu8; 4096];
-    ring.push(unsafe { Sqe::write_ptr(fd, write_buf.as_ptr(), 4096, 0) }.user_data(0))
-        .unwrap();
+    ring.push(
+        unsafe { Sqe::write_ptr(RawFd::from_raw(fd as usize), write_buf.as_ptr(), 4096, 0) }
+            .user_data(0),
+    )
+    .unwrap();
     ring.submit_and_wait(1).unwrap();
     ring.complete().unwrap();
 
     c.bench_function("write_4k", |b| {
         b.iter(|| {
-            ring.push(unsafe { Sqe::write_ptr(fd, write_buf.as_ptr(), 4096, 0) }.user_data(1))
-                .unwrap();
+            ring.push(
+                unsafe {
+                    Sqe::write_ptr(RawFd::from_raw(fd as usize), write_buf.as_ptr(), 4096, 0)
+                }
+                .user_data(1),
+            )
+            .unwrap();
             ring.submit_and_wait(1).unwrap();
             black_box(ring.complete().unwrap());
         });
@@ -106,8 +118,13 @@ fn bench_read_write(c: &mut Criterion) {
     c.bench_function("read_4k", |b| {
         let mut read_buf = [0u8; 4096];
         b.iter(|| {
-            ring.push(unsafe { Sqe::read_ptr(fd, read_buf.as_mut_ptr(), 4096, 0) }.user_data(1))
-                .unwrap();
+            ring.push(
+                unsafe {
+                    Sqe::read_ptr(RawFd::from_raw(fd as usize), read_buf.as_mut_ptr(), 4096, 0)
+                }
+                .user_data(1),
+            )
+            .unwrap();
             ring.submit_and_wait(1).unwrap();
             black_box(ring.complete().unwrap());
         });
@@ -129,8 +146,11 @@ fn bench_vectored_write(c: &mut Criterion) {
             ]
         };
         b.iter(|| {
-            ring.push(unsafe { Sqe::writev_ptr(fd, vecs.as_ptr(), 2, 0) }.user_data(1))
-                .unwrap();
+            ring.push(
+                unsafe { Sqe::writev_ptr(RawFd::from_raw(fd as usize), vecs.as_ptr(), 2, 0) }
+                    .user_data(1),
+            )
+            .unwrap();
             ring.submit_and_wait(1).unwrap();
             black_box(ring.complete().unwrap());
         });

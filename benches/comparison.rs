@@ -11,6 +11,7 @@
 //! the relative difference.
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use ququmatz::types::RawFd;
 use std::os::unix::io::IntoRawFd;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -82,7 +83,12 @@ fn bench_sqe_build(c: &mut Criterion) {
         let mut g = c.benchmark_group("sqe_build_read");
 
         g.bench_function("ququmatz", |b| {
-            b.iter(|| black_box(unsafe { ququmatz::Sqe::read_ptr(3, ptr, 4096, 0) }.user_data(1)));
+            b.iter(|| {
+                black_box(
+                    unsafe { ququmatz::Sqe::read_ptr(RawFd::from_raw(3), ptr, 4096, 0) }
+                        .user_data(1),
+                )
+            });
         });
 
         g.bench_function("io-uring", |b| {
@@ -103,7 +109,12 @@ fn bench_sqe_build(c: &mut Criterion) {
         let mut g = c.benchmark_group("sqe_build_write");
 
         g.bench_function("ququmatz", |b| {
-            b.iter(|| black_box(unsafe { ququmatz::Sqe::write_ptr(3, ptr, 4096, 0) }.user_data(1)));
+            b.iter(|| {
+                black_box(
+                    unsafe { ququmatz::Sqe::write_ptr(RawFd::from_raw(3), ptr, 4096, 0) }
+                        .user_data(1),
+                )
+            });
         });
 
         g.bench_function("io-uring", |b| {
@@ -238,8 +249,15 @@ fn bench_write_4k(c: &mut Criterion) {
         g.bench_function("ququmatz", |b| {
             b.iter(|| {
                 ring.push(
-                    unsafe { ququmatz::Sqe::write_ptr(fd, write_buf.as_ptr(), 4096, 0) }
-                        .user_data(1),
+                    unsafe {
+                        ququmatz::Sqe::write_ptr(
+                            RawFd::from_raw(fd as usize),
+                            write_buf.as_ptr(),
+                            4096,
+                            0,
+                        )
+                    }
+                    .user_data(1),
                 )
                 .unwrap();
                 ring.submit_and_wait(1).unwrap();
@@ -283,8 +301,13 @@ fn bench_read_4k(c: &mut Criterion) {
         let fd = open_tmpfile_raw();
         let mut ring = ququmatz::IoUring::new(32).expect("setup");
         // seed
-        ring.push(unsafe { ququmatz::Sqe::write_ptr(fd, seed_buf.as_ptr(), 4096, 0) }.user_data(0))
-            .unwrap();
+        ring.push(
+            unsafe {
+                ququmatz::Sqe::write_ptr(RawFd::from_raw(fd as usize), seed_buf.as_ptr(), 4096, 0)
+            }
+            .user_data(0),
+        )
+        .unwrap();
         ring.submit_and_wait(1).unwrap();
         ring.complete().unwrap();
 
@@ -292,8 +315,15 @@ fn bench_read_4k(c: &mut Criterion) {
         g.bench_function("ququmatz", |b| {
             b.iter(|| {
                 ring.push(
-                    unsafe { ququmatz::Sqe::read_ptr(fd, read_buf.as_mut_ptr(), 4096, 0) }
-                        .user_data(1),
+                    unsafe {
+                        ququmatz::Sqe::read_ptr(
+                            RawFd::from_raw(fd as usize),
+                            read_buf.as_mut_ptr(),
+                            4096,
+                            0,
+                        )
+                    }
+                    .user_data(1),
                 )
                 .unwrap();
                 ring.submit_and_wait(1).unwrap();
@@ -306,7 +336,17 @@ fn bench_read_4k(c: &mut Criterion) {
         let fd = open_tmpfile_raw();
         let mut ring_setup = ququmatz::IoUring::new(32).expect("setup");
         ring_setup
-            .push(unsafe { ququmatz::Sqe::write_ptr(fd, seed_buf.as_ptr(), 4096, 0) }.user_data(0))
+            .push(
+                unsafe {
+                    ququmatz::Sqe::write_ptr(
+                        RawFd::from_raw(fd as usize),
+                        seed_buf.as_ptr(),
+                        4096,
+                        0,
+                    )
+                }
+                .user_data(0),
+            )
             .unwrap();
         ring_setup.submit_and_wait(1).unwrap();
         ring_setup.complete().unwrap();
@@ -358,7 +398,10 @@ fn bench_writev(c: &mut Criterion) {
             };
             b.iter(|| {
                 ring.push(
-                    unsafe { ququmatz::Sqe::writev_ptr(fd, vecs.as_ptr(), 2, 0) }.user_data(1),
+                    unsafe {
+                        ququmatz::Sqe::writev_ptr(RawFd::from_raw(fd as usize), vecs.as_ptr(), 2, 0)
+                    }
+                    .user_data(1),
                 )
                 .unwrap();
                 ring.submit_and_wait(1).unwrap();

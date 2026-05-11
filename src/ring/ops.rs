@@ -5,7 +5,8 @@ use super::IoUring;
 use crate::error::{CompletionError, Error};
 use crate::op::Sqe;
 use crate::types::{
-    AcceptFlags, DirFd, FileMode, FsyncFlags, MsgFlags, OpenFlags, Statx, StatxFlags, StatxMask,
+    AcceptFlags, DirFd, FileMode, FsyncFlags, MsgFlags, OpenFlags, RawFd, Statx, StatxFlags,
+    StatxMask,
 };
 
 impl IoUring {
@@ -30,7 +31,7 @@ impl IoUring {
     /// # Errors
     ///
     /// Returns an [`Error`] if the submission or the kernel operation fails.
-    pub fn do_read(&mut self, fd: i32, buf: &mut [u8], offset: u64) -> Result<u32, Error> {
+    pub fn do_read(&mut self, fd: RawFd, buf: &mut [u8], offset: u64) -> Result<u32, Error> {
         self.run_one(Sqe::read(fd, buf, offset))
     }
 
@@ -39,7 +40,7 @@ impl IoUring {
     /// # Errors
     ///
     /// Returns an [`Error`] if the submission or the kernel operation fails.
-    pub fn do_write(&mut self, fd: i32, buf: &[u8], offset: u64) -> Result<u32, Error> {
+    pub fn do_write(&mut self, fd: RawFd, buf: &[u8], offset: u64) -> Result<u32, Error> {
         self.run_one(Sqe::write(fd, buf, offset))
     }
 
@@ -63,7 +64,7 @@ impl IoUring {
     /// # Errors
     ///
     /// Returns an [`Error`] if the submission or the kernel operation fails.
-    pub fn do_close(&mut self, fd: i32) -> Result<u32, Error> {
+    pub fn do_close(&mut self, fd: RawFd) -> Result<u32, Error> {
         self.run_one(Sqe::close(fd))
     }
 
@@ -72,7 +73,7 @@ impl IoUring {
     /// # Errors
     ///
     /// Returns an [`Error`] if the submission or the kernel operation fails.
-    pub fn do_send(&mut self, fd: i32, buf: &[u8], flags: MsgFlags) -> Result<u32, Error> {
+    pub fn do_send(&mut self, fd: RawFd, buf: &[u8], flags: MsgFlags) -> Result<u32, Error> {
         self.run_one(Sqe::send(fd, buf, flags))
     }
 
@@ -81,7 +82,7 @@ impl IoUring {
     /// # Errors
     ///
     /// Returns an [`Error`] if the submission or the kernel operation fails.
-    pub fn do_recv(&mut self, fd: i32, buf: &mut [u8], flags: MsgFlags) -> Result<u32, Error> {
+    pub fn do_recv(&mut self, fd: RawFd, buf: &mut [u8], flags: MsgFlags) -> Result<u32, Error> {
         self.run_one(Sqe::recv(fd, buf, flags))
     }
 
@@ -91,7 +92,7 @@ impl IoUring {
     /// # Errors
     ///
     /// Returns an [`Error`] if the submission or the kernel operation fails.
-    pub fn do_accept(&mut self, fd: i32, flags: AcceptFlags) -> Result<u32, Error> {
+    pub fn do_accept(&mut self, fd: RawFd, flags: AcceptFlags) -> Result<u32, Error> {
         self.run_one(Sqe::accept(fd, flags))
     }
 
@@ -116,7 +117,7 @@ impl IoUring {
     /// # Errors
     ///
     /// Returns an [`Error`] if the submission or the kernel operation fails.
-    pub fn do_fsync(&mut self, fd: i32, flags: FsyncFlags) -> Result<u32, Error> {
+    pub fn do_fsync(&mut self, fd: RawFd, flags: FsyncFlags) -> Result<u32, Error> {
         self.run_one(Sqe::fsync(fd, flags))
     }
 }

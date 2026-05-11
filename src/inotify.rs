@@ -16,7 +16,7 @@
 //!
 //! let mut ring = IoUring::new(4).unwrap();
 //! let mut buf = [0u8; 4096];
-//! let n = ring.do_read(ino.fd().as_i32(), &mut buf, 0).unwrap();
+//! let n = ring.do_read(ino.fd(), &mut buf, 0).unwrap();
 //!
 //! let event: InotifyEvent =
 //!     unsafe { core::ptr::read_unaligned(buf.as_ptr().cast()) };

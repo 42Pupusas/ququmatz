@@ -18,7 +18,7 @@
 //! // Read the counter via io_uring
 //! let mut ring = IoUring::new(4).unwrap();
 //! let mut buf = [0u8; 8];
-//! ring.do_read(efd.fd().as_i32(), &mut buf, 0).unwrap();
+//! ring.do_read(efd.fd(), &mut buf, 0).unwrap();
 //!
 //! let value = u64::from_ne_bytes(buf);
 //! assert_eq!(value, 1);

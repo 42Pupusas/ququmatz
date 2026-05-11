@@ -1,7 +1,7 @@
 //! Control-plane SQEs: nop, cancel, poll, timeout.
 
 use super::{Sqe, ZEROED};
-use crate::types::{Opcode, PollMask, TimeoutFlags, Timespec};
+use crate::types::{Opcode, PollMask, RawFd, TimeoutFlags, Timespec};
 
 impl Sqe {
     /// Prepare a no-op operation.
@@ -38,10 +38,10 @@ impl Sqe {
     ///
     /// Waits for events matching `mask` on the given fd.
     #[must_use]
-    pub fn poll_add(fd: i32, mask: PollMask) -> Self {
+    pub fn poll_add(fd: RawFd, mask: PollMask) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::PollAdd.into();
-        sqe.fd = fd;
+        sqe.fd = fd.as_i32();
         sqe.op_flags = mask.bits();
         Self(sqe)
     }

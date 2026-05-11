@@ -5,32 +5,32 @@
 use super::{Sqe, ZEROED};
 use crate::types::{
     DirFd, FadviseAdvice, FallocateMode, FileMode, FsyncFlags, IoVec, MadviseAdvice, Opcode,
-    OpenFlags, OpenHow, RenameFlags, SpliceFlags, Statx, StatxFlags, StatxMask, UnlinkFlags,
+    OpenFlags, OpenHow, RawFd, RenameFlags, SpliceFlags, Statx, StatxFlags, StatxMask, UnlinkFlags,
 };
 
 impl Sqe {
     /// Prepare a close operation on a file descriptor.
     #[must_use]
-    pub fn close(fd: i32) -> Self {
+    pub fn close(fd: RawFd) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Close.into();
-        sqe.fd = fd;
+        sqe.fd = fd.as_i32();
         Self(sqe)
     }
 
     /// Prepare an fsync operation.
     #[must_use]
-    pub fn fsync(fd: i32, flags: FsyncFlags) -> Self {
+    pub fn fsync(fd: RawFd, flags: FsyncFlags) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Fsync.into();
-        sqe.fd = fd;
+        sqe.fd = fd.as_i32();
         sqe.op_flags = flags.bits();
         Self(sqe)
     }
 
     /// Prepare an fdatasync operation (convenience for fsync + DATASYNC flag).
     #[must_use]
-    pub fn fdatasync(fd: i32) -> Self {
+    pub fn fdatasync(fd: RawFd) -> Self {
         Self::fsync(fd, FsyncFlags::DATASYNC)
     }
 
@@ -43,10 +43,10 @@ impl Sqe {
     /// `sqe.len` is only u32 and fallocate needs a 64-bit length.
     /// `sqe.len` carries the mode flags instead.
     #[must_use]
-    pub fn fallocate(fd: i32, mode: FallocateMode, offset: u64, len: u64) -> Self {
+    pub fn fallocate(fd: RawFd, mode: FallocateMode, offset: u64, len: u64) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Fallocate.into();
-        sqe.fd = fd;
+        sqe.fd = fd.as_i32();
         sqe.off = offset;
         sqe.addr = len; // byte length (u64), not an address
         sqe.len = mode.bits(); // mode flags, not a length
@@ -59,7 +59,7 @@ impl Sqe {
     /// Use offset `u64::MAX` (`-1` as unsigned) for current file position.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn read(fd: i32, buf: &mut [u8], offset: u64) -> Self {
+    pub fn read(fd: RawFd, buf: &mut [u8], offset: u64) -> Self {
         debug_assert!(buf.len() <= u32::MAX as usize);
         unsafe { Self::read_ptr(fd, buf.as_mut_ptr(), buf.len() as u32, offset) }
     }
@@ -70,7 +70,7 @@ impl Sqe {
     /// Use offset `u64::MAX` (`-1` as unsigned) for current file position.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn write(fd: i32, buf: &[u8], offset: u64) -> Self {
+    pub fn write(fd: RawFd, buf: &[u8], offset: u64) -> Self {
         debug_assert!(buf.len() <= u32::MAX as usize);
         unsafe { Self::write_ptr(fd, buf.as_ptr(), buf.len() as u32, offset) }
     }
@@ -80,7 +80,7 @@ impl Sqe {
     /// Reads from `fd` at `offset` into the buffers described by `iovecs`.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn readv(fd: i32, iovecs: &[IoVec], offset: u64) -> Self {
+    pub fn readv(fd: RawFd, iovecs: &[IoVec], offset: u64) -> Self {
         debug_assert!(iovecs.len() <= u32::MAX as usize);
         unsafe { Self::readv_ptr(fd, iovecs.as_ptr(), iovecs.len() as u32, offset) }
     }
@@ -90,7 +90,7 @@ impl Sqe {
     /// Writes to `fd` at `offset` from the buffers described by `iovecs`.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn writev(fd: i32, iovecs: &[IoVec], offset: u64) -> Self {
+    pub fn writev(fd: RawFd, iovecs: &[IoVec], offset: u64) -> Self {
         debug_assert!(iovecs.len() <= u32::MAX as usize);
         unsafe { Self::writev_ptr(fd, iovecs.as_ptr(), iovecs.len() as u32, offset) }
     }
@@ -102,10 +102,10 @@ impl Sqe {
     /// The caller must ensure `buf` points to at least `len` bytes of valid,
     /// writable memory that remains valid until the operation completes.
     #[must_use]
-    pub unsafe fn read_ptr(fd: i32, buf: *mut u8, len: u32, offset: u64) -> Self {
+    pub unsafe fn read_ptr(fd: RawFd, buf: *mut u8, len: u32, offset: u64) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Read.into();
-        sqe.fd = fd;
+        sqe.fd = fd.as_i32();
         sqe.addr = buf as u64;
         sqe.len = len;
         sqe.off = offset;
@@ -119,10 +119,10 @@ impl Sqe {
     /// The caller must ensure `buf` points to at least `len` bytes of valid,
     /// readable memory that remains valid until the operation completes.
     #[must_use]
-    pub unsafe fn write_ptr(fd: i32, buf: *const u8, len: u32, offset: u64) -> Self {
+    pub unsafe fn write_ptr(fd: RawFd, buf: *const u8, len: u32, offset: u64) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Write.into();
-        sqe.fd = fd;
+        sqe.fd = fd.as_i32();
         sqe.addr = buf as u64;
         sqe.len = len;
         sqe.off = offset;
@@ -136,10 +136,10 @@ impl Sqe {
     /// The caller must ensure `iovecs` and all referenced buffers remain valid
     /// until the operation completes.
     #[must_use]
-    pub unsafe fn readv_ptr(fd: i32, iovecs: *const IoVec, nr_vecs: u32, offset: u64) -> Self {
+    pub unsafe fn readv_ptr(fd: RawFd, iovecs: *const IoVec, nr_vecs: u32, offset: u64) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Readv.into();
-        sqe.fd = fd;
+        sqe.fd = fd.as_i32();
         sqe.addr = iovecs as u64;
         sqe.len = nr_vecs;
         sqe.off = offset;
@@ -153,10 +153,10 @@ impl Sqe {
     /// The caller must ensure `iovecs` and all referenced buffers remain valid
     /// until the operation completes.
     #[must_use]
-    pub unsafe fn writev_ptr(fd: i32, iovecs: *const IoVec, nr_vecs: u32, offset: u64) -> Self {
+    pub unsafe fn writev_ptr(fd: RawFd, iovecs: *const IoVec, nr_vecs: u32, offset: u64) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Writev.into();
-        sqe.fd = fd;
+        sqe.fd = fd.as_i32();
         sqe.addr = iovecs as u64;
         sqe.len = nr_vecs;
         sqe.off = offset;
@@ -173,10 +173,16 @@ impl Sqe {
     /// within the registered buffer at `buf_index`, and must remain valid
     /// until the operation completes.
     #[must_use]
-    pub unsafe fn read_fixed(fd: i32, buf: *mut u8, len: u32, offset: u64, buf_index: u16) -> Self {
+    pub unsafe fn read_fixed(
+        fd: RawFd,
+        buf: *mut u8,
+        len: u32,
+        offset: u64,
+        buf_index: u16,
+    ) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::ReadFixed.into();
-        sqe.fd = fd;
+        sqe.fd = fd.as_i32();
         sqe.addr = buf as u64;
         sqe.len = len;
         sqe.off = offset;
@@ -195,7 +201,7 @@ impl Sqe {
     /// until the operation completes.
     #[must_use]
     pub unsafe fn write_fixed(
-        fd: i32,
+        fd: RawFd,
         buf: *const u8,
         len: u32,
         offset: u64,
@@ -203,7 +209,7 @@ impl Sqe {
     ) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::WriteFixed.into();
-        sqe.fd = fd;
+        sqe.fd = fd.as_i32();
         sqe.addr = buf as u64;
         sqe.len = len;
         sqe.off = offset;
@@ -418,10 +424,10 @@ impl Sqe {
     /// Advises the kernel about the expected access pattern for the given
     /// byte range `[offset, offset+len)` of `fd`.
     #[must_use]
-    pub fn fadvise(fd: i32, offset: u64, len: u32, advice: FadviseAdvice) -> Self {
+    pub fn fadvise(fd: RawFd, offset: u64, len: u32, advice: FadviseAdvice) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Fadvise.into();
-        sqe.fd = fd;
+        sqe.fd = fd.as_i32();
         sqe.off = offset;
         sqe.len = len;
         sqe.op_flags = advice.into();
@@ -453,18 +459,18 @@ impl Sqe {
     /// Set `SpliceFlags::FD_IN_FIXED` in `flags` if `fd_in` is a registered fd.
     #[must_use]
     pub fn splice(
-        fd_out: i32,
+        fd_out: RawFd,
         off_out: u64,
-        fd_in: i32,
+        fd_in: RawFd,
         off_in: u64,
         len: u32,
         flags: SpliceFlags,
     ) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Splice.into();
-        sqe.fd = fd_out;
+        sqe.fd = fd_out.as_i32();
         sqe.off = off_out;
-        sqe.splice_fd_in = fd_in;
+        sqe.splice_fd_in = fd_in.as_i32();
         sqe.addr = off_in;
         sqe.len = len;
         sqe.op_flags = flags.bits();
@@ -475,11 +481,11 @@ impl Sqe {
     ///
     /// Both `fd_in` and `fd` must be pipe fds.
     #[must_use]
-    pub fn tee(fd_out: i32, fd_in: i32, len: u32, flags: SpliceFlags) -> Self {
+    pub fn tee(fd_out: RawFd, fd_in: RawFd, len: u32, flags: SpliceFlags) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Tee.into();
-        sqe.fd = fd_out;
-        sqe.splice_fd_in = fd_in;
+        sqe.fd = fd_out.as_i32();
+        sqe.splice_fd_in = fd_in.as_i32();
         sqe.len = len;
         sqe.op_flags = flags.bits();
         Self(sqe)
