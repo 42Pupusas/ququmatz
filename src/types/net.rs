@@ -1,6 +1,5 @@
 //! Networking types: addresses, msghdr, send/recv flags, socket creation.
 
-use super::bitflags;
 use super::buffers::IoVec;
 
 // Raw kernel values. Internal — public callers use the typed `AddressFamily`

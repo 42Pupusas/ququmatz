@@ -1,7 +1,5 @@
 //! Eventfd init flags.
 
-use super::bitflags;
-
 bitflags! {
     /// Flags for `eventfd2`.
     pub struct EventFdFlags(i32);

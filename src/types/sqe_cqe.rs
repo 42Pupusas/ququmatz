@@ -1,6 +1,5 @@
 //! Kernel SQE/CQE/params layout and CQE flag bits.
 
-use super::bitflags;
 use super::buffers::{IoCqringOffsets, IoSqringOffsets};
 
 #[derive(Debug, Clone, Copy, Default)]

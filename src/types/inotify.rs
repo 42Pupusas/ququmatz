@@ -1,7 +1,5 @@
 //! Inotify watch mask, event header, and init flags.
 
-use super::bitflags;
-
 bitflags! {
     /// Event mask for inotify watches.
     pub struct WatchMask(u32);

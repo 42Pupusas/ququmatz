@@ -1,7 +1,5 @@
 //! `mmap` protection and mapping flags.
 
-use super::bitflags;
-
 bitflags! {
     /// Memory protection flags for `mmap`.
     pub struct Prot(u32);

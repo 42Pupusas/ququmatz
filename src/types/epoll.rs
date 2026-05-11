@@ -1,7 +1,5 @@
 //! epoll control op and event types.
 
-use super::bitflags;
-
 /// epoll control operations for `IORING_OP_EPOLL_CTL`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]

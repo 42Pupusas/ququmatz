@@ -1,7 +1,5 @@
 //! Timespec and timeout flags.
 
-use super::bitflags;
-
 /// Kernel timespec for timeout operations.
 ///
 /// Fields are private to enforce the nanosecond range invariant

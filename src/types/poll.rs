@@ -1,7 +1,5 @@
 //! Poll event mask.
 
-use super::bitflags;
-
 bitflags! {
     /// Event mask for poll operations (matches Linux poll event bits).
     pub struct PollMask(u32);

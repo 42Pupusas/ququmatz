@@ -6,9 +6,7 @@
 
 // ---------------------------------------------------------------------------
 // Bitflag newtype macro — eliminates per-type boilerplate.
-//
-// Submodules access this via `use super::bitflags;` (the `pub(crate) use`
-// below makes the macro path-importable).
+// Visible to all submodules automatically as a macro defined in the parent.
 // ---------------------------------------------------------------------------
 
 macro_rules! bitflags {
@@ -83,8 +81,6 @@ macro_rules! bitflags {
         }
     };
 }
-
-pub(crate) use bitflags;
 
 mod buffers;
 mod epoll;

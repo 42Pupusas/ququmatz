@@ -533,6 +533,167 @@ impl Iterator for SplitCompletions<'_> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Private helpers extracted from IoUring::from_params to keep it short.
+// ---------------------------------------------------------------------------
+
+/// Map the SQ ring, CQ ring, and SQE array for a freshly set-up ring fd.
+///
+/// Returns `(sq_ring_ptr, mmap_sz, cq_ring_ptr, cq_ring_region, sqes_ptr, sqes_sz)`.
+/// On success the caller owns all three mappings; on error the `guard` cleans them up.
+#[allow(clippy::cast_ptr_alignment)]
+fn map_rings(
+    fd: RawFd,
+    params: &IoUringParams,
+    features: Features,
+    guard: &mut SetupGuard,
+) -> Result<(usize, usize, usize, MappedRegion, usize, usize), Error> {
+    let prot = Prot::READ | Prot::WRITE;
+    let map = MapFlags::SHARED | MapFlags::POPULATE;
+
+    let sq_ring_sz =
+        params.sq_off.array as usize + params.sq_entries as usize * core::mem::size_of::<u32>();
+    let cq_ring_sz = params.cq_off.cqes as usize
+        + params.cq_entries as usize * core::mem::size_of::<IoUringCqe>();
+
+    let single_mmap = features.contains(Features::SINGLE_MMAP);
+    let mmap_sz = if single_mmap {
+        sq_ring_sz.max(cq_ring_sz)
+    } else {
+        sq_ring_sz
+    };
+
+    let sq_ring_ptr = syscall::mmap(
+        0,
+        mmap_sz,
+        prot,
+        map,
+        fd.as_usize(),
+        RingOffset::SqRing.into(),
+    )?;
+    guard.sq_ring = MappedRegion::new(sq_ring_ptr, mmap_sz);
+
+    let (cq_ring_ptr, cq_ring_region) = if single_mmap {
+        (sq_ring_ptr, MappedRegion::new(0, 0))
+    } else {
+        let ptr = syscall::mmap(
+            0,
+            cq_ring_sz,
+            prot,
+            map,
+            fd.as_usize(),
+            RingOffset::CqRing.into(),
+        )?;
+        guard.cq_ring = MappedRegion::new(ptr, cq_ring_sz);
+        (ptr, MappedRegion::new(ptr, cq_ring_sz))
+    };
+
+    let sqes_sz = params.sq_entries as usize * core::mem::size_of::<IoUringSqe>();
+    let sqes_ptr = syscall::mmap(
+        0,
+        sqes_sz,
+        prot,
+        map,
+        fd.as_usize(),
+        RingOffset::Sqes.into(),
+    )?;
+    guard.sqes = MappedRegion::new(sqes_ptr, sqes_sz);
+
+    Ok((
+        sq_ring_ptr,
+        mmap_sz,
+        cq_ring_ptr,
+        cq_ring_region,
+        sqes_ptr,
+        sqes_sz,
+    ))
+}
+
+/// Parse SQ-side pointers out of the mapped SQ ring region.
+///
+/// Returns `(sq_head, sq_tail, sq_mask, sq_flags, sqes, sq_tail_local)`.
+///
+/// # Safety
+///
+/// `sq_ring_ptr` must point to a valid SQ ring mmap and `sqes_ptr` to the SQE array mmap,
+/// both sized according to `params`. Pointers remain valid for the life of the ring.
+#[allow(clippy::cast_ptr_alignment, clippy::type_complexity)]
+unsafe fn parse_sq(
+    sq_ring_ptr: usize,
+    sqes_ptr: usize,
+    params: &IoUringParams,
+) -> (
+    *const AtomicU32,
+    *const AtomicU32,
+    u32,
+    *const AtomicU32,
+    *mut IoUringSqe,
+    u32,
+) {
+    let base = sq_ring_ptr as *const u8;
+    let sq_head = unsafe { base.add(params.sq_off.head as usize) }.cast::<AtomicU32>();
+    let sq_tail = unsafe { base.add(params.sq_off.tail as usize) }.cast::<AtomicU32>();
+    let sq_mask = unsafe { *base.add(params.sq_off.ring_mask as usize).cast::<u32>() };
+    let sq_flags = unsafe { base.add(params.sq_off.flags as usize) }.cast::<AtomicU32>();
+    let sq_array = unsafe { base.add(params.sq_off.array as usize) } as *mut u32;
+
+    debug_assert!(sq_head.is_aligned(), "sq_head not aligned");
+    debug_assert!(sq_tail.is_aligned(), "sq_tail not aligned");
+    debug_assert!(sq_flags.is_aligned(), "sq_flags not aligned");
+    debug_assert!(sq_array.is_aligned(), "sq_array not aligned");
+
+    // Pre-fill sq_array with identity mapping (sq_array[i] = i).
+    //
+    // The kernel reads sq_array[tail & mask] to find which SQE slot to
+    // consume. Because push() always writes sqes[tail & mask] and the
+    // identity mapping means sq_array[j] == j for all j < sq_entries,
+    // the kernel always picks up the right slot without us ever
+    // touching sq_array again.
+    //
+    // SAFETY: this invariant breaks if push() ever writes to a slot
+    // other than (tail & mask), or if SQE reordering is added later.
+    for i in 0..params.sq_entries {
+        unsafe { sq_array.add(i as usize).write(i) };
+    }
+
+    let sq_tail_local = unsafe { &*sq_tail }.load(Ordering::Acquire);
+    let sqes = sqes_ptr as *mut IoUringSqe;
+
+    (sq_head, sq_tail, sq_mask, sq_flags, sqes, sq_tail_local)
+}
+
+/// Parse CQ-side pointers out of the mapped CQ ring region.
+///
+/// Returns `(cq_head, cq_tail, cq_mask, cqes, cq_head_local)`.
+///
+/// # Safety
+///
+/// `cq_ring_ptr` must point to a valid CQ ring mmap sized according to `params`.
+#[allow(clippy::cast_ptr_alignment, clippy::type_complexity)]
+unsafe fn parse_cq(
+    cq_ring_ptr: usize,
+    params: &IoUringParams,
+) -> (
+    *const AtomicU32,
+    *const AtomicU32,
+    u32,
+    *const IoUringCqe,
+    u32,
+) {
+    let base = cq_ring_ptr as *const u8;
+    let cq_head = unsafe { base.add(params.cq_off.head as usize) }.cast::<AtomicU32>();
+    let cq_tail = unsafe { base.add(params.cq_off.tail as usize) }.cast::<AtomicU32>();
+    let cq_mask = unsafe { *base.add(params.cq_off.ring_mask as usize).cast::<u32>() };
+    let cqes = unsafe { base.add(params.cq_off.cqes as usize) }.cast::<IoUringCqe>();
+
+    debug_assert!(cq_head.is_aligned(), "cq_head not aligned");
+    debug_assert!(cq_tail.is_aligned(), "cq_tail not aligned");
+    debug_assert!(cqes.is_aligned(), "cqes not aligned");
+
+    let cq_head_local = unsafe { &*cq_head }.load(Ordering::Acquire);
+    (cq_head, cq_tail, cq_mask, cqes, cq_head_local)
+}
+
 impl IoUring {
     /// Create a new `io_uring` instance with the given queue depth.
     ///
@@ -582,110 +743,22 @@ impl IoUring {
         flags & IORING_SQ_NEED_WAKEUP != 0
     }
 
-    #[allow(clippy::cast_ptr_alignment)]
     pub(super) fn from_params(entries: u32, params: &mut IoUringParams) -> Result<Self, Error> {
-        let prot = Prot::READ | Prot::WRITE;
-        let map = MapFlags::SHARED | MapFlags::POPULATE;
-
         let fd = syscall::io_uring_setup(entries, &raw mut *params)?;
         let mut guard = SetupGuard::new(fd);
 
         let features = Features::from_raw(params.features);
-        let single_mmap = features.contains(Features::SINGLE_MMAP);
+        let (sq_ring_ptr, mmap_sz, cq_ring_ptr, cq_ring_region, sqes_ptr, sqes_sz) =
+            map_rings(fd, params, features, &mut guard)?;
 
-        // Compute ring sizes
-        let sq_ring_sz =
-            params.sq_off.array as usize + params.sq_entries as usize * core::mem::size_of::<u32>();
-        let cq_ring_sz = params.cq_off.cqes as usize
-            + params.cq_entries as usize * core::mem::size_of::<IoUringCqe>();
+        let (sq_head, sq_tail, sq_mask, sq_flags, sqes, sq_tail_local) =
+            // SAFETY: sq_ring_ptr points to a valid mmap of at least sq_ring_sz bytes.
+            unsafe { parse_sq(sq_ring_ptr, sqes_ptr, params) };
 
-        // Map the SQ ring (and CQ ring too if SINGLE_MMAP)
-        let mmap_sz = if single_mmap {
-            sq_ring_sz.max(cq_ring_sz)
-        } else {
-            sq_ring_sz
-        };
-        let sq_ring_ptr = syscall::mmap(
-            0,
-            mmap_sz,
-            prot,
-            map,
-            fd.as_usize(),
-            RingOffset::SqRing.into(),
-        )?;
-        guard.sq_ring = MappedRegion::new(sq_ring_ptr, mmap_sz);
+        let (cq_head, cq_tail, cq_mask, cqes, cq_head_local) =
+            // SAFETY: cq_ring_ptr points to a valid mmap of at least cq_ring_sz bytes.
+            unsafe { parse_cq(cq_ring_ptr, params) };
 
-        // Map the CQ ring (reuse SQ mmap if SINGLE_MMAP)
-        let (cq_ring_ptr, cq_ring_region) = if single_mmap {
-            (sq_ring_ptr, MappedRegion::new(0, 0))
-        } else {
-            let ptr = syscall::mmap(
-                0,
-                cq_ring_sz,
-                prot,
-                map,
-                fd.as_usize(),
-                RingOffset::CqRing.into(),
-            )?;
-            let region = MappedRegion::new(ptr, cq_ring_sz);
-            guard.cq_ring = MappedRegion::new(ptr, cq_ring_sz);
-            (ptr, region)
-        };
-
-        // Map the SQE array
-        let sqes_sz = params.sq_entries as usize * core::mem::size_of::<IoUringSqe>();
-        let sqes_ptr = syscall::mmap(
-            0,
-            sqes_sz,
-            prot,
-            map,
-            fd.as_usize(),
-            RingOffset::Sqes.into(),
-        )?;
-        guard.sqes = MappedRegion::new(sqes_ptr, sqes_sz);
-
-        let sq_base = sq_ring_ptr as *const u8;
-        let sq_head = unsafe { sq_base.add(params.sq_off.head as usize) }.cast::<AtomicU32>();
-        let sq_tail = unsafe { sq_base.add(params.sq_off.tail as usize) }.cast::<AtomicU32>();
-        let sq_mask = unsafe { *sq_base.add(params.sq_off.ring_mask as usize).cast::<u32>() };
-        let sq_flags = unsafe { sq_base.add(params.sq_off.flags as usize) }.cast::<AtomicU32>();
-        let sq_array = unsafe { sq_base.add(params.sq_off.array as usize) } as *mut u32;
-
-        debug_assert!(sq_head.is_aligned(), "sq_head not aligned");
-        debug_assert!(sq_tail.is_aligned(), "sq_tail not aligned");
-        debug_assert!(sq_flags.is_aligned(), "sq_flags not aligned");
-        debug_assert!(sq_array.is_aligned(), "sq_array not aligned");
-
-        // Pre-fill sq_array with identity mapping (sq_array[i] = i).
-        //
-        // The kernel reads sq_array[tail & mask] to find which SQE slot to
-        // consume. Because push() always writes sqes[tail & mask] and the
-        // identity mapping means sq_array[j] == j for all j < sq_entries,
-        // the kernel always picks up the right slot without us ever
-        // touching sq_array again.
-        //
-        // SAFETY: this invariant breaks if push() ever writes to a slot
-        // other than (tail & mask), or if SQE reordering is added later.
-        for i in 0..params.sq_entries {
-            unsafe { sq_array.add(i as usize).write(i) };
-        }
-
-        let cq_base = cq_ring_ptr as *const u8;
-        let cq_head = unsafe { cq_base.add(params.cq_off.head as usize) }.cast::<AtomicU32>();
-        let cq_tail = unsafe { cq_base.add(params.cq_off.tail as usize) }.cast::<AtomicU32>();
-        let cq_mask = unsafe { *cq_base.add(params.cq_off.ring_mask as usize).cast::<u32>() };
-        let cqes = unsafe { cq_base.add(params.cq_off.cqes as usize) }.cast::<IoUringCqe>();
-
-        debug_assert!(cq_head.is_aligned(), "cq_head not aligned");
-        debug_assert!(cq_tail.is_aligned(), "cq_tail not aligned");
-        debug_assert!(cqes.is_aligned(), "cqes not aligned");
-
-        let sq_tail_local = unsafe { &*sq_tail }.load(Ordering::Acquire);
-        let cq_head_local = unsafe { &*cq_head }.load(Ordering::Acquire);
-
-        // All resources acquired — disarm the guard and hand them to
-        // RingResources. If alloc fails the guard would have already been
-        // disarmed, so we re-clean manually on error.
         guard.disarm();
 
         let resources = match RingResources::alloc(
@@ -709,7 +782,7 @@ impl IoUring {
             sq_tail,
             sq_mask,
             sq_flags,
-            sqes: sqes_ptr as *mut IoUringSqe,
+            sqes,
             sq_tail_local,
             sq_submitted: sq_tail_local,
             cq_head,

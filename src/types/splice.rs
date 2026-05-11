@@ -1,7 +1,5 @@
 //! splice/tee flags.
 
-use super::bitflags;
-
 bitflags! {
     /// Flags for `IORING_OP_SPLICE` and `IORING_OP_TEE`.
     pub struct SpliceFlags(u32);

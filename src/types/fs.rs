@@ -1,7 +1,6 @@
 //! Filesystem op flags and structs: openat/openat2, statx, rename/unlink,
 //! file mode, fsync, fallocate, fadvise/madvise.
 
-use super::bitflags;
 use super::buffers::RawFd;
 
 bitflags! {

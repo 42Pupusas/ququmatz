@@ -1,7 +1,5 @@
 //! Ring setup, enter, and feature flags.
 
-use super::bitflags;
-
 bitflags! {
     /// Flags for `io_uring_enter`.
     pub struct EnterFlags(u32);
