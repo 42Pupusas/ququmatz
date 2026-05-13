@@ -201,6 +201,41 @@ impl ProvidedBufferRing {
         }
     }
 
+    /// Borrow the contents of a completed buffer for the lifetime of the
+    /// ring's backing memory (`'ring`) rather than the lifetime of the
+    /// borrow of `self` (`'borrow`).
+    ///
+    /// The two-lifetime signature lets the caller hold the returned slice
+    /// while subsequently re-borrowing `self` for other operations (e.g.
+    /// recycling a *different* buffer), because the slice lifetime `'ring`
+    /// is not consumed by the short `'borrow`.  The bound `'ring: 'borrow`
+    /// proves the backing memory outlives this borrow.
+    ///
+    /// The caller must ensure `buf_id` is not recycled for the duration
+    /// of the returned slice.
+    #[must_use]
+    pub fn buffer_pinned<'ring, 'borrow>(
+        &'borrow self,
+        buf_id: u16,
+        len: u32,
+    ) -> Option<&'ring [u8]>
+    where
+        'ring: 'borrow,
+    {
+        // SAFETY: `bufs_addr` is a pinned mmap valid for `'ring`. The
+        // `'ring: 'borrow` bound proves the memory outlives this borrow.
+        // Caller upholds the no-recycle invariant for `buf_id`.
+        unsafe {
+            buffer_slice(
+                self.bufs_addr as *const u8,
+                self.entries,
+                self.buf_size,
+                buf_id,
+                len,
+            )
+        }
+    }
+
     /// Mutably borrow a completed buffer.
     ///
     /// Same bounds as [`buffer`](Self::buffer). The `&mut self` borrow
@@ -212,6 +247,42 @@ impl ProvidedBufferRing {
         // SAFETY: same region guarantees as `buffer`, plus `&mut self`
         // which rules out any aliasing `&[u8]` / `&mut [u8]` previously
         // handed out.
+        unsafe {
+            buffer_slice_mut(
+                self.bufs_addr as *mut u8,
+                self.entries,
+                self.buf_size,
+                buf_id,
+                len,
+            )
+        }
+    }
+
+    /// Mutably borrow a buffer for the lifetime of the ring's backing
+    /// memory (`'ring`) rather than the lifetime of the borrow of `self`
+    /// (`'borrow`).
+    ///
+    /// The two-lifetime signature lets the caller hold the returned
+    /// `&'ring mut [u8]` while subsequently re-borrowing `self` for
+    /// unrelated operations (e.g. recycling a *different* buffer).
+    /// The bound `'ring: 'borrow` proves the backing memory outlives
+    /// this borrow.
+    ///
+    /// The caller must guarantee that no other live reference (shared or
+    /// exclusive) to slot `buf_id` exists and that the slot is not
+    /// recycled while the slice is held.
+    #[must_use]
+    pub fn buffer_mut_pinned<'ring, 'borrow>(
+        &'borrow mut self,
+        buf_id: u16,
+        len: u32,
+    ) -> Option<&'ring mut [u8]>
+    where
+        'ring: 'borrow,
+    {
+        // SAFETY: `bufs_addr` is a pinned mmap valid for `'ring`. The
+        // `'ring: 'borrow` bound proves the memory outlives this borrow.
+        // Caller upholds exclusive access and no-recycle invariants.
         unsafe {
             buffer_slice_mut(
                 self.bufs_addr as *mut u8,

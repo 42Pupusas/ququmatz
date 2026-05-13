@@ -859,7 +859,6 @@ impl IoUring {
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
     pub fn submit(&mut self) -> Result<u32, Error> {
-        self.flush_cq_head();
         // Snapshot the count *before* publishing the tail. After
         // flush_sq_tail() the kernel may start consuming entries
         // immediately, advancing sq_head — reading head after the
@@ -871,6 +870,7 @@ impl IoUring {
         }
         let ret = syscall::io_uring_enter(self.fd, to_submit, 0, EnterFlags::default())?;
         self.sq_submitted = self.sq_tail_local;
+        self.flush_cq_head();
         Ok(ret as u32)
     }
 
@@ -916,7 +916,6 @@ impl IoUring {
     /// Returns an error if the wakeup `io_uring_enter` call fails.
     #[inline]
     pub fn submit_sqpoll(&mut self) -> Result<(), Error> {
-        self.flush_cq_head();
         self.flush_sq_tail();
         self.sq_submitted = self.sq_tail_local;
         if self.sq_need_wakeup() {
@@ -927,9 +926,10 @@ impl IoUring {
 
     /// Publish the local CQ head to the kernel-visible atomic head.
     ///
-    /// Called automatically by `submit`, `submit_and_wait`, `submit_sqpoll`,
-    /// and `Drop`. Call explicitly after draining completions if you need the
-    /// kernel to see freed CQ slots before the next submission.
+    /// Called automatically by [`submit_and_wait`](Self::submit_and_wait)
+    /// and `Drop`. Call explicitly after draining completions if you need
+    /// the kernel to see freed CQ slots before the next
+    /// [`submit`](Self::submit) (which does *not* auto-flush).
     #[inline]
     fn flush_cq_head(&self) {
         unsafe { &*self.cq_head }.store(self.cq_head_local, Ordering::Release);
@@ -937,9 +937,8 @@ impl IoUring {
 
     /// Reap one completion from the completion queue, if available.
     ///
-    /// The CQ head is not published to the kernel until the next `submit`,
-    /// `submit_and_wait`, or when the ring is dropped. This avoids a
-    /// costly Release store on every completion.
+    /// The CQ head is not published to the kernel until [`flush_cq_head`](Self::flush_cq_head)
+    /// is called or the ring is dropped. This avoids a costly Release store on every completion.
     #[inline]
     #[must_use]
     pub fn complete(&mut self) -> Option<Completion> {
