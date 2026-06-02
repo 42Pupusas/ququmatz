@@ -2127,6 +2127,153 @@ fn update_registered_files_replaces_slot() {
     let _ = syscall::close(RawFd::from_raw(fd2 as usize));
 }
 
+// ---------------------------------------------------------------
+// Error `Display` impls — pure formatting, run under Miri.
+// ---------------------------------------------------------------
+
+#[test]
+fn submit_error_display() {
+    extern crate std;
+    use std::string::ToString;
+
+    assert_eq!(
+        SubmitError::QueueFull.to_string(),
+        "submission queue is full"
+    );
+    assert_eq!(
+        SubmitError::Syscall(Errno::EAGAIN).to_string(),
+        "submit syscall failed: os error 11"
+    );
+}
+
+#[test]
+fn completion_error_display() {
+    extern crate std;
+    use std::string::ToString;
+
+    assert_eq!(
+        CompletionError::NoCompletion.to_string(),
+        "no completion available"
+    );
+    assert_eq!(
+        CompletionError::Failed(Errno::EINVAL).to_string(),
+        "operation failed: os error 22"
+    );
+}
+
+#[test]
+fn setup_error_display() {
+    extern crate std;
+    use std::string::ToString;
+
+    assert_eq!(
+        SetupError::InvalidArg(InvalidArgKind::BufferCountZero).to_string(),
+        "invalid argument: buffer count must be non-zero"
+    );
+    assert_eq!(
+        SetupError::Syscall(Errno::EINVAL).to_string(),
+        "setup syscall failed: os error 22"
+    );
+}
+
+#[test]
+fn error_display_delegates_to_inner() {
+    extern crate std;
+    use std::string::ToString;
+
+    // Each wrapping variant must format exactly like the value it wraps.
+    assert_eq!(
+        Error::Submit(SubmitError::QueueFull).to_string(),
+        SubmitError::QueueFull.to_string()
+    );
+    assert_eq!(
+        Error::Completion(CompletionError::NoCompletion).to_string(),
+        CompletionError::NoCompletion.to_string()
+    );
+    assert_eq!(
+        Error::Setup(SetupError::Syscall(Errno::EINVAL)).to_string(),
+        SetupError::Syscall(Errno::EINVAL).to_string()
+    );
+    // The leaf `Syscall` arm has its own message.
+    assert_eq!(
+        Error::Syscall(Errno::ENOENT).to_string(),
+        "syscall failed: os error 2"
+    );
+}
+
+// ---------------------------------------------------------------
+// SQPOLL submit path — needs a real kernel, skipped under Miri.
+// ---------------------------------------------------------------
+
+#[cfg(not(miri))]
+#[test]
+fn submit_sqpoll_roundtrip() {
+    // 100ms idle so the poll thread reliably parks between submissions,
+    // forcing `submit_sqpoll` through its SQ_WAKEUP branch on the 2nd push.
+    let mut ring = IoUring::builder(4).sqpoll(100).build().expect("setup");
+
+    ring.push_nop(1).expect("push");
+    ring.submit_sqpoll().expect("submit_sqpoll");
+    // Spin until the poll thread reaps our NOP into the CQ.
+    let cqe = loop {
+        if let Some(cqe) = ring.complete() {
+            break cqe;
+        }
+        core::hint::spin_loop();
+    };
+    assert_eq!(cqe.user_data, 1);
+    assert_eq!(cqe.result, 0);
+
+    // Let the kernel poll thread go idle, then submit again so the
+    // need-wakeup path actually fires.
+    for _ in 0..1_000_000 {
+        core::hint::spin_loop();
+    }
+    ring.push_nop(2).expect("push");
+    ring.submit_sqpoll().expect("submit_sqpoll wakeup");
+    let cqe = loop {
+        if let Some(cqe) = ring.complete() {
+            break cqe;
+        }
+        core::hint::spin_loop();
+    };
+    assert_eq!(cqe.user_data, 2);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn submit_sqpoll_split_roundtrip() {
+    // Same SQPOLL path, but through the split Submitter/Completer halves so
+    // `Submitter::submit_sqpoll` is exercised (not just `IoUring::`).
+    let ring = IoUring::builder(4).sqpoll(100).build().expect("setup");
+    let (mut sub, mut comp) = ring.split();
+
+    sub.push_nop(7).expect("push");
+    sub.submit_sqpoll().expect("submit_sqpoll");
+    let cqe = loop {
+        if let Some(cqe) = comp.complete() {
+            break cqe;
+        }
+        core::hint::spin_loop();
+    };
+    assert_eq!(cqe.user_data, 7);
+    assert_eq!(cqe.result, 0);
+
+    // Park the poll thread, then submit again to hit the wakeup branch.
+    for _ in 0..1_000_000 {
+        core::hint::spin_loop();
+    }
+    sub.push_nop(8).expect("push");
+    sub.submit_sqpoll().expect("submit_sqpoll wakeup");
+    let cqe = loop {
+        if let Some(cqe) = comp.complete() {
+            break cqe;
+        }
+        core::hint::spin_loop();
+    };
+    assert_eq!(cqe.user_data, 8);
+}
+
 /// Thin shim over `pipe2(2)` — only used in tests, so we call the
 /// raw syscall number rather than pulling in libc.
 #[cfg(not(miri))]

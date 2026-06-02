@@ -103,6 +103,17 @@ pub struct SockAddrIn {
     pub sin_zero: [u8; 8],
 }
 
+impl SockAddrIn {
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; 16] {
+        let mut buf = [0u8; 16];
+        buf[0..2].copy_from_slice(&self.sin_family.to_ne_bytes());
+        buf[2..4].copy_from_slice(&self.sin_port.to_ne_bytes());
+        buf[4..8].copy_from_slice(&self.sin_addr.to_ne_bytes());
+        buf
+    }
+}
+
 /// Message header for sendmsg/recvmsg.
 ///
 /// The padding fields match the `x86_64` C ABI layout of `struct msghdr`:

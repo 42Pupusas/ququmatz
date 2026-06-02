@@ -399,6 +399,25 @@ impl Submitter {
         self.features
     }
 
+    /// Returns the ring's file descriptor.
+    #[must_use]
+    pub const fn raw_fd(&self) -> RawFd {
+        self.fd
+    }
+
+    /// Returns the total number of SQ slots (always a power of two).
+    #[must_use]
+    pub const fn sq_capacity(&self) -> u32 {
+        self.sq_mask + 1
+    }
+
+    /// Returns the number of SQ slots available for new submissions.
+    #[must_use]
+    pub fn sq_space_left(&self) -> u32 {
+        let head = unsafe { &*self.sq_head }.load(Ordering::Acquire);
+        self.sq_capacity() - self.sq_tail_local.wrapping_sub(head)
+    }
+
     /// Submit all queued entries to the kernel.
     ///
     /// # Errors
@@ -455,6 +474,18 @@ impl Drop for Submitter {
 }
 
 impl Completer {
+    /// Returns the ring's file descriptor.
+    #[must_use]
+    pub const fn raw_fd(&self) -> RawFd {
+        self.fd
+    }
+
+    /// Returns the total number of CQ slots (always a power of two).
+    #[must_use]
+    pub const fn cq_capacity(&self) -> u32 {
+        self.cq_mask + 1
+    }
+
     /// Reap one completion from the completion queue, if available.
     #[inline]
     #[must_use]
@@ -717,6 +748,31 @@ impl IoUring {
     #[must_use]
     pub const fn features(&self) -> Features {
         self.features
+    }
+
+    /// Returns the ring's file descriptor.
+    #[must_use]
+    pub const fn raw_fd(&self) -> RawFd {
+        self.fd
+    }
+
+    /// Returns the total number of SQ slots (always a power of two).
+    #[must_use]
+    pub const fn sq_capacity(&self) -> u32 {
+        self.sq_mask + 1
+    }
+
+    /// Returns the number of SQ slots available for new submissions.
+    #[must_use]
+    pub fn sq_space_left(&self) -> u32 {
+        let head = unsafe { &*self.sq_head }.load(Ordering::Acquire);
+        self.sq_capacity() - self.sq_tail_local.wrapping_sub(head)
+    }
+
+    /// Returns the total number of CQ slots (always a power of two).
+    #[must_use]
+    pub const fn cq_capacity(&self) -> u32 {
+        self.cq_mask + 1
     }
 
     /// Check if the CQ ring has overflowed.

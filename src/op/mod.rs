@@ -60,6 +60,12 @@ impl Sqe {
         self
     }
 
+    /// Read back the `user_data` field.
+    #[must_use]
+    pub const fn get_user_data(&self) -> u64 {
+        self.0.user_data
+    }
+
     /// Add SQE flags (OR'd with any existing flags).
     #[must_use]
     pub const fn flags(mut self, flags: SqeFlags) -> Self {

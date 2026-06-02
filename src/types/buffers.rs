@@ -70,7 +70,7 @@ pub struct IoUringBuf {
 /// A newtype wrapping `usize` so that file descriptors cannot be accidentally
 /// mixed with arbitrary integers. Construct with [`RawFd::from_raw`]; convert
 /// back with [`RawFd::as_usize`] or [`RawFd::as_i32`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RawFd(usize);
 
 impl RawFd {
@@ -91,6 +91,12 @@ impl RawFd {
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     pub const fn as_i32(self) -> i32 {
         self.0 as i32
+    }
+}
+
+impl core::fmt::Display for RawFd {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
