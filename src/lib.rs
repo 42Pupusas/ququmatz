@@ -22,8 +22,8 @@ pub use inotify::Inotify;
 pub use net::Socket;
 pub use op::Sqe;
 pub use ring::{
-    Completer, Completion, Completions, IoUring, IoUringBuilder, ProvidedBufferRing,
-    SplitCompletions, Submitter,
+    BufferConsumer, Completer, Completion, Completions, IoUring, IoUringBuilder,
+    ProvidedBufferRing, SplitCompletions, Submitter,
 };
 pub use types::{
     AcceptFlags, AddressFamily, CqeFlags, DirFd, EnterFlags, EpollEvent, EpollEvents, EpollOp,

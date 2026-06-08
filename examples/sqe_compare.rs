@@ -11,8 +11,8 @@ fn main() {
         .build()
         .user_data(1);
 
-    let qq_b: &[u8] = unsafe { core::slice::from_raw_parts(&qq as *const _ as *const u8, 64) };
-    let iu_b: &[u8] = unsafe { core::slice::from_raw_parts(&iu as *const _ as *const u8, 64) };
+    let qq_b: &[u8] = unsafe { core::slice::from_raw_parts((&raw const qq).cast::<u8>(), 64) };
+    let iu_b: &[u8] = unsafe { core::slice::from_raw_parts((&raw const iu).cast::<u8>(), 64) };
 
     println!("ququmatz: {qq_b:02x?}");
     println!("io_uring: {iu_b:02x?}");

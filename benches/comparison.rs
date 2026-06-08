@@ -77,7 +77,7 @@ mod sqe_build_read {
 }
 
 mod sqe_build_write {
-    use super::*;
+    use super::RawFd;
 
     static BUF: [u8; 4096] = [0u8; 4096];
 
@@ -101,7 +101,7 @@ mod sqe_build_write {
 }
 
 mod nop_single {
-    use super::*;
+    use super::drain_cq;
 
     #[divan::bench]
     fn ququmatz(bencher: divan::Bencher) {
@@ -130,7 +130,7 @@ mod nop_single {
 }
 
 mod nop_batch_32 {
-    use super::*;
+    use super::drain_cq;
 
     #[divan::bench]
     fn ququmatz(bencher: divan::Bencher) {
@@ -163,7 +163,7 @@ mod nop_batch_32 {
 }
 
 mod nop_batch_128 {
-    use super::*;
+    use super::drain_cq;
 
     #[divan::bench]
     fn ququmatz(bencher: divan::Bencher) {
@@ -196,7 +196,7 @@ mod nop_batch_128 {
 }
 
 mod write_4k {
-    use super::*;
+    use super::{RawFd, drain_cq, open_tmpfile};
 
     static WRITE_BUF: [u8; 4096] = [0xABu8; 4096];
 
@@ -267,7 +267,7 @@ mod write_4k {
 }
 
 mod read_4k {
-    use super::*;
+    use super::{RawFd, drain_cq, open_tmpfile};
 
     static SEED_BUF: [u8; 4096] = [0xCDu8; 4096];
 
@@ -345,7 +345,7 @@ mod read_4k {
 }
 
 mod writev_2x2k {
-    use super::*;
+    use super::{RawFd, drain_cq, open_tmpfile};
 
     #[divan::bench]
     fn ququmatz(bencher: divan::Bencher) {
@@ -397,7 +397,7 @@ mod writev_2x2k {
 }
 
 mod linked_nops_3 {
-    use super::*;
+    use super::drain_cq;
 
     #[divan::bench]
     fn ququmatz(bencher: divan::Bencher) {

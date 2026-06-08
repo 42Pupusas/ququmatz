@@ -1,7 +1,7 @@
 //! Heap-allocation comparison: ququmatz vs io-uring crate.
 //!
 //! Run with:
-//!   cargo run --example dhat_comparison --features dhat-heap
+//!   cargo run --example `dhat_comparison` --features dhat-heap
 //!
 //! Each section profiles one logical operation through both libraries and
 //! prints a side-by-side table of dhat's heap stats.

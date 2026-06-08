@@ -777,6 +777,46 @@ fn setup_tcp_listener() -> (i32, u16) {
     (fd, u16::from_be(bound_addr.sin_port))
 }
 
+/// Drive an accept+connect handshake on `ring` and return the accepted server
+/// fd. `listener`/`client` are raw fds; `port` is the listener's bound port.
+#[cfg(not(miri))]
+fn tcp_handshake(ring: &mut IoUring, listener: i32, client: i32, port: u16) -> i32 {
+    ring.push(Sqe::accept(RawFd::from_raw(listener as usize), AcceptFlags::default()).user_data(1))
+        .expect("push accept");
+    let connect_addr = SockAddrIn {
+        sin_family: types::AF_INET as u16,
+        sin_port: port.to_be(),
+        sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+        sin_zero: [0; 8],
+    };
+    let addr_bytes: &[u8] = unsafe {
+        core::slice::from_raw_parts(
+            (&raw const connect_addr).cast(),
+            core::mem::size_of::<SockAddrIn>(),
+        )
+    };
+    ring.push(Sqe::connect(RawFd::from_raw(client as usize), addr_bytes).user_data(2))
+        .expect("push connect");
+    ring.submit_and_wait(2).expect("submit handshake");
+
+    let mut server_fd = -1i32;
+    for _ in 0..2 {
+        let cqe = ring.complete().expect("handshake cqe");
+        if cqe.user_data == 1 {
+            assert!(cqe.result >= 0, "accept failed: {}", cqe.result);
+            server_fd = cqe.result;
+        } else {
+            assert!(
+                cqe.result == 0 || cqe.result == -115,
+                "connect failed: {}",
+                cqe.result
+            );
+        }
+    }
+    assert!(server_fd >= 0, "never got accept completion");
+    server_fd
+}
+
 #[cfg(not(miri))]
 #[test]
 fn tcp_send_recv_roundtrip() {
@@ -1063,6 +1103,120 @@ fn provided_buffer_ring_recv() {
         }
     }
     assert!(got_send && got_recv);
+
+    let _ = syscall::close(RawFd::from_raw(server_fd as usize));
+    let _ = syscall::close(RawFd::from_raw(client as usize));
+    let _ = syscall::close(RawFd::from_raw(listener as usize));
+}
+
+/// Two-thread mirror of [`provided_buffer_ring_recv`]: register the pool from
+/// the `Submitter` after `split()`, hand its `BufferConsumer` to a separate
+/// completion thread, and recv several messages so the kernel recycles buffer
+/// ids fed back across the thread boundary.
+///
+/// Exercises the split-concurrency path: `Submitter::register_provided_buffers`,
+/// `ProvidedBufferRing::split`, and `BufferConsumer` (read + recycle) on a
+/// thread distinct from the one that submits.
+#[cfg(not(miri))]
+#[test]
+fn provided_buffer_ring_recv_split_threads() {
+    extern crate std;
+    use std::sync::mpsc;
+    use std::thread;
+
+    const BGID: u16 = 3;
+    const POOL_ENTRIES: u32 = 4;
+    const BUF_SIZE: u32 = 64;
+    const MESSAGES: usize = 8; // > pool size, so ids must recycle
+    const RECV_UD: u64 = 100;
+
+    let mut ring = IoUring::new(8).expect("setup");
+    let (listener, port) = setup_tcp_listener();
+
+    let client = syscall::socket(types::AF_INET, types::SOCK_STREAM | types::SOCK_NONBLOCK, 0)
+        .expect("client socket")
+        .as_i32();
+
+    // --- Connection handshake on the un-split ring (setup is serial) ---------
+    let server_fd = tcp_handshake(&mut ring, listener, client, port);
+
+    // --- Split, then register the pool through the Submitter -----------------
+    let (mut submitter, mut completer) = ring.split();
+    let pool = submitter
+        .register_provided_buffers(BGID, POOL_ENTRIES, BUF_SIZE)
+        .expect("register provided buffers via Submitter");
+    assert_eq!(pool.bgid(), BGID);
+    let mut consumer = pool.split(); // Send → moves to the completion thread
+
+    // --- Completion thread: read each recv'd buffer, verify, recycle ---------
+    let (got_tx, got_rx) = mpsc::channel::<(usize, std::vec::Vec<u8>)>();
+    let complete = thread::spawn(move || {
+        let mut received = 0usize;
+        while received < MESSAGES {
+            completer.wait(1).expect("wait");
+            for cqe in completer.completions() {
+                if cqe.user_data != RECV_UD {
+                    continue;
+                }
+                assert!(!cqe.is_err(), "recv failed: errno {}", -cqe.result);
+                let buf_id = cqe.buffer_id().expect("buffer_id present");
+                #[allow(clippy::cast_sign_loss)]
+                let len = cqe.result as u32;
+                let payload = consumer.buffer(buf_id, len).expect("buffer slice");
+                got_tx
+                    .send((received, payload.to_vec()))
+                    .expect("main alive");
+                consumer.recycle_and_commit(buf_id);
+                received += 1;
+            }
+        }
+        completer
+    });
+
+    // --- Submit thread: one single-shot recv per message ---------------------
+    // Single-shot (not multishot) keeps the test deterministic: each recv
+    // consumes exactly one pool buffer, and we only arm the next after the
+    // previous completion has recycled, so the 4-buffer pool serves all 8.
+    let (send_next_tx, send_next_rx) = mpsc::channel::<()>();
+    let submit = thread::spawn(move || {
+        for _ in 0..MESSAGES {
+            // Wait until the driver has written a message to recv.
+            send_next_rx.recv().expect("driver alive");
+            let recv_sqe = unsafe {
+                Sqe::recv_ptr(
+                    RawFd::from_raw(server_fd as usize),
+                    core::ptr::null_mut(),
+                    0,
+                    MsgFlags::default(),
+                )
+            }
+            .buffer_select(BGID)
+            .user_data(RECV_UD);
+            submitter.push(recv_sqe).expect("push recv");
+            submitter.submit().expect("submit recv");
+        }
+        submitter
+    });
+
+    // --- Driver: write one message, let the recv fire, collect, repeat -------
+    for i in 0..MESSAGES {
+        let msg = std::format!("msg-{i:02}");
+        send_next_tx.send(()).expect("submit thread alive");
+        // Small settle so the recv SQE is armed before/around the write; the
+        // recv is robust to ordering either way (data is buffered in the socket).
+        let n = syscall::write(RawFd::from_raw(client as usize), msg.as_ptr(), msg.len())
+            .expect("write");
+        assert_eq!(n, msg.len());
+
+        let (idx, payload) = got_rx
+            .recv_timeout(core::time::Duration::from_secs(5))
+            .expect("completion within timeout");
+        assert_eq!(idx, i, "completions arrive in order");
+        assert_eq!(payload, msg.as_bytes(), "payload mismatch at message {i}");
+    }
+
+    let _submitter = submit.join().expect("submit thread");
+    let _completer = complete.join().expect("complete thread");
 
     let _ = syscall::close(RawFd::from_raw(server_fd as usize));
     let _ = syscall::close(RawFd::from_raw(client as usize));

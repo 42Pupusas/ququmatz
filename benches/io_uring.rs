@@ -24,7 +24,7 @@ fn ring_setup_teardown() {
 }
 
 mod sqe_build {
-    use super::*;
+    use super::{RawFd, Sqe};
 
     #[divan::bench]
     fn nop() {
@@ -59,7 +59,7 @@ fn nop_push_submit_complete(bencher: divan::Bencher) {
 }
 
 mod nop_batch {
-    use super::*;
+    use super::{IoUring, Sqe};
 
     #[divan::bench]
     fn batch_32(bencher: divan::Bencher) {

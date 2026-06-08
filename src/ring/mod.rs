@@ -21,7 +21,7 @@ mod pbuf;
 mod register;
 
 pub use builder::IoUringBuilder;
-pub use pbuf::ProvidedBufferRing;
+pub use pbuf::{BufferConsumer, ProvidedBufferRing};
 
 // ---------------------------------------------------------------------------
 // Shared ring resources — refcounted without alloc
@@ -568,6 +568,20 @@ impl Iterator for SplitCompletions<'_> {
 // Private helpers extracted from IoUring::from_params to keep it short.
 // ---------------------------------------------------------------------------
 
+/// Compute the byte size of a ring region: a base `offset` (the kernel's
+/// position of the trailing array within the ring) plus `count` elements of
+/// `elem_size` bytes.
+///
+/// This is the one audited place where the kernel's `u32` ABI fields are
+/// widened to `usize` for size arithmetic. The widening is always lossless:
+/// `u32` fits in `usize` on every supported target (`usize` is 32 bits on
+/// `arm`, 64 on the rest), so a plain `as usize` cannot truncate. Centralizing
+/// it here keeps the size formulas free of inline casts.
+#[allow(clippy::cast_possible_truncation)]
+const fn ring_bytes(offset: u32, count: u32, elem_size: usize) -> usize {
+    offset as usize + count as usize * elem_size
+}
+
 /// Map the SQ ring, CQ ring, and SQE array for a freshly set-up ring fd.
 ///
 /// Returns `(sq_ring_ptr, mmap_sz, cq_ring_ptr, cq_ring_region, sqes_ptr, sqes_sz)`.
@@ -582,10 +596,16 @@ fn map_rings(
     let prot = Prot::READ | Prot::WRITE;
     let map = MapFlags::SHARED | MapFlags::POPULATE;
 
-    let sq_ring_sz =
-        params.sq_off.array as usize + params.sq_entries as usize * core::mem::size_of::<u32>();
-    let cq_ring_sz = params.cq_off.cqes as usize
-        + params.cq_entries as usize * core::mem::size_of::<IoUringCqe>();
+    let sq_ring_sz = ring_bytes(
+        params.sq_off.array,
+        params.sq_entries,
+        core::mem::size_of::<u32>(),
+    );
+    let cq_ring_sz = ring_bytes(
+        params.cq_off.cqes,
+        params.cq_entries,
+        core::mem::size_of::<IoUringCqe>(),
+    );
 
     let single_mmap = features.contains(Features::SINGLE_MMAP);
     let mmap_sz = if single_mmap {
@@ -619,7 +639,7 @@ fn map_rings(
         (ptr, MappedRegion::new(ptr, cq_ring_sz))
     };
 
-    let sqes_sz = params.sq_entries as usize * core::mem::size_of::<IoUringSqe>();
+    let sqes_sz = ring_bytes(0, params.sq_entries, core::mem::size_of::<IoUringSqe>());
     let sqes_ptr = syscall::mmap(
         0,
         sqes_sz,
