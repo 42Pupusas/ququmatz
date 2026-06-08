@@ -5,8 +5,8 @@ use super::*;
 use crate::types::{
     AcceptFlags, EventFdFlags, FileMode, FsyncFlags, InotifyEvent, InotifyInitFlags,
     IoCqringOffsets, IoSqringOffsets, IoUringBuf, IoUringBufReg, IoUringCqe, IoUringParams,
-    IoUringSqe, MsgFlags, MsgHdr, Opcode, OpenFlags, PollMask, SockAddrIn, SqeFlags, Statx,
-    StatxFlags, StatxMask, StatxTimestamp, WatchMask,
+    IoUringSqe, MsgFlags, MsgHdr, Opcode, OpenFlags, PollMask, RecvmsgOut, SockAddrIn, SqeFlags,
+    Statx, StatxFlags, StatxMask, StatxTimestamp, WatchMask,
 };
 use core::mem;
 
@@ -49,6 +49,133 @@ fn msghdr_layout() {
 fn sockaddrin_layout() {
     assert_eq!(mem::size_of::<SockAddrIn>(), 16);
     assert_eq!(mem::align_of::<SockAddrIn>(), 4);
+}
+
+#[test]
+fn recvmsg_out_layout() {
+    // Mirrors the kernel `struct io_uring_recvmsg_out`: four packed u32s.
+    assert_eq!(mem::size_of::<RecvmsgOut>(), 16);
+    assert_eq!(mem::align_of::<RecvmsgOut>(), 4);
+    assert_eq!(RecvmsgOut::SIZE, 16);
+}
+
+/// Build a synthetic multishot-recvmsg buffer exactly as the kernel lays it
+/// out: `[recvmsg_out header][name padded to name_reserved][control padded to
+/// ctrl_reserved][payload]`. Header fields report the *would-have-been* lengths.
+fn make_recvmsg_buf(
+    name_reserved: usize,
+    ctrl_reserved: usize,
+    hdr_namelen: u32,
+    hdr_controllen: u32,
+    name: &[u8],
+    control: &[u8],
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    // header: namelen, controllen, payloadlen, flags (all LE u32)
+    buf.extend_from_slice(&hdr_namelen.to_le_bytes());
+    buf.extend_from_slice(&hdr_controllen.to_le_bytes());
+    buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes()); // flags
+    // name region, fixed width = name_reserved
+    let mut name_region = vec![0u8; name_reserved];
+    name_region[..name.len()].copy_from_slice(name);
+    buf.extend_from_slice(&name_region);
+    // control region, fixed width = ctrl_reserved
+    let mut ctrl_region = vec![0u8; ctrl_reserved];
+    ctrl_region[..control.len()].copy_from_slice(control);
+    buf.extend_from_slice(&ctrl_region);
+    // payload (the remainder)
+    buf.extend_from_slice(payload);
+    buf
+}
+
+#[test]
+fn recvmsg_out_parse_splits_name_control_payload() {
+    const NAME_RES: usize = 16; // e.g. sizeof(sockaddr_in)
+    const CTRL_RES: usize = 24;
+    let name = [0x11u8; 16];
+    let control = [0x22u8; 10];
+    let payload = b"hello multishot recvmsg";
+
+    let buf = make_recvmsg_buf(
+        NAME_RES,
+        CTRL_RES,
+        name.len() as u32,
+        control.len() as u32,
+        &name,
+        &control,
+        payload,
+    );
+
+    let parts = RecvmsgOut::parse(&buf, NAME_RES as u32, CTRL_RES as u32).expect("buffer is valid");
+
+    assert_eq!(parts.header.namelen, name.len() as u32);
+    assert_eq!(parts.header.controllen, control.len() as u32);
+    assert_eq!(parts.header.payloadlen, payload.len() as u32);
+    assert_eq!(parts.name, &name);
+    assert_eq!(parts.control, &control[..]);
+    assert_eq!(parts.payload, payload);
+}
+
+#[test]
+fn recvmsg_out_parse_caps_truncated_name_at_reserved() {
+    // Peer address larger than what we reserved: header reports the full
+    // would-have-been namelen, but only `msg_namelen` bytes exist in the
+    // buffer. We must cap the readable name at the reserved width.
+    const NAME_RES: usize = 8; // smaller than the real address
+    const CTRL_RES: usize = 0;
+    let name_in_buf = [0xABu8; 8]; // only 8 bytes physically present
+    let payload = b"payload";
+
+    let buf = make_recvmsg_buf(
+        NAME_RES,
+        CTRL_RES,
+        128, // header claims a 128-byte address (truncated)
+        0,
+        &name_in_buf,
+        &[],
+        payload,
+    );
+
+    let parts = RecvmsgOut::parse(&buf, NAME_RES as u32, CTRL_RES as u32).expect("valid");
+    // Header preserves the kernel-reported (truncated) length...
+    assert_eq!(parts.header.namelen, 128);
+    // ...but the readable slice is capped at the reserved width.
+    assert_eq!(parts.name.len(), NAME_RES);
+    assert_eq!(parts.name, &name_in_buf);
+    assert!(parts.control.is_empty());
+    assert_eq!(parts.payload, payload);
+}
+
+#[test]
+fn recvmsg_out_parse_rejects_buffer_too_small() {
+    // Buffer shorter than header + reserved name + reserved control => the
+    // kernel truncated internally; parse must return None (like
+    // io_uring_recvmsg_validate returning NULL).
+    const NAME_RES: u32 = 16;
+    const CTRL_RES: u32 = 16;
+    // 16 (header) + 16 + 16 = 48 required; give it 40.
+    let buf = vec![0u8; 40];
+    assert!(RecvmsgOut::parse(&buf, NAME_RES, CTRL_RES).is_none());
+
+    // Exactly the fixed size (no payload) is still valid: empty payload.
+    let buf_exact = vec![0u8; 48];
+    let parts = RecvmsgOut::parse(&buf_exact, NAME_RES, CTRL_RES).expect("exact fit is valid");
+    assert!(parts.payload.is_empty());
+}
+
+#[test]
+fn recvmsg_out_parse_zero_name_and_control() {
+    // The common TCP case: no peer name, no control data. Payload starts
+    // right after the 16-byte header.
+    let payload = b"just bytes";
+    let buf = make_recvmsg_buf(0, 0, 0, 0, &[], &[], payload);
+    let parts = RecvmsgOut::parse(&buf, 0, 0).expect("valid");
+    assert!(parts.name.is_empty());
+    assert!(parts.control.is_empty());
+    assert_eq!(parts.payload, payload);
+    assert_eq!(buf.len(), RecvmsgOut::SIZE + payload.len());
 }
 
 #[test]

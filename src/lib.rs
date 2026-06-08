@@ -29,9 +29,9 @@ pub use types::{
     AcceptFlags, AddressFamily, CqeFlags, DirFd, EnterFlags, EpollEvent, EpollEvents, EpollOp,
     EventFdFlags, FadviseAdvice, FallocateMode, Features, FileMode, FsyncFlags, InotifyEvent,
     InotifyInitFlags, IoUringBuf, IoUringBufReg, IoUringFilesUpdate, IoUringRsrcUpdate, IoVec,
-    MadviseAdvice, MsgFlags, OpenFlags, OpenHow, PollMask, RawFd, RenameFlags, SendRecvFlag,
-    SetupFlags, ShutdownHow, SocketFlags, SocketType, SpliceFlags, SqeFlags, StatxFlags, StatxMask,
-    TimeoutFlags, Timespec, UnlinkFlags, WatchMask,
+    MadviseAdvice, MsgFlags, OpenFlags, OpenHow, PollMask, RawFd, RecvmsgOut, RecvmsgParts,
+    RenameFlags, SendRecvFlag, SetupFlags, ShutdownHow, SocketFlags, SocketType, SpliceFlags,
+    SqeFlags, StatxFlags, StatxMask, TimeoutFlags, Timespec, UnlinkFlags, WatchMask,
 };
 
 #[cfg(test)]

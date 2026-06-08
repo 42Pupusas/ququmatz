@@ -3,7 +3,9 @@
 use super::{IoUring, Submitter};
 use crate::error::{Error, InvalidArgKind, SetupError};
 use crate::syscall;
-use crate::types::{IoUringBuf, IoUringBufReg, MapFlags, Prot, RawFd, RegisterOp};
+use crate::types::{
+    IoUringBuf, IoUringBufReg, MapFlags, Prot, RawFd, RecvmsgOut, RecvmsgParts, RegisterOp,
+};
 
 /// Allocate, mmap, and register a provided-buffer ring against `fd`.
 ///
@@ -271,6 +273,31 @@ impl ProvidedBufferRing {
         }
     }
 
+    /// Parse a buffer delivered by
+    /// [`recvmsg_multishot`](crate::op::Sqe::recvmsg_multishot).
+    ///
+    /// Multishot `recvmsg` prepends a [`RecvmsgOut`] header and fixed-width
+    /// name/control regions ahead of the payload; reading the buffer raw (via
+    /// [`buffer`](Self::buffer)) would return that header in front of the data.
+    /// Pass the chosen `buf_id`, the CQE `result` as `len`, and the
+    /// `msg_namelen` / `msg_controllen` from the submitted `MsgHdr` to get back
+    /// validated name / control / payload slices. See
+    /// [`BufferConsumer::recvmsg_parts`] for the split-side equivalent.
+    ///
+    /// Returns `None` if `buf_id`/`len` are out of range or the buffer is too
+    /// small to be valid.
+    #[must_use]
+    pub fn recvmsg_parts(
+        &self,
+        buf_id: u16,
+        len: u32,
+        msg_namelen: u32,
+        msg_controllen: u32,
+    ) -> Option<RecvmsgParts<'_>> {
+        let buf = self.buffer(buf_id, len)?;
+        RecvmsgOut::parse(buf, msg_namelen, msg_controllen)
+    }
+
     /// Borrow the contents of a completed buffer for the lifetime of the
     /// ring's backing memory (`'ring`) rather than the lifetime of the
     /// borrow of `self` (`'borrow`).
@@ -508,6 +535,34 @@ impl BufferConsumer {
     #[must_use]
     pub fn buffer_mut(&mut self, buf_id: u16, len: u32) -> Option<&mut [u8]> {
         self.inner.buffer_mut(buf_id, len)
+    }
+
+    /// Parse a buffer delivered by
+    /// [`recvmsg_multishot`](crate::op::Sqe::recvmsg_multishot).
+    ///
+    /// Multishot `recvmsg` does **not** write a bare payload like
+    /// [`recv_multishot`](crate::op::Sqe::recv_multishot) does — the kernel
+    /// prepends a [`RecvmsgOut`] header, then the name and control regions,
+    /// then the payload. Reading the buffer as raw bytes (via
+    /// [`buffer`](Self::buffer)) would hand back that header garbage in front of
+    /// the data. Use this instead: pass the chosen `buf_id`, the CQE `result`
+    /// as `len`, and the `msg_namelen` / `msg_controllen` from the [`MsgHdr`]
+    /// you submitted, and get back validated name / control / payload slices.
+    ///
+    /// Returns `None` if `buf_id`/`len` are out of range or the buffer is too
+    /// small to be valid (an internal kernel truncation).
+    ///
+    /// [`MsgHdr`]: crate::types::MsgHdr
+    #[must_use]
+    pub fn recvmsg_parts(
+        &self,
+        buf_id: u16,
+        len: u32,
+        msg_namelen: u32,
+        msg_controllen: u32,
+    ) -> Option<RecvmsgParts<'_>> {
+        let buf = self.inner.buffer(buf_id, len)?;
+        RecvmsgOut::parse(buf, msg_namelen, msg_controllen)
     }
 
     /// Return buffer `buf_id` to the pool *and* publish it to the kernel.

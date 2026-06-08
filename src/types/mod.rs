@@ -114,7 +114,8 @@ pub use mmap::{MapFlags, Prot};
 #[cfg(test)]
 pub(crate) use net::{AF_INET, SOCK_NONBLOCK, SOCK_STREAM};
 pub use net::{
-    AcceptFlags, AddressFamily, MsgFlags, MsgHdr, ShutdownHow, SockAddrIn, SocketFlags, SocketType,
+    AcceptFlags, AddressFamily, MsgFlags, MsgHdr, RecvmsgOut, RecvmsgParts, ShutdownHow,
+    SockAddrIn, SocketFlags, SocketType,
 };
 pub use opcodes::{Opcode, RegisterOp, RingOffset};
 pub use poll::PollMask;
