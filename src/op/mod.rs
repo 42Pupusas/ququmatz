@@ -40,7 +40,7 @@ mod net;
 /// until the io\_uring operation completes. The [`IoUring::do_read`] family
 /// of methods enforces this automatically by borrowing across the full
 /// submit-and-wait cycle.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Sqe(pub(crate) IoUringSqe);
 
 /// Create a zeroed SQE. All fields are integer primitives, so zero-init is
@@ -49,6 +49,24 @@ pub struct Sqe(pub(crate) IoUringSqe);
 pub(crate) const ZEROED: IoUringSqe = unsafe { core::mem::zeroed() };
 
 impl Sqe {
+    /// Consume this builder and return the raw kernel SQE.
+    ///
+    /// Useful for lock-free protocols that write SQEs directly
+    /// into the mmap'd SQE array.
+    #[must_use]
+    pub const fn into_inner(self) -> IoUringSqe {
+        self.0
+    }
+
+    /// Construct an `Sqe` from a raw kernel SQE.
+    ///
+    /// The caller is responsible for ensuring the SQE is valid
+    /// for the intended operation.
+    #[must_use]
+    pub const fn from_raw(sqe: IoUringSqe) -> Self {
+        Self(sqe)
+    }
+
     // -----------------------------------------------------------------
     // SQE modifiers (chainable)
     // -----------------------------------------------------------------

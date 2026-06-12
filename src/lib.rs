@@ -11,7 +11,7 @@ pub mod eventfd;
 pub mod inotify;
 pub mod net;
 pub mod op;
-pub(crate) mod syscall;
+pub mod syscall;
 pub mod types;
 
 mod ring;
@@ -28,10 +28,11 @@ pub use ring::{
 pub use types::{
     AcceptFlags, AddressFamily, CqeFlags, DirFd, EnterFlags, EpollEvent, EpollEvents, EpollOp,
     EventFdFlags, FadviseAdvice, FallocateMode, Features, FileMode, FsyncFlags, InotifyEvent,
-    InotifyInitFlags, IoUringBuf, IoUringBufReg, IoUringFilesUpdate, IoUringRsrcUpdate, IoVec,
-    MadviseAdvice, MsgFlags, OpenFlags, OpenHow, PollMask, RawFd, RecvmsgOut, RecvmsgParts,
-    RenameFlags, SendRecvFlag, SetupFlags, ShutdownHow, SocketFlags, SocketType, SpliceFlags,
-    SqeFlags, StatxFlags, StatxMask, TimeoutFlags, Timespec, UnlinkFlags, WatchMask,
+    InotifyInitFlags, IoUringBuf, IoUringBufReg, IoUringCqe, IoUringFilesUpdate, IoUringParams,
+    IoUringRsrcUpdate, IoUringSqe, IoVec, MadviseAdvice, MsgFlags, OpenFlags, OpenHow, PollMask,
+    RawFd, RecvmsgOut, RecvmsgParts, RenameFlags, SendRecvFlag, SetupFlags, ShutdownHow,
+    SocketFlags, SocketType, SpliceFlags, SqeFlags, StatxFlags, StatxMask, TimeoutFlags,
+    Timespec, UnlinkFlags, WatchMask,
 };
 
 #[cfg(test)]

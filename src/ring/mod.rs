@@ -418,6 +418,44 @@ impl Submitter {
         self.sq_capacity() - self.sq_tail_local.wrapping_sub(head)
     }
 
+    // ── Raw pointer accessors ──────────────────────────────────────
+
+    /// Returns a raw pointer to the SQE array in the mmap'd region.
+    #[must_use]
+    pub const fn sqe_array_ptr(&self) -> *const IoUringSqe {
+        self.sqes
+    }
+
+    /// Returns a mutable raw pointer to the SQE array.
+    #[must_use]
+    pub fn sqe_array_ptr_mut(&self) -> *mut IoUringSqe {
+        self.sqes
+    }
+
+    /// Returns a raw pointer to the kernel-shared SQ head atomic.
+    #[must_use]
+    pub const fn sq_head_ptr(&self) -> *const AtomicU32 {
+        self.sq_head
+    }
+
+    /// Returns a raw pointer to the kernel-shared SQ tail atomic.
+    #[must_use]
+    pub const fn sq_tail_ptr(&self) -> *const AtomicU32 {
+        self.sq_tail
+    }
+
+    /// Returns the SQ ring mask.
+    #[must_use]
+    pub const fn sq_mask(&self) -> u32 {
+        self.sq_mask
+    }
+
+    /// Returns a raw pointer to the SQ flags atomic.
+    #[must_use]
+    pub const fn sq_flags_ptr(&self) -> *const AtomicU32 {
+        self.sq_flags
+    }
+
     /// Submit all queued entries to the kernel.
     ///
     /// # Errors
@@ -484,6 +522,38 @@ impl Completer {
     #[must_use]
     pub const fn cq_capacity(&self) -> u32 {
         self.cq_mask + 1
+    }
+
+    // ── Raw pointer accessors ──────────────────────────────────────
+
+    /// Returns a raw pointer to the CQE array in the mmap'd region.
+    ///
+    /// Each entry is 16 bytes. The array has [`cq_capacity`](Self::cq_capacity) entries.
+    #[must_use]
+    pub const fn cqe_array_ptr(&self) -> *const IoUringCqe {
+        self.cqes
+    }
+
+    /// Returns a raw pointer to the kernel-shared CQ head atomic.
+    ///
+    /// Userspace publishes the head to tell the kernel which CQEs have been consumed.
+    #[must_use]
+    pub const fn cq_head_ptr(&self) -> *const AtomicU32 {
+        self.cq_head
+    }
+
+    /// Returns a raw pointer to the kernel-shared CQ tail atomic.
+    ///
+    /// The kernel advances this as it posts completions.
+    #[must_use]
+    pub const fn cq_tail_ptr(&self) -> *const AtomicU32 {
+        self.cq_tail
+    }
+
+    /// Returns the CQ ring mask (`cq_capacity() - 1`).
+    #[must_use]
+    pub const fn cq_mask(&self) -> u32 {
+        self.cq_mask
     }
 
     /// Reap one completion from the completion queue, if available.
@@ -789,6 +859,55 @@ impl IoUring {
         self.sq_capacity() - self.sq_tail_local.wrapping_sub(head)
     }
 
+    // ── Raw pointer accessors ──────────────────────────────────────
+    //
+    // Expose the mmap'd ring memory so external lock-free protocols
+    // (e.g. quetzalcoatl-uring) can operate directly on the kernel-
+    // shared buffers. The pointers are valid for the lifetime of the
+    // ring (guaranteed by the `RingResources` refcount).
+
+    /// Returns a raw pointer to the SQE array in the mmap'd region.
+    ///
+    /// Each entry is 64 bytes. The array has [`sq_capacity`](Self::sq_capacity) entries.
+    #[must_use]
+    pub const fn sqe_array_ptr(&self) -> *const IoUringSqe {
+        self.sqes
+    }
+
+    /// Returns a mutable raw pointer to the SQE array.
+    #[must_use]
+    pub fn sqe_array_ptr_mut(&self) -> *mut IoUringSqe {
+        self.sqes
+    }
+
+    /// Returns a raw pointer to the kernel-shared SQ head atomic.
+    ///
+    /// The kernel advances this as it consumes SQEs.
+    #[must_use]
+    pub const fn sq_head_ptr(&self) -> *const AtomicU32 {
+        self.sq_head
+    }
+
+    /// Returns a raw pointer to the kernel-shared SQ tail atomic.
+    ///
+    /// Userspace publishes the tail to tell the kernel which SQEs are ready.
+    #[must_use]
+    pub const fn sq_tail_ptr(&self) -> *const AtomicU32 {
+        self.sq_tail
+    }
+
+    /// Returns the SQ ring mask (`sq_capacity() - 1`).
+    #[must_use]
+    pub const fn sq_mask(&self) -> u32 {
+        self.sq_mask
+    }
+
+    /// Returns a raw pointer to the SQ flags atomic.
+    #[must_use]
+    pub const fn sq_flags_ptr(&self) -> *const AtomicU32 {
+        self.sq_flags
+    }
+
     /// Returns the total number of CQ slots (always a power of two).
     #[must_use]
     pub const fn cq_capacity(&self) -> u32 {
@@ -805,6 +924,36 @@ impl IoUring {
         const IORING_SQ_CQ_OVERFLOW: u32 = 1 << 1;
         let flags = unsafe { &*self.sq_flags }.load(Ordering::Acquire);
         flags & IORING_SQ_CQ_OVERFLOW != 0
+    }
+
+    /// Returns a raw pointer to the CQE array in the mmap'd region.
+    ///
+    /// Each entry is 16 bytes. The array has [`cq_capacity`](Self::cq_capacity) entries.
+    #[must_use]
+    pub const fn cqe_array_ptr(&self) -> *const IoUringCqe {
+        self.cqes
+    }
+
+    /// Returns a raw pointer to the kernel-shared CQ head atomic.
+    ///
+    /// Userspace publishes the head to tell the kernel which CQEs have been consumed.
+    #[must_use]
+    pub const fn cq_head_ptr(&self) -> *const AtomicU32 {
+        self.cq_head
+    }
+
+    /// Returns a raw pointer to the kernel-shared CQ tail atomic.
+    ///
+    /// The kernel advances this as it posts completions.
+    #[must_use]
+    pub const fn cq_tail_ptr(&self) -> *const AtomicU32 {
+        self.cq_tail
+    }
+
+    /// Returns the CQ ring mask (`cq_capacity() - 1`).
+    #[must_use]
+    pub const fn cq_mask(&self) -> u32 {
+        self.cq_mask
     }
 
     /// Check if the SQPOLL kernel thread needs a wakeup.

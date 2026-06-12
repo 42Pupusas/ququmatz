@@ -68,7 +68,7 @@ bitflags! {
 
 impl CqeFlags {
     /// Construct from the raw value in the CQE.
-    pub(crate) const fn from_raw(raw: u32) -> Self {
+    pub const fn from_raw(raw: u32) -> Self {
         Self(raw)
     }
 }
