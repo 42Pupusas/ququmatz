@@ -9,7 +9,9 @@
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
-    clippy::cast_sign_loss
+    clippy::cast_sign_loss,
+    clippy::too_many_lines,
+    dead_code
 )]
 
 #[cfg(feature = "dhat-heap")]
@@ -82,7 +84,7 @@ fn main() {
 #[cfg(feature = "dhat-heap")]
 fn main() {
     println!("{:-<90}", "");
-    println!("{:<30}  {:<42}  {}", "operation", "ququmatz", "io-uring");
+    println!("{:<30}  {:<42}  io-uring", "operation", "ququmatz");
     println!("{:-<90}", "");
 
     // ── 1. Ring setup / teardown ──────────────────────────────────────────────

@@ -31,8 +31,8 @@ pub use types::{
     InotifyInitFlags, IoUringBuf, IoUringBufReg, IoUringCqe, IoUringFilesUpdate, IoUringParams,
     IoUringRsrcUpdate, IoUringSqe, IoVec, MadviseAdvice, MsgFlags, OpenFlags, OpenHow, PollMask,
     RawFd, RecvmsgOut, RecvmsgParts, RenameFlags, SendRecvFlag, SetupFlags, ShutdownHow,
-    SocketFlags, SocketType, SpliceFlags, SqeFlags, StatxFlags, StatxMask, TimeoutFlags,
-    Timespec, UnlinkFlags, WatchMask,
+    SocketFlags, SocketType, SpliceFlags, SqeFlags, StatxFlags, StatxMask, TimeoutFlags, Timespec,
+    UnlinkFlags, WatchMask,
 };
 
 #[cfg(test)]

@@ -428,7 +428,7 @@ impl Submitter {
 
     /// Returns a mutable raw pointer to the SQE array.
     #[must_use]
-    pub fn sqe_array_ptr_mut(&self) -> *mut IoUringSqe {
+    pub const fn sqe_array_ptr_mut(&self) -> *mut IoUringSqe {
         self.sqes
     }
 
@@ -876,7 +876,7 @@ impl IoUring {
 
     /// Returns a mutable raw pointer to the SQE array.
     #[must_use]
-    pub fn sqe_array_ptr_mut(&self) -> *mut IoUringSqe {
+    pub const fn sqe_array_ptr_mut(&self) -> *mut IoUringSqe {
         self.sqes
     }
 
@@ -1109,6 +1109,14 @@ impl IoUring {
     /// `min_complete > 0` and no completions are forthcoming (e.g., you forgot
     /// to push any SQEs), it will block indefinitely.
     ///
+    /// **Backpressure safety:** When the CQ is more than 3/4 full this method
+    /// first issues a non-blocking `io_uring_enter` (without GETEVENTS) to give
+    /// the kernel a chance to flush its internal CQ overflow list into the now-
+    /// free slots.  Without this, a thread that holds the ring's only reference
+    /// and blocks in GETEVENTS can deadlock: the kernel waits for CQ space, but
+    /// CQ space is only freed by the next `sync_cq` + `io_uring_enter` call on
+    /// the same thread.
+    ///
     /// **SQPOLL note:** In SQPOLL mode the kernel thread consumes SQEs
     /// asynchronously. This method issues a plain `io_uring_enter` which
     /// may not wake a sleeping SQPOLL thread. Use
@@ -1123,6 +1131,23 @@ impl IoUring {
         self.flush_cq_head();
         let to_submit = self.sq_tail_local.wrapping_sub(self.sq_submitted);
         self.flush_sq_tail();
+
+        // Backpressure safety valve: if the CQ is more than 3/4 full,
+        // issue a non-blocking enter first so the kernel can flush its
+        // overflow list into the newly-freed CQ slots before we block.
+        let cq_tail = unsafe { &*self.cq_tail }.load(Ordering::Acquire);
+        let cq_used = cq_tail.wrapping_sub(self.cq_head_local);
+        let cq_cap = self.cq_mask + 1;
+        if cq_used > cq_cap - (cq_cap / 4) {
+            let _ = syscall::io_uring_enter(self.fd, to_submit, 0, EnterFlags::default())?;
+            self.sq_submitted = self.sq_tail_local;
+            // After the non-blocking enter, the kernel has had a
+            // chance to flush the overflow list.  Now wait for the
+            // completions.
+            let ret = syscall::io_uring_enter(self.fd, 0, min_complete, EnterFlags::GETEVENTS)?;
+            return Ok(ret as u32);
+        }
+
         let ret = syscall::io_uring_enter(self.fd, to_submit, min_complete, EnterFlags::GETEVENTS)?;
         self.sq_submitted = self.sq_tail_local;
         Ok(ret as u32)
