@@ -2015,6 +2015,22 @@ fn enter_flags_new_bits() {
 }
 
 #[test]
+fn msg_flags_bits() {
+    use crate::types::MsgFlags;
+    assert_eq!(MsgFlags::DONTWAIT.bits(), 0x40);
+    assert_eq!(MsgFlags::WAITALL.bits(), 0x100);
+    assert_eq!(MsgFlags::NOSIGNAL.bits(), 0x4000);
+    assert_eq!(MsgFlags::CMSG_CLOEXEC.bits(), 1 << 30);
+}
+
+#[test]
+fn msg_flags_combine_without_overlap() {
+    use crate::types::MsgFlags;
+    let combined = MsgFlags::CMSG_CLOEXEC | MsgFlags::DONTWAIT;
+    assert_eq!(combined.bits(), 0x4000_0040);
+}
+
+#[test]
 fn splice_flags_fd_in_fixed() {
     use crate::types::SpliceFlags;
     // High bit of u32

@@ -71,6 +71,13 @@ bitflags! {
     const DONTWAIT = 0x40;
     const NOSIGNAL = 0x4000;
     const WAITALL = 0x100;
+    /// Set close-on-exec on descriptors received through `SCM_RIGHTS`
+    /// (`MSG_CMSG_CLOEXEC`, recvmsg only).
+    ///
+    /// The kernel applies the flag as it installs each descriptor. A later
+    /// `fcntl(F_SETFD)` cannot do the same: between the recvmsg and the
+    /// fcntl, a concurrent fork+exec leaks the descriptor to the child.
+    const CMSG_CLOEXEC = 0x4000_0000;
 }
 
 bitflags! {
