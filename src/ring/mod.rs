@@ -1009,22 +1009,23 @@ impl IoUring {
             // SAFETY: cq_ring_ptr points to a valid mmap of at least cq_ring_sz bytes.
             unsafe { parse_cq(cq_ring_ptr, params) };
 
-        guard.disarm();
-
-        let resources = match RingResources::alloc(
+        // Keep `guard` armed across `RingResources::alloc`: it already
+        // tracks the CQ mapping correctly (set by `map_rings` only in the
+        // non-`SINGLE_MMAP` fallback layout, where the CQ is a separate
+        // mmap from the SQ ring), so an allocation failure here is cleaned
+        // up by `guard`'s own `Drop` rather than by a second, easy-to-miss
+        // manual unwind that would otherwise have to duplicate that same
+        // single-vs-dual-mapping distinction.
+        let resources = RingResources::alloc(
             fd,
             MappedRegion::new(sq_ring_ptr, mmap_sz),
             cq_ring_region,
             MappedRegion::new(sqes_ptr, sqes_sz),
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = syscall::munmap(sqes_ptr, sqes_sz);
-                let _ = syscall::munmap(sq_ring_ptr, mmap_sz);
-                let _ = syscall::close(fd);
-                return Err(e);
-            }
-        };
+        )?;
+
+        // Resources are now owned by the refcounted `RingResources` page;
+        // `guard` must not free them a second time.
+        guard.disarm();
 
         Ok(Self {
             fd,
