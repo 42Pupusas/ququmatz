@@ -37,6 +37,45 @@ bitflags! {
     const NO_SQARRAY = 1 << 16;
 }
 
+impl SetupFlags {
+    /// Flags this crate's setup path actually implements.
+    ///
+    /// `NO_MMAP` requires the caller to pre-allocate and describe the ring
+    /// memory in `sq_off`/`cq_off` before `io_uring_setup` — this crate's
+    /// builder never does that. `NO_SQARRAY` removes the SQ indirection
+    /// array entirely (`sq_off.array` becomes 0), which the mapping and
+    /// parsing code does not special-case: it always maps a conventional
+    /// array-based ring and writes an identity `sq_array`. Any other
+    /// currently-unnamed bit is equally unimplemented by definition.
+    ///
+    /// [`IoUring::from_params`](crate::ring::IoUring) rejects flags outside
+    /// this mask before the setup syscall runs, so an accepted `IoUring`
+    /// never has a layout its mapping code cannot handle.
+    pub(crate) const SUPPORTED_MASK: Self = Self(
+        Self::SQPOLL.0
+            | Self::SQ_AFF.0
+            | Self::CQSIZE.0
+            | Self::CLAMP.0
+            | Self::ATTACH_WQ.0
+            | Self::COOP_TASKRUN.0
+            | Self::SINGLE_ISSUER.0
+            | Self::DEFER_TASKRUN.0,
+    );
+
+    /// Construct from an arbitrary raw value, including bits with no
+    /// associated named constant.
+    ///
+    /// Test-only: exercises the unsupported-flag rejection path in
+    /// [`IoUring::from_params`](crate::ring::IoUring) against a bit that
+    /// cannot be spelled through the public builder API, since real
+    /// callers only ever OR together named constants.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn from_raw_for_test(bits: u32) -> Self {
+        Self(bits)
+    }
+}
+
 bitflags! {
     /// Feature flags reported by the kernel after `io_uring_setup`.
     pub struct Features(u32);

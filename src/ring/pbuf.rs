@@ -7,6 +7,30 @@ use crate::types::{
     IoUringBuf, IoUringBufReg, MapFlags, Prot, RawFd, RecvmsgOut, RecvmsgParts, RegisterOp,
 };
 
+/// Kernel-enforced limit for `IORING_REGISTER_PBUF_RING`: the ring must be
+/// a power of two up to 32768 (2^15) entries.
+const MAX_PBUF_RING_ENTRIES: u32 = 1 << 15;
+
+/// Compute `count * elem_size` as a `usize`, rejecting overflow rather than
+/// wrapping.
+///
+/// Both inputs are bounded `u32`s (buffer counts and sizes never exceed
+/// that in this crate's API), but the product must fit in `usize` to be a
+/// valid mmap length — which is not guaranteed on a target where `usize`
+/// is narrower than 64 bits. Pure and free of syscalls so it can be unit
+/// tested directly against `u32::MAX`-scale inputs regardless of the host
+/// architecture's actual pointer width.
+///
+/// # Errors
+///
+/// Returns [`InvalidArgKind::BufferRingSizeOverflow`] if the product does
+/// not fit in `usize`.
+fn checked_ring_bytes(count: u32, elem_size: usize) -> Result<usize, InvalidArgKind> {
+    (count as usize)
+        .checked_mul(elem_size)
+        .ok_or(InvalidArgKind::BufferRingSizeOverflow)
+}
+
 /// Allocate, mmap, and register a provided-buffer ring against `fd`.
 ///
 /// Shared by [`IoUring::register_provided_buffers`] and
@@ -29,17 +53,33 @@ fn register_provided_buffers_on(
     if !count.is_power_of_two() {
         return Err(SetupError::InvalidArg(InvalidArgKind::BufferCountNotPowerOfTwo).into());
     }
+    if count > MAX_PBUF_RING_ENTRIES {
+        return Err(SetupError::InvalidArg(InvalidArgKind::BufferCountTooLarge).into());
+    }
 
     let prot = Prot::READ | Prot::WRITE;
     let map = MapFlags::PRIVATE | MapFlags::ANONYMOUS;
 
-    // Ring of `count` entries, each 16 bytes (sizeof IoUringBuf).
-    let ring_bytes = (count as usize) * core::mem::size_of::<IoUringBuf>();
+    // Ring of `count` entries, each 16 bytes (sizeof IoUringBuf). Checked:
+    // on a 32-bit target `count as usize * size_of::<IoUringBuf>()` can
+    // overflow `usize` even though `count` itself passed the u32 checks
+    // above — catch that before it silently wraps into a too-small mmap
+    // request that the ring-entry writes below would then walk past.
+    let ring_bytes = checked_ring_bytes(count, core::mem::size_of::<IoUringBuf>())
+        .map_err(SetupError::InvalidArg)?;
     let ring_addr =
         syscall::mmap(0, ring_bytes, prot, map, usize::MAX, 0).map_err(SetupError::Syscall)?;
 
-    // Backing region for the buffers themselves.
-    let bufs_bytes = (count as usize) * (buf_size as usize);
+    // Backing region for the buffers themselves. Same overflow concern as
+    // `ring_bytes`, and more reachable here since `buf_size` is a
+    // caller-supplied u32 with no upper bound of its own.
+    let bufs_bytes = match checked_ring_bytes(count, buf_size as usize) {
+        Ok(bytes) => bytes,
+        Err(kind) => {
+            let _ = syscall::munmap(ring_addr, ring_bytes);
+            return Err(SetupError::InvalidArg(kind).into());
+        }
+    };
     let bufs_addr = match syscall::mmap(0, bufs_bytes, prot, map, usize::MAX, 0) {
         Ok(a) => a,
         Err(e) => {
@@ -752,5 +792,76 @@ mod buffer_slice_tests {
         b.fill(0xBB);
         assert!(a.iter().all(|&x| x == 0xAA));
         assert!(b.iter().all(|&x| x == 0xBB));
+    }
+}
+
+#[cfg(test)]
+mod checked_ring_bytes_tests {
+    //! Tests for [`checked_ring_bytes`] (Q-09): the overflow guard behind
+    //! the provided-buffer ring's mmap sizing. Exercises the `u32 x usize`
+    //! product directly with `u32::MAX`-scale inputs so the boundary is
+    //! verified without depending on the host's actual pointer width —
+    //! on a 64-bit host `u32 * u32` alone can never overflow `usize`, so a
+    //! test that only drove the real registration path could not reach
+    //! this guard at all.
+    use super::checked_ring_bytes;
+    use crate::error::InvalidArgKind;
+
+    #[test]
+    fn ordinary_sizes_multiply_normally() {
+        assert_eq!(checked_ring_bytes(4, 64), Ok(256));
+        assert_eq!(checked_ring_bytes(0, 64), Ok(0));
+        assert_eq!(checked_ring_bytes(4, 0), Ok(0));
+    }
+
+    #[test]
+    fn fits_exactly_at_usize_boundary_on_a_32_bit_sized_product() {
+        // Simulate the narrowest realistic target: usize::MAX as if it
+        // were 32-bit-sized, by using elem_size values that only barely
+        // fit. `checked_mul` is what actually enforces the boundary on the
+        // host's real usize width; this confirms the exact-fit case does
+        // not spuriously reject.
+        let elem_size = usize::MAX / 4;
+        assert_eq!(checked_ring_bytes(4, elem_size), Ok(elem_size * 4));
+    }
+
+    #[test]
+    fn overflow_is_rejected_not_wrapped() {
+        // Choose an elem_size guaranteed to overflow usize when multiplied
+        // by a count > 1, regardless of host pointer width, by using
+        // usize::MAX itself as the per-element size.
+        let err = checked_ring_bytes(2, usize::MAX).unwrap_err();
+        assert_eq!(err, InvalidArgKind::BufferRingSizeOverflow);
+    }
+
+    #[test]
+    fn u32_max_count_times_small_elem_size_fits_in_64_bit_usize() {
+        // On a 64-bit host this product (~8.6e9) is nowhere near
+        // usize::MAX (~1.8e19), so it must succeed, not be misclassified
+        // as overflow — a checked_mul call is only correct if it also
+        // accepts values that genuinely fit. `try_from` (rather than `as`)
+        // keeps this assertion honest on a hypothetical narrower `usize`
+        // too: if the product didn't fit there either, the conversion
+        // itself would fail loudly instead of silently truncating.
+        let expected = u64::from(u32::MAX) * 2;
+        let Ok(expected) = usize::try_from(expected) else {
+            // Product doesn't fit in this host's usize at all — nothing to
+            // assert; checked_ring_bytes should also report overflow.
+            assert_eq!(
+                checked_ring_bytes(u32::MAX, 2),
+                Err(InvalidArgKind::BufferRingSizeOverflow)
+            );
+            return;
+        };
+        assert_eq!(checked_ring_bytes(u32::MAX, 2), Ok(expected));
+    }
+
+    #[test]
+    fn u32_max_count_times_elem_size_that_overflows_is_rejected() {
+        // Pick an elem_size that forces the product past usize::MAX
+        // regardless of host width, by scaling from usize::MAX itself.
+        let elem_size = usize::MAX / 2;
+        let err = checked_ring_bytes(u32::MAX, elem_size).unwrap_err();
+        assert_eq!(err, InvalidArgKind::BufferRingSizeOverflow);
     }
 }

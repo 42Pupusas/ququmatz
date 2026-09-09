@@ -105,6 +105,12 @@ impl IoUringBuilder {
     }
 
     /// Set raw setup flags directly.
+    ///
+    /// Accepts any bit, including ones this crate's ring mapping/parsing
+    /// code does not implement (e.g. `NO_MMAP`, `NO_SQARRAY`, or an unnamed
+    /// future flag). [`build`](Self::build) rejects those before the setup
+    /// syscall runs, so an unsupported combination surfaces as an error
+    /// here rather than as a corrupted ring later.
     #[must_use]
     pub const fn setup_flags(mut self, flags: SetupFlags) -> Self {
         self.params.flags |= flags.bits();
@@ -115,7 +121,11 @@ impl IoUringBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if the kernel rejects the parameters.
+    /// Returns [`SetupError::InvalidArg`](crate::SetupError::InvalidArg)
+    /// wrapping [`InvalidArgKind::UnsupportedSetupFlags`](crate::InvalidArgKind::UnsupportedSetupFlags)
+    /// if any requested setup flag is not implemented by this crate's ring
+    /// mapping/parsing code, and an error if the kernel rejects the
+    /// parameters.
     pub fn build(mut self) -> Result<IoUring, Error> {
         IoUring::from_params(self.entries, &mut self.params)
     }

@@ -30,8 +30,15 @@ use crate::types::RawFd;
 #[allow(clippy::wildcard_imports)]
 use arch::*;
 
+/// Highest magnitude a kernel error return can have. Linux's raw syscall
+/// ABI convention is that a return value in `-4095..=-1` is `-errno`; any
+/// more negative value (e.g. a high userspace address bit-pattern from
+/// `mmap` on a 32-bit target) is a legitimate result, not an error.
+/// Matches the kernel's own `MAX_ERRNO`.
+const MAX_ERRNO: isize = 4095;
+
 const fn check(ret: isize) -> Result<usize, Errno> {
-    if ret < 0 {
+    if ret < 0 && ret >= -MAX_ERRNO {
         Err(Errno((-ret) as i32))
     } else {
         Ok(ret as usize)
@@ -254,4 +261,57 @@ pub fn inotify_add_watch(fd: RawFd, path: *const u8, mask: u32) -> Result<usize,
 pub fn inotify_rm_watch(fd: RawFd, wd: i32) -> Result<(), Errno> {
     check(unsafe { syscall2(SYS_INOTIFY_RM_WATCH, fd.as_usize(), wd as usize) })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod check_tests {
+    //! Tests for the raw-syscall-return decoding boundary (Q-09). Linux's
+    //! convention is that only `-4095..=-1` denotes `-errno`; a more
+    //! negative `isize` (i.e. one whose high bit is set when read as an
+    //! unsigned pointer-width value) is a legitimate result on some
+    //! syscalls, e.g. a high userspace address returned by `mmap` on a
+    //! 32-bit target. A `check()` that treated every negative value as an
+    //! error would misinterpret such an address as a spurious failure.
+    use super::check;
+
+    #[test]
+    fn positive_return_is_ok() {
+        assert_eq!(check(0), Ok(0));
+        assert_eq!(check(42), Ok(42));
+        assert_eq!(check(isize::MAX), Ok(isize::MAX as usize));
+    }
+
+    #[test]
+    fn small_negative_return_is_decoded_as_errno() {
+        // -EPERM
+        assert_eq!(check(-1).unwrap_err().raw(), 1);
+        // -ENOENT
+        assert_eq!(check(-2).unwrap_err().raw(), 2);
+        // -EINVAL
+        assert_eq!(check(-22).unwrap_err().raw(), 22);
+    }
+
+    #[test]
+    fn boundary_of_error_range_is_still_an_error() {
+        // -4095 is the most negative value the kernel's -errno convention
+        // covers (MAX_ERRNO); it must still decode as an error, not roll
+        // over into "legitimate result".
+        assert_eq!(check(-4095).unwrap_err().raw(), 4095);
+    }
+
+    #[test]
+    fn value_just_past_error_range_is_a_legitimate_result() {
+        // One past MAX_ERRNO in magnitude: no real errno reaches here, so
+        // this must be treated as a successful, large return value.
+        assert_eq!(check(-4096), Ok(-4096isize as usize));
+    }
+
+    #[test]
+    fn high_bit_set_return_is_not_misread_as_an_error() {
+        // A pointer-sized return whose top bit is set (as a userspace
+        // address on a 32-bit target legitimately can be, e.g. from mmap)
+        // must round-trip as Ok, not be misclassified as -errno.
+        let high_address = isize::MIN; // most negative representable isize
+        assert_eq!(check(high_address), Ok(high_address as usize));
+    }
 }

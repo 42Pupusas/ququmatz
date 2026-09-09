@@ -225,7 +225,10 @@ mod write_4k {
     #[divan::bench]
     fn ququmatz_split(bencher: divan::Bencher) {
         let fd = open_tmpfile("/tmp/ququmatz-cmp-write-qq-split");
-        let (mut submitter, mut completer) = ququmatz::IoUring::new(32).expect("setup").split();
+        let (mut submitter, mut completer) = ququmatz::IoUring::new(32)
+            .expect("setup")
+            .split()
+            .unwrap_or_else(|(_, e)| panic!("split: {e}"));
         bencher.bench_local(|| {
             submitter
                 .push(

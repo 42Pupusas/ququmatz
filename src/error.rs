@@ -48,6 +48,31 @@ pub enum InvalidArgKind {
     BufferSizeZero,
     /// A buffer count argument was not a power of two.
     BufferCountNotPowerOfTwo,
+    /// A buffer count argument exceeded the kernel's maximum provided-buffer
+    /// ring size (32768 entries, per `IORING_REGISTER_PBUF_RING`).
+    BufferCountTooLarge,
+    /// `count * size_of::<IoUringBuf>()` or `count * buf_size` overflowed
+    /// `usize` while sizing the provided-buffer ring's backing mmaps.
+    /// Rejected before any allocation is attempted, so this cannot be
+    /// exploited to request a mmap smaller than the caller believes.
+    BufferRingSizeOverflow,
+    /// `IoUringBuilder` was asked for a setup-flag combination this crate's
+    /// ring mapping/parsing code does not implement (e.g. `NO_MMAP`, which
+    /// needs caller-provided ring memory, or `NO_SQARRAY`, which removes
+    /// the SQ indirection array the mapping code assumes). Carries the
+    /// raw unsupported bits for diagnostics.
+    UnsupportedSetupFlags(u32),
+    /// `IoUring::split` was called on a ring whose setup flags restrict
+    /// which OS thread may submit or call `IORING_ENTER_GETEVENTS` to the
+    /// thread that created (or enabled) the ring — `SINGLE_ISSUER` without
+    /// `SQPOLL`, or `DEFER_TASKRUN`. `split` hands out `Send` halves that
+    /// invite moving work to another thread, which this crate cannot
+    /// enforce against, so it refuses to produce them for these
+    /// configurations rather than hand out a promise it cannot keep.
+    /// Carries the raw setup flags that trigger the restriction. Check
+    /// [`IoUring::can_split`](crate::IoUring::can_split) before calling
+    /// `split` if the ring's configuration is not known statically.
+    IncompatibleSplit(u32),
 }
 
 impl fmt::Display for InvalidArgKind {
@@ -56,6 +81,20 @@ impl fmt::Display for InvalidArgKind {
             Self::BufferCountZero => f.write_str("buffer count must be non-zero"),
             Self::BufferSizeZero => f.write_str("buffer size must be non-zero"),
             Self::BufferCountNotPowerOfTwo => f.write_str("buffer count must be a power of two"),
+            Self::BufferCountTooLarge => {
+                f.write_str("buffer count exceeds the kernel's maximum of 32768 entries")
+            }
+            Self::BufferRingSizeOverflow => {
+                f.write_str("buffer count * buffer/entry size overflows usize")
+            }
+            Self::UnsupportedSetupFlags(bits) => write!(
+                f,
+                "setup flags 0x{bits:x} are not supported by this crate's ring mapping code"
+            ),
+            Self::IncompatibleSplit(bits) => write!(
+                f,
+                "setup flags 0x{bits:x} restrict this ring to its creating thread; split() cannot honor that for a Send Submitter/Completer"
+            ),
         }
     }
 }

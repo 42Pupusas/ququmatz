@@ -10,6 +10,56 @@ use crate::types::{
 };
 use core::mem;
 
+/// A private, unpredictable path under the system temp directory for a
+/// single test's exclusive use.
+///
+/// Mixes the process id, a monotonically increasing counter, and the
+/// current time into the name so that concurrent test runs never collide
+/// on the same path, and a pre-planted file or symlink at a *guessed*
+/// path cannot be hit. Callers must still create the path with an
+/// exclusive syscall flag (`O_EXCL` / `O_CREAT_NEW` / plain `mkdir`) —
+/// this type only guarantees the *name* is unpredictable and unique, not
+/// that the create step itself is safe against a pre-existing object.
+/// Best-effort removes the path on drop, including across test panics.
+#[cfg(not(miri))]
+struct UniqueTestPath {
+    path: std::string::String,
+}
+
+#[cfg(not(miri))]
+impl UniqueTestPath {
+    fn new(prefix: &str) -> Self {
+        static COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let nonce = COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        let pid = std::process::id();
+        let dir = std::env::temp_dir();
+        let dir = dir.to_str().expect("temp dir is valid UTF-8");
+        Self {
+            path: std::format!("{dir}/ququmatz_{prefix}_{pid}_{nonce}_{nanos}"),
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.path
+    }
+
+    fn as_cstring(&self) -> std::ffi::CString {
+        std::ffi::CString::new(self.path.clone()).expect("generated path has no interior NUL")
+    }
+}
+
+#[cfg(not(miri))]
+impl Drop for UniqueTestPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 // ---------------------------------------------------------------
 // Layout tests — verify our repr(C) structs match kernel sizes.
 // These run under Miri.
@@ -650,6 +700,58 @@ fn multiple_nops() {
 
 #[cfg(not(miri))]
 #[test]
+fn submit_return_value_tracks_actual_consumption_across_rounds() {
+    // `submit`/`submit_and_wait` must advance their internal `sq_submitted`
+    // bookkeeping by what `io_uring_enter` actually reports consuming, not
+    // by the requested count — Linux permits a short submission. On the
+    // common path (no rejected entries) the kernel consumes everything in
+    // one call, so this cannot exercise a genuine partial-consumption
+    // return from the kernel deterministically without a mockable syscall
+    // backend (see AUDIT.md Q-07). What it does prove: many interleaved
+    // push/submit rounds against a small ring never desynchronize the
+    // `sq_submitted` cursor from reality — every push is submitted exactly
+    // once, nothing is submitted twice, and nothing is silently dropped.
+    // A regression that went back to unconditionally setting
+    // `sq_submitted = sq_tail_local` would still pass this test on a
+    // healthy kernel; it guards the accounting's steady-state correctness,
+    // not the short-submission path itself.
+    let mut ring = IoUring::new(4).expect("setup");
+    let mut next_user_data = 0u64;
+    let mut expected = std::collections::HashSet::new();
+
+    for round in 0..50u64 {
+        let batch = 1 + (round % 3);
+        for _ in 0..batch {
+            ring.push_nop(next_user_data).expect("push");
+            expected.insert(next_user_data);
+            next_user_data += 1;
+        }
+        let submitted = ring.submit_and_wait(batch as u32).expect("submit");
+        assert_eq!(
+            submitted, batch as u32,
+            "round {round}: every pushed entry should be consumed in one \
+             call on a healthy kernel with no queue pressure"
+        );
+        for _ in 0..batch {
+            let cqe = ring.complete().expect("completion");
+            assert!(
+                expected.remove(&cqe.user_data),
+                "round {round}: completion for user_data {} was unexpected or duplicated",
+                cqe.user_data
+            );
+            assert_eq!(cqe.result, 0);
+        }
+    }
+
+    assert!(
+        expected.is_empty(),
+        "leftover user_data values never completed: {expected:?}"
+    );
+    assert!(ring.complete().is_none());
+}
+
+#[cfg(not(miri))]
+#[test]
 fn completions_iterator() {
     let mut ring = IoUring::new(8).expect("failed to create io_uring");
 
@@ -1139,6 +1241,24 @@ fn provided_buffer_ring_register_only() {
 
 #[cfg(not(miri))]
 #[test]
+fn provided_buffer_ring_rejects_count_above_kernel_max() {
+    use crate::error::{Error, InvalidArgKind, SetupError};
+
+    // IORING_REGISTER_PBUF_RING caps ring_entries at 32768 (2^15). A
+    // caller-supplied count above that must be rejected before any mmap or
+    // registration syscall runs, not surfaced as an opaque kernel EINVAL.
+    let mut ring = IoUring::new(4).expect("setup");
+    let Err(err) = ring.register_provided_buffers(1, 1 << 16, 64) else {
+        panic!("count above 32768 must be rejected")
+    };
+    assert_eq!(
+        err,
+        Error::Setup(SetupError::InvalidArg(InvalidArgKind::BufferCountTooLarge))
+    );
+}
+
+#[cfg(not(miri))]
+#[test]
 fn provided_buffer_ring_recv() {
     let mut ring = IoUring::new(8).expect("setup");
     let (listener, port) = setup_tcp_listener();
@@ -1268,7 +1388,7 @@ fn provided_buffer_ring_recv_split_threads() {
     let server_fd = tcp_handshake(&mut ring, listener, client, port);
 
     // --- Split, then register the pool through the Submitter -----------------
-    let (mut submitter, mut completer) = ring.split();
+    let (mut submitter, mut completer) = ring.split().unwrap_or_else(|(_, e)| panic!("split: {e}"));
     let pool = submitter
         .register_provided_buffers(BGID, POOL_ENTRIES, BUF_SIZE)
         .expect("register provided buffers via Submitter");
@@ -1456,16 +1576,17 @@ fn inotify_read_via_io_uring() {
 
     let ino = Inotify::new().expect("inotify_init1");
 
-    // Create a temp directory to watch
-    let pid = std::process::id();
-    let dir = std::format!("/tmp/ququmatz_inotify_test_{pid}");
-    fs::create_dir_all(&dir).expect("mkdir");
+    // Create a private, unpredictably-named temp directory to watch. Plain
+    // `create_dir` (not `create_dir_all`) is exclusive at the leaf: if
+    // anything (including a symlink) already occupies that name, mkdir(2)
+    // fails with EEXIST instead of following it.
+    let target = UniqueTestPath::new("inotify_test");
+    let dir = target.as_str();
+    fs::create_dir(dir).expect("mkdir");
 
-    let watch_path = std::format!("{dir}\0");
-    let watch_cstr =
-        core::ffi::CStr::from_bytes_with_nul(watch_path.as_bytes()).expect("valid cstr");
+    let watch_cstring = target.as_cstring();
     let wd = ino
-        .add_watch(watch_cstr, WatchMask::CREATE)
+        .add_watch(&watch_cstring, WatchMask::CREATE)
         .expect("add_watch");
 
     // Create a file inside the watched dir to trigger an event
@@ -1500,9 +1621,8 @@ fn inotify_read_via_io_uring() {
 
     ino.remove_watch(wd).expect("remove_watch");
 
-    // Cleanup
-    let _ = fs::remove_file(&file_path);
-    let _ = fs::remove_dir(&dir);
+    // `file_path` and the directory itself are removed by `target`'s Drop,
+    // which runs even if an assertion above panics.
 }
 
 // ---------------------------------------------------------------
@@ -2073,6 +2193,183 @@ fn builder_defer_taskrun() {
 
 #[cfg(not(miri))]
 #[test]
+fn builder_rejects_no_mmap_before_syscall() {
+    use crate::error::{Error, InvalidArgKind, SetupError};
+    use crate::types::SetupFlags;
+
+    // NO_MMAP requires the caller to pre-allocate ring memory and describe
+    // it via sq_off/cq_off before the setup syscall — this builder never
+    // does that, and the mapping code assumes conventional kernel mmaps.
+    // Reject it at `build()` rather than handing the kernel a request this
+    // crate cannot follow through on.
+    let Err(err) = IoUring::builder(4).setup_flags(SetupFlags::NO_MMAP).build() else {
+        panic!("NO_MMAP must be rejected before the kernel is asked")
+    };
+    assert_eq!(
+        err,
+        Error::Setup(SetupError::InvalidArg(
+            InvalidArgKind::UnsupportedSetupFlags(SetupFlags::NO_MMAP.bits())
+        ))
+    );
+}
+
+#[cfg(not(miri))]
+#[test]
+fn builder_rejects_no_sqarray_before_syscall() {
+    use crate::error::{Error, InvalidArgKind, SetupError};
+    use crate::types::SetupFlags;
+
+    // NO_SQARRAY zeroes sq_off.array and removes the SQ indirection array;
+    // `parse_sq` always maps and writes an identity array, which would
+    // corrupt shared ring metadata under this mode. Reject it up front.
+    let Err(err) = IoUring::builder(4)
+        .setup_flags(SetupFlags::NO_SQARRAY)
+        .build()
+    else {
+        panic!("NO_SQARRAY must be rejected before the kernel is asked")
+    };
+    assert_eq!(
+        err,
+        Error::Setup(SetupError::InvalidArg(
+            InvalidArgKind::UnsupportedSetupFlags(SetupFlags::NO_SQARRAY.bits())
+        ))
+    );
+}
+
+#[cfg(not(miri))]
+#[test]
+fn builder_rejects_unnamed_setup_flag_bits() {
+    use crate::error::{Error, InvalidArgKind, SetupError};
+    use crate::types::SetupFlags;
+
+    // Safety must not depend on callers only ever constructing named
+    // constants: SetupFlags's Not/BitOr impls let a caller form bits with
+    // no associated constant at all (e.g. a future kernel flag this crate
+    // has not learned about yet). Those must be rejected too.
+    const UNNAMED_BIT: u32 = 1 << 30;
+    assert_eq!(
+        UNNAMED_BIT & SetupFlags::SQPOLL.bits(),
+        0,
+        "test bit must not collide with a real named flag"
+    );
+
+    let flags = SetupFlags::from_raw_for_test(UNNAMED_BIT);
+    let Err(err) = IoUring::builder(4).setup_flags(flags).build() else {
+        panic!("unnamed setup-flag bits must be rejected before the kernel is asked")
+    };
+    assert_eq!(
+        err,
+        Error::Setup(SetupError::InvalidArg(
+            InvalidArgKind::UnsupportedSetupFlags(UNNAMED_BIT)
+        ))
+    );
+}
+
+#[cfg(not(miri))]
+#[test]
+fn builder_accepts_combined_supported_flags() {
+    // Sanity check that the supported-mask gate does not reject legitimate
+    // combinations of implemented flags.
+    let ring = IoUring::builder(4)
+        .clamp()
+        .coop_taskrun()
+        .build()
+        .expect("supported flag combination must build");
+    drop(ring);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn split_rejects_defer_taskrun() {
+    use crate::error::{Error, InvalidArgKind, SetupError};
+    use crate::types::SetupFlags;
+
+    // DEFER_TASKRUN requires every io_uring_enter(GETEVENTS) call to run on
+    // the thread that created (or enabled) the ring. A Completer moved to
+    // another thread would violate that on its very first `wait` or
+    // `submit_and_wait`, so split() must refuse rather than hand out a
+    // Send type that cannot honor its own thread-safety claim.
+    let ring = IoUring::builder(4)
+        .defer_taskrun()
+        .single_issuer()
+        .build()
+        .expect("setup");
+    assert!(
+        !ring.can_split(),
+        "can_split must agree with split's own check"
+    );
+
+    let setup_flags = SetupFlags::DEFER_TASKRUN.bits()
+        | SetupFlags::COOP_TASKRUN.bits()
+        | SetupFlags::SINGLE_ISSUER.bits();
+    let Err((ring, err)) = ring.split() else {
+        panic!("DEFER_TASKRUN ring must not split")
+    };
+    assert_eq!(
+        err,
+        Error::Setup(SetupError::InvalidArg(InvalidArgKind::IncompatibleSplit(
+            setup_flags
+        )))
+    );
+    // The ring must come back usable, not consumed by the failed split.
+    drop(ring);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn split_rejects_single_issuer_without_sqpoll() {
+    use crate::error::{Error, InvalidArgKind, SetupError};
+    use crate::types::SetupFlags;
+
+    // SINGLE_ISSUER without SQPOLL restricts *submission* to one userspace
+    // thread; the kernel fails a competing submitter with -EEXIST. A
+    // Submitter moved to a second thread would hit that on its first push
+    // or submit.
+    let ring = IoUring::builder(4).single_issuer().build().expect("setup");
+    assert!(!ring.can_split());
+
+    let Err((ring, err)) = ring.split() else {
+        panic!("SINGLE_ISSUER without SQPOLL must not split")
+    };
+    assert_eq!(
+        err,
+        Error::Setup(SetupError::InvalidArg(InvalidArgKind::IncompatibleSplit(
+            SetupFlags::SINGLE_ISSUER.bits()
+        )))
+    );
+    drop(ring);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn split_allows_single_issuer_with_sqpoll() {
+    // With SQPOLL, the kernel's own polling thread is the sole submitter
+    // regardless of which userspace thread calls io_uring_enter, so
+    // SINGLE_ISSUER's restriction is satisfied structurally. This
+    // combination must remain splittable.
+    let ring = IoUring::builder(4)
+        .sqpoll(50)
+        .single_issuer()
+        .build()
+        .expect("setup");
+    assert!(ring.can_split());
+
+    let (sub, comp) = ring.split().unwrap_or_else(|(_, e)| panic!("split: {e}"));
+    drop((sub, comp));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn split_allows_default_flags() {
+    // No thread-affinity flags at all: must split, as before this change.
+    let ring = IoUring::new(4).expect("setup");
+    assert!(ring.can_split());
+    let (sub, comp) = ring.split().unwrap_or_else(|(_, e)| panic!("split: {e}"));
+    drop((sub, comp));
+}
+
+#[cfg(not(miri))]
+#[test]
 fn splice_pipe_roundtrip() {
     use crate::types::SpliceFlags;
     // pipe2(2) via /proc/self/fd to avoid direct syscall
@@ -2160,14 +2457,15 @@ fn openat2_basic() {
     use crate::types::{OpenFlags, OpenHow};
     let mut ring = IoUring::new(4).expect("setup");
 
+    let target = UniqueTestPath::new("openat2_test");
+    let path = target.as_cstring();
+
     let how = OpenHow {
-        flags: u64::from(
-            OpenFlags::RDWR.bits() | OpenFlags::CREAT.bits() | OpenFlags::TRUNC.bits(),
-        ),
+        flags: u64::from(OpenFlags::RDWR.bits() | OpenFlags::CREAT.bits() | OpenFlags::EXCL.bits()),
         mode: 0o600,
         resolve: 0,
     };
-    ring.push(Sqe::openat2(types::AT_FDCWD, c"/tmp/ququmatz_openat2_test", &how).user_data(1))
+    ring.push(Sqe::openat2(types::AT_FDCWD, &path, &how).user_data(1))
         .expect("push openat2");
     ring.submit_and_wait(1).expect("submit");
     let cqe = ring.complete().expect("openat2 cqe");
@@ -2178,7 +2476,7 @@ fn openat2_basic() {
     // cleanup
     ring.push(Sqe::unlinkat(
         crate::types::DirFd::Cwd,
-        c"/tmp/ququmatz_openat2_test",
+        &path,
         UnlinkFlags::default(),
     ))
     .expect("push unlinkat");
@@ -2543,7 +2841,7 @@ fn submit_sqpoll_split_roundtrip() {
     // Same SQPOLL path, but through the split Submitter/Completer halves so
     // `Submitter::submit_sqpoll` is exercised (not just `IoUring::`).
     let ring = IoUring::builder(4).sqpoll(100).build().expect("setup");
-    let (mut sub, mut comp) = ring.split();
+    let (mut sub, mut comp) = ring.split().unwrap_or_else(|(_, e)| panic!("split: {e}"));
 
     sub.push_nop(7).expect("push");
     sub.submit_sqpoll().expect("submit_sqpoll");
@@ -2569,6 +2867,59 @@ fn submit_sqpoll_split_roundtrip() {
         core::hint::spin_loop();
     };
     assert_eq!(cqe.user_data, 8);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn split_submit_return_value_tracks_actual_consumption_across_rounds() {
+    // Split-ring counterpart of
+    // `submit_return_value_tracks_actual_consumption_across_rounds`: the
+    // `Submitter`/`Completer` halves run a separate copy of the same
+    // sq_submitted-tracking logic, so a fix applied only to the unsplit
+    // `IoUring` path would leave this one unrepaired. Same scope note
+    // applies — see AUDIT.md Q-07 — this proves round-trip accounting
+    // integrity, not a genuine kernel short-submission.
+    let ring = IoUring::new(4).expect("setup");
+    let (mut sub, mut comp) = ring.split().unwrap_or_else(|(_, e)| panic!("split: {e}"));
+    let mut next_user_data = 0u64;
+    let mut expected = std::collections::HashSet::new();
+
+    for round in 0..50u64 {
+        let batch = 1 + (round % 3);
+        for _ in 0..batch {
+            sub.push_nop(next_user_data).expect("push");
+            expected.insert(next_user_data);
+            next_user_data += 1;
+        }
+        let submitted = sub.submit_and_wait(batch as u32).expect("submit");
+        assert_eq!(
+            submitted, batch as u32,
+            "round {round}: every pushed entry should be consumed in one \
+             call on a healthy kernel with no queue pressure"
+        );
+        for _ in 0..batch {
+            let cqe = comp.complete().expect("completion");
+            assert!(
+                expected.remove(&cqe.user_data),
+                "round {round}: completion for user_data {} was unexpected or duplicated",
+                cqe.user_data
+            );
+            assert_eq!(cqe.result, 0);
+        }
+        // Unlike the unsplit `IoUring::submit_and_wait`, `Submitter` has no
+        // access to the CQ head and so cannot auto-flush it. Publish the
+        // drained head back to the kernel so the CQ ring has free slots for
+        // the next round — without this, the CQ ring fills after a few
+        // rounds and the kernel queues further completions internally
+        // instead of posting them where `complete()` can see them.
+        comp.sync_cq();
+    }
+
+    assert!(
+        expected.is_empty(),
+        "leftover user_data values never completed: {expected:?}"
+    );
+    assert!(comp.complete().is_none());
 }
 
 /// Thin shim over `pipe2(2)` — only used in tests, so we call the

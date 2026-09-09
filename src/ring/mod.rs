@@ -6,12 +6,12 @@
 //! - [`register`] — `register_*` resource registration (non-pbuf)
 //! - [`pbuf`] — provided-buffer ring
 
-use crate::error::{CompletionError, Errno, Error, SubmitError};
+use crate::error::{CompletionError, Errno, Error, InvalidArgKind, SetupError, SubmitError};
 use crate::op::Sqe;
 use crate::syscall;
 use crate::types::{
     CqeFlags, EnterFlags, Features, IoUringCqe, IoUringParams, IoUringSqe, MapFlags, Prot, RawFd,
-    RingOffset,
+    RingOffset, SetupFlags,
 };
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
@@ -236,7 +236,10 @@ impl Drop for SetupGuard {
 ///
 /// To split submission and completion across threads, use
 /// [`split`](Self::split) to obtain a [`Submitter`] and a [`Completer`],
-/// both of which are `Send`.
+/// both of which are `Send`. `split` refuses to run — returning the ring
+/// back unchanged — on setup-flag combinations that restrict submission or
+/// `GETEVENTS` waits to the ring's creating thread; see
+/// [`can_split`](Self::can_split) and [`split`](Self::split) for details.
 ///
 /// # Drop Behavior
 ///
@@ -273,6 +276,12 @@ pub struct IoUring {
 
     // Kernel-reported features
     features: Features,
+
+    /// Raw setup flags this ring was created with. Kept so [`split`](Self::split)
+    /// and [`can_split`](Self::can_split) can check thread-affinity
+    /// restrictions (`SINGLE_ISSUER` without `SQPOLL`, `DEFER_TASKRUN`)
+    /// without needing the caller to remember and re-supply them.
+    setup_flags: u32,
 
     // Shared cleanup resources
     resources: *mut RingResources,
@@ -470,8 +479,13 @@ impl Submitter {
             return Ok(0);
         }
         let ret = syscall::io_uring_enter(self.fd, to_submit, 0, EnterFlags::default())?;
-        self.sq_submitted = self.sq_tail_local;
-        Ok(ret as u32)
+        // The kernel may consume fewer than `to_submit` entries in one
+        // enter() call (Linux permits partial submission). Advance only
+        // by what was actually consumed so the remainder is retried by a
+        // later submit() instead of being silently dropped from tracking.
+        let consumed = ret as u32;
+        self.sq_submitted = self.sq_submitted.wrapping_add(consumed);
+        Ok(consumed)
     }
 
     /// Submit all queued entries and wait for at least `min_complete` completions.
@@ -485,8 +499,10 @@ impl Submitter {
         let to_submit = self.sq_tail_local.wrapping_sub(self.sq_submitted);
         self.flush_sq_tail();
         let ret = syscall::io_uring_enter(self.fd, to_submit, min_complete, EnterFlags::GETEVENTS)?;
-        self.sq_submitted = self.sq_tail_local;
-        Ok(ret as u32)
+        // See `submit`: track actual consumption, not the request size.
+        let consumed = ret as u32;
+        self.sq_submitted = self.sq_submitted.wrapping_add(consumed);
+        Ok(consumed)
     }
 
     /// Submit in SQPOLL mode, waking the kernel thread if necessary.
@@ -969,6 +985,15 @@ impl IoUring {
     }
 
     pub(super) fn from_params(entries: u32, params: &mut IoUringParams) -> Result<Self, Error> {
+        let unsupported = params.flags & !SetupFlags::SUPPORTED_MASK.bits();
+        if unsupported != 0 {
+            return Err(
+                SetupError::InvalidArg(InvalidArgKind::UnsupportedSetupFlags(unsupported)).into(),
+            );
+        }
+
+        let setup_flags = params.flags;
+
         let fd = syscall::io_uring_setup(entries, &raw mut *params)?;
         let mut guard = SetupGuard::new(fd);
 
@@ -1016,6 +1041,7 @@ impl IoUring {
             cqes,
             cq_head_local,
             features,
+            setup_flags,
             resources,
         })
     }
@@ -1071,7 +1097,14 @@ impl IoUring {
 
     /// Submit all queued entries to the kernel.
     ///
-    /// Returns the number of entries submitted.
+    /// Returns the number of entries actually consumed by this call, which
+    /// can be less than the number pushed since the kernel is allowed to
+    /// submit a short batch (e.g. if one entry in the middle errors and the
+    /// ring was not created with `IORING_SETUP_SUBMIT_ALL`). Entries beyond
+    /// the returned count remain queued and are retried by the next call to
+    /// [`submit`](Self::submit) or [`submit_and_wait`](Self::submit_and_wait)
+    /// — they are not lost, but they also do not execute until a later call
+    /// picks them up.
     ///
     /// **SQPOLL note:** In SQPOLL mode the kernel thread consumes SQEs
     /// asynchronously. This method issues a plain `io_uring_enter` which
@@ -1094,14 +1127,21 @@ impl IoUring {
             return Ok(0);
         }
         let ret = syscall::io_uring_enter(self.fd, to_submit, 0, EnterFlags::default())?;
-        self.sq_submitted = self.sq_tail_local;
+        // The kernel may consume fewer than `to_submit` entries in one
+        // enter() call (Linux permits partial submission). Advance only
+        // by what was actually consumed so the remainder is retried by a
+        // later submit() instead of being silently dropped from tracking.
+        let consumed = ret as u32;
+        self.sq_submitted = self.sq_submitted.wrapping_add(consumed);
         self.flush_cq_head();
-        Ok(ret as u32)
+        Ok(consumed)
     }
 
     /// Submit all queued entries and wait for at least `min_complete` completions.
     ///
-    /// Returns the number of entries submitted.
+    /// Returns the number of entries actually consumed across the enter
+    /// call(s) this method makes — see [`submit`](Self::submit) for why that
+    /// can be less than what was pushed, and what happens to the remainder.
     ///
     /// **Important:** Unlike [`submit`](Self::submit), this method always calls
     /// `io_uring_enter` — even when no entries have been pushed — because it
@@ -1139,18 +1179,29 @@ impl IoUring {
         let cq_used = cq_tail.wrapping_sub(self.cq_head_local);
         let cq_cap = self.cq_mask + 1;
         if cq_used > cq_cap - (cq_cap / 4) {
-            let _ = syscall::io_uring_enter(self.fd, to_submit, 0, EnterFlags::default())?;
-            self.sq_submitted = self.sq_tail_local;
+            let first_ret = syscall::io_uring_enter(self.fd, to_submit, 0, EnterFlags::default())?;
+            // Track actual consumption, not the request size — and do not
+            // discard this call's return value: it is real submission
+            // progress and must be reflected in both `sq_submitted` and
+            // the count this method reports back to the caller.
+            let first_consumed = first_ret as u32;
+            self.sq_submitted = self.sq_submitted.wrapping_add(first_consumed);
             // After the non-blocking enter, the kernel has had a
             // chance to flush the overflow list.  Now wait for the
-            // completions.
-            let ret = syscall::io_uring_enter(self.fd, 0, min_complete, EnterFlags::GETEVENTS)?;
-            return Ok(ret as u32);
+            // completions. `to_submit` is 0 here, so this call normally
+            // consumes nothing further, but fold in whatever it reports
+            // rather than assuming that.
+            let second_ret =
+                syscall::io_uring_enter(self.fd, 0, min_complete, EnterFlags::GETEVENTS)?;
+            let second_consumed = second_ret as u32;
+            self.sq_submitted = self.sq_submitted.wrapping_add(second_consumed);
+            return Ok(first_consumed.wrapping_add(second_consumed));
         }
 
         let ret = syscall::io_uring_enter(self.fd, to_submit, min_complete, EnterFlags::GETEVENTS)?;
-        self.sq_submitted = self.sq_tail_local;
-        Ok(ret as u32)
+        let consumed = ret as u32;
+        self.sq_submitted = self.sq_submitted.wrapping_add(consumed);
+        Ok(consumed)
     }
 
     /// Submit queued entries in SQPOLL mode.
@@ -1226,16 +1277,59 @@ impl IoUring {
         Completions { ring: self }
     }
 
+    /// Returns `true` if this ring's setup flags permit [`split`](Self::split).
+    ///
+    /// `split` hands out `Send` `Submitter`/`Completer` halves, inviting the
+    /// caller to move submission and completion to separate OS threads. Two
+    /// setup modes make that unsound to promise:
+    ///
+    /// - `DEFER_TASKRUN` requires every `io_uring_enter(GETEVENTS)` call
+    ///   (which `Completer::wait` and both `submit_and_wait` methods issue)
+    ///   to run on the thread that created or enabled the ring. A `Completer`
+    ///   moved to a different thread would violate that unconditionally.
+    /// - `SINGLE_ISSUER` without `SQPOLL` restricts *submission* to a single
+    ///   userspace thread; the kernel fails competing submitters with
+    ///   `-EEXIST`. With `SQPOLL` this restriction is satisfied by the
+    ///   kernel's own polling thread regardless of which userspace thread
+    ///   calls `io_uring_enter`, so that combination is fine to split.
+    #[must_use]
+    pub const fn can_split(&self) -> bool {
+        !Self::setup_flags_forbid_split(self.setup_flags)
+    }
+
+    /// Shared by `can_split` and `split`'s guard so the rule lives in one place.
+    const fn setup_flags_forbid_split(setup_flags: u32) -> bool {
+        let sqpoll = setup_flags & SetupFlags::SQPOLL.bits() != 0;
+        let single_issuer = setup_flags & SetupFlags::SINGLE_ISSUER.bits() != 0;
+        let defer_taskrun = setup_flags & SetupFlags::DEFER_TASKRUN.bits() != 0;
+        defer_taskrun || (single_issuer && !sqpoll)
+    }
+
     /// Split the ring into a [`Submitter`] and a [`Completer`].
     ///
     /// Both halves are `Send` and can be moved to separate threads. The
     /// underlying kernel resources (fd and mmap regions) are freed only
     /// when **both** halves have been dropped.
     ///
-    /// `self` is consumed — use the returned halves instead of the original
-    /// `IoUring`.
-    #[must_use]
-    pub fn split(self) -> (Submitter, Completer) {
+    /// `self` is consumed on success — use the returned halves instead of
+    /// the original `IoUring`. On rejection `self` is returned back to the
+    /// caller unchanged, so a caller that wants to keep using the ring
+    /// single-threaded after a failed split does not lose it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Setup`](crate::Error::Setup) wrapping
+    /// [`InvalidArgKind::IncompatibleSplit`](crate::InvalidArgKind::IncompatibleSplit)
+    /// if the ring's setup flags restrict submission or completion to the
+    /// creating thread — see [`can_split`](Self::can_split) for exactly
+    /// which combinations that covers.
+    pub fn split(self) -> Result<(Submitter, Completer), (Self, Error)> {
+        if Self::setup_flags_forbid_split(self.setup_flags) {
+            let err =
+                SetupError::InvalidArg(InvalidArgKind::IncompatibleSplit(self.setup_flags)).into();
+            return Err((self, err));
+        }
+
         // Bump refcount: resources starts at 1 (from IoUring), we need 2.
         unsafe { RingResources::retain(self.resources) };
 
@@ -1265,7 +1359,7 @@ impl IoUring {
         // Don't run IoUring's Drop — the two halves now own the resources.
         core::mem::forget(self);
 
-        (submitter, completer)
+        Ok((submitter, completer))
     }
 }
 

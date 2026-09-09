@@ -66,7 +66,7 @@ fn main() {
 
     // --- Ring setup, then split ----------------------------------------------
     let ring = IoUring::new(16).expect("ring setup");
-    let (mut submitter, mut completer) = ring.split();
+    let (mut submitter, mut completer) = ring.split().unwrap_or_else(|(_, e)| panic!("split: {e}"));
 
     // Register the pool *through the Submitter* (the IoUring is already
     // consumed by split()), then hand its consumer half to the completion side.
