@@ -30,6 +30,7 @@ use super::rename::{PendingRename, PreparedRename};
 use super::sendmsg::{PendingSendmsg, PreparedSendmsg, SendTarget};
 use super::slot::SlotTarget;
 use super::statx::{PendingStatx, PreparedStatx};
+use super::timeout::{Count, PendingTimeout, PreparedTimeout};
 use super::vectored::{PendingVectored, PreparedVectored};
 use super::zerocopy::{PendingZc, PreparedZc};
 use super::{
@@ -39,7 +40,7 @@ use super::{
 use crate::op::Sqe;
 use crate::types::{
     CqeFlags, FileMode, IoVec, MsgFlags, MsgHdr, OpenFlags, OpenHow, RawFd, ResolveFlags,
-    SockAddrIn, Statx, StatxFlags, StatxMask,
+    SockAddrIn, Statx, StatxFlags, StatxMask, Timespec,
 };
 
 /// Heap storage standing in for an `MmapBuffer`.
@@ -112,8 +113,8 @@ impl HeapBuffer {
     /// bytes with no live references remaining.
     unsafe fn reclaim_leaked(ptr: *mut u8, len: usize) {
         // SAFETY: the caller guarantees this pointer came from
-        // `with_capacity(len)` and is otherwise unreachable.
-        unsafe { dealloc(ptr, Self::layout_of(len, 1)) };
+        // `with_capacity(len)`, whose alignment is 1, and is unreachable.
+        unsafe { Self::reclaim_aligned(ptr, len, 1) };
     }
 
     /// Free leaked descriptor storage, which has its own alignment.
@@ -123,7 +124,19 @@ impl HeapBuffer {
     /// `ptr` must come from `for_descriptors(len)` and be unreachable.
     unsafe fn reclaim_leaked_descriptors(ptr: *mut u8, len: usize) {
         // SAFETY: as above, with the alignment `for_descriptors` used.
-        unsafe { dealloc(ptr, Self::layout_of(len, align_of::<IoVec>())) };
+        unsafe { Self::reclaim_aligned(ptr, len, align_of::<IoVec>()) };
+    }
+
+    /// Free leaked storage of any alignment.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must come from `with_alignment(len, align)` and have no live
+    /// references remaining.
+    unsafe fn reclaim_aligned(ptr: *mut u8, len: usize, align: usize) {
+        // SAFETY: the caller guarantees the pointer and layout match the
+        // allocation and that nothing else references it.
+        unsafe { dealloc(ptr, Self::layout_of(len, align)) };
     }
 }
 
@@ -351,6 +364,41 @@ impl Lifecycle {
     ) -> (FakeKernel, PendingRecvmsg<B, R, N>) {
         let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
         (FakeKernel::holding(sqe), pending)
+    }
+
+    fn submit_timeout<S: StableBufferMut>(
+        &self,
+        prepared: PreparedTimeout<S>,
+    ) -> (FakeKernel, PendingTimeout<S>) {
+        let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
+        (FakeKernel::holding(sqe), pending)
+    }
+}
+
+impl FakeKernel {
+    /// Read the `Timespec` a timeout publishes at `addr`.
+    ///
+    /// The real kernel copies this during `io_uring_enter` rather than
+    /// while the timer runs, but under SQPOLL that copy happens on the SQ
+    /// thread's own schedule, after the submitting call has returned. So
+    /// the read modelled here is one that can land at any point while only
+    /// a `PendingTimeout` owns the storage — which is what has to stay
+    /// allocated.
+    fn read_timespec(&self) -> Timespec {
+        // `PreparedTimeout` rejected storage that was not aligned for a
+        // `Timespec`, so this address is aligned.
+        #[allow(clippy::cast_ptr_alignment)]
+        let base = self.published_ptr().cast::<Timespec>();
+        // SAFETY: the live `PendingTimeout` owns storage checked for size
+        // and alignment against `Timespec` and written before submission,
+        // and keeps it allocated until redeemed.
+        unsafe { base.read() }
+    }
+
+    /// The completion count the SQE carries, which the kernel reads from
+    /// `off` rather than from the caller's memory.
+    const fn published_count(&self) -> u64 {
+        self.sqe.0.off
     }
 }
 
@@ -2260,6 +2308,114 @@ fn reclaiming_an_unpublished_direct_open_keeps_its_target() {
     assert_eq!(recovered.target(), target);
     assert_eq!(recovered.path().as_bytes(), b"/tmp/again");
     drop(recovered.into_path().into_storage());
+}
+
+/// Storage for one `Timespec`, aligned as the real one requires.
+///
+/// Byte-aligned storage is what Miri rejects and what the system allocator
+/// would hide by handing back aligned addresses anyway.
+fn timespec_store() -> HeapBuffer {
+    HeapBuffer::with_alignment(core::mem::size_of::<Timespec>(), align_of::<Timespec>())
+}
+
+#[test]
+fn the_kernel_reads_a_timeouts_duration_from_storage_the_ticket_owns() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedTimeout::after(
+        Timespec::new(9, 12_345),
+        Count::Completions(4),
+        timespec_store(),
+    )
+    .ok()
+    .expect("aligned storage fits");
+    let (kernel, pending) = cycle.submit_timeout(prepared);
+
+    // The read happens while only the ticket owns the storage, which is
+    // the window SQPOLL makes unbounded.
+    let seen = kernel.read_timespec();
+    assert_eq!(seen.tv_sec(), 9);
+    assert_eq!(seen.tv_nsec(), 12_345);
+    // The count travels in the SQE rather than in caller memory.
+    assert_eq!(kernel.published_count(), 4);
+
+    let receipt = kernel.post_status(cycle.ring, -62);
+    let done = pending.redeem(receipt).ok().expect("receipt matches");
+    assert_eq!(done.expiry(), super::Expiry::Expired);
+    drop(done.into_store());
+}
+
+#[test]
+fn a_timeouts_duration_survives_the_ticket_moving_between_owners() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedTimeout::after(Timespec::new(3, 7), Count::Timer, timespec_store())
+        .ok()
+        .expect("aligned storage fits");
+    let (kernel, pending) = cycle.submit_timeout(prepared);
+
+    // Moving the ticket is the hazard: an inline `Timespec` would relocate
+    // the exact bytes the SQ thread is about to copy.
+    let pending = Box::new(pending);
+    let pending = core::hint::black_box(pending);
+    let pending = *pending;
+
+    let seen = kernel.read_timespec();
+    assert_eq!(seen.tv_sec(), 3);
+    assert_eq!(seen.tv_nsec(), 7);
+
+    let receipt = kernel.post_status(cycle.ring, -62);
+    let done = pending.redeem(receipt).ok().expect("receipt matches");
+    drop(done.into_store());
+}
+
+#[test]
+fn abandoning_a_timeout_leaks_rather_than_freeing_the_duration() {
+    let cycle = Lifecycle::new();
+    let store = timespec_store();
+    let addr = store.stable_ptr();
+    let prepared = PreparedTimeout::after(Timespec::new(1, 2), Count::Timer, store)
+        .ok()
+        .expect("aligned storage fits");
+    let (kernel, pending) = cycle.submit_timeout(prepared);
+
+    // Dropping an in-flight ticket must not free storage the SQ thread may
+    // still be copying from.
+    drop(pending);
+    let seen = kernel.read_timespec();
+    assert_eq!(seen.tv_sec(), 1);
+
+    // SAFETY: the leak above is deliberate; the stand-in kernel has
+    // finished and nothing else references this allocation.
+    unsafe {
+        HeapBuffer::reclaim_aligned(
+            addr.cast_mut(),
+            core::mem::size_of::<Timespec>(),
+            align_of::<Timespec>(),
+        );
+    }
+}
+
+#[test]
+fn reclaiming_an_unpublished_timeout_returns_the_storage_and_its_count() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedTimeout::at(
+        Timespec::new(50, 500),
+        Count::Completions(2),
+        timespec_store(),
+    )
+    .ok()
+    .expect("aligned storage fits");
+    let (_kernel, pending) = cycle.submit_timeout(prepared);
+
+    // SAFETY: this stands in for a rejected push — the SQE was built but
+    // never made visible to any kernel, so the storage is unreferenced.
+    let prepared = unsafe { pending.reclaim_unsubmitted() };
+    // A retry must issue the same request, so the published duration, the
+    // count, and the absolute flag all have to survive.
+    assert_eq!(prepared.published().tv_sec(), 50);
+    assert_eq!(prepared.published().tv_nsec(), 500);
+    assert_eq!(prepared.count(), Count::Completions(2));
+    assert!(prepared.is_absolute());
+    drop(prepared.into_store());
 }
 
 #[test]

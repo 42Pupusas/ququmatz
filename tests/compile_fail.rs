@@ -168,6 +168,20 @@ fn an_in_flight_received_message_hides_what_the_kernel_is_writing() {
     t.compile_fail("tests/ui/a_recvmsg_ticket_must_be_kept.rs");
 }
 
+/// A timeout owns the least of any request here — one `Timespec`, which
+/// the kernel copies during `io_uring_enter` and never reads again. That
+/// almost argues for a borrow, and SQPOLL is why it cannot be one: the
+/// submitting thread never enters the kernel, so no call's return proves
+/// the copy has happened and there is nowhere safe for a borrow to end.
+/// The storage is owned until the completion, and the compiler enforces
+/// the same two rules as everywhere else.
+#[test]
+fn an_in_flight_timeout_hides_the_duration_the_kernel_may_be_copying() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/an_in_flight_timeout_duration_is_unreachable.rs");
+    t.compile_fail("tests/ui/a_timeout_ticket_must_be_kept.rs");
+}
+
 /// An accepted connection is owned rather than borrowed, so the compiler
 /// cannot tie it to a pool the way it does an arrival. What it can do is
 /// refuse to let the result be thrown away unread, which is the failure

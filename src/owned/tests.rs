@@ -3,13 +3,14 @@
 extern crate std;
 
 use super::{
-    Arrival, Completed, Delivery, DirectIncoming, DirectOpenError, DirectSlot, DirectSocketError,
-    Direction, Event, Incoming, MmapBuffer, MsgRegionError, Openat2Error, Openat2Mode, OwnedPath,
-    PathError, PeerWanted, Pending, PendingStatx, PendingZc, Prepared, PreparedAccept,
-    PreparedDirectAccept, PreparedDirectOpen, PreparedDirectSocket, PreparedMultishot,
-    PreparedOpen, PreparedOpenat2, PreparedPathOp, PreparedRecvmsg, PreparedRename,
-    PreparedSendmsg, PreparedStatx, PreparedVectored, PreparedZc, Receipt, RenameMode, RingId,
-    SendTarget, SlotIndex, SlotTarget, StableBuffer, StatxError, VectoredError, ZcCompleted,
+    Arrival, Completed, Count, Delivery, DirectIncoming, DirectOpenError, DirectSlot,
+    DirectSocketError, Direction, Event, Expiry, Incoming, MmapBuffer, MsgRegionError,
+    Openat2Error, Openat2Mode, OwnedPath, PathError, PeerWanted, Pending, PendingStatx, PendingZc,
+    Prepared, PreparedAccept, PreparedDirectAccept, PreparedDirectOpen, PreparedDirectSocket,
+    PreparedMultishot, PreparedOpen, PreparedOpenat2, PreparedPathOp, PreparedRecvmsg,
+    PreparedRename, PreparedSendmsg, PreparedStatx, PreparedTimeout, PreparedVectored, PreparedZc,
+    Receipt, RenameMode, RingId, SendTarget, SlotIndex, SlotTarget, StableBuffer, StatxError,
+    TimeoutError, VectoredError, ZcCompleted,
 };
 /// Only the kernel-backed tests name a path-op kind or inspect a peer
 /// address, and those are gated.
@@ -19,7 +20,7 @@ use crate::error::{Error, SubmitError};
 use crate::net::Socket;
 use crate::types::{
     AcceptFlags, AddressFamily, DirFd, FileMode, MsgFlags, OpenFlags, RawFd, ResolveFlags,
-    SockAddrIn, SocketFlags, SocketType, Statx, StatxFlags, StatxMask,
+    SockAddrIn, SocketFlags, SocketType, Statx, StatxFlags, StatxMask, Timespec,
 };
 
 /// Static proof that a ticket crosses a thread boundary. The whole design
@@ -4694,4 +4695,331 @@ fn a_recvmsg_ticket_survives_moving_to_another_thread_before_completion() {
         peer.v4().expect("a bound peer").sin_port,
         pair.tx_addr.sin_port
     );
+}
+
+// ---------------------------------------------------------------
+// Timeouts
+// ---------------------------------------------------------------
+
+/// Storage for one `Timespec`, page-aligned like every `MmapBuffer`.
+fn timespec_store() -> MmapBuffer {
+    MmapBuffer::with_capacity(core::mem::size_of::<Timespec>()).expect("map")
+}
+
+#[test]
+fn a_timeout_publishes_its_duration_before_any_sqe_names_it() {
+    let prepared = PreparedTimeout::after(Timespec::new(4, 500), Count::Timer, timespec_store())
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let published = prepared.published();
+    assert_eq!(published.tv_sec(), 4);
+    assert_eq!(published.tv_nsec(), 500);
+    assert_eq!(prepared.count(), Count::Timer);
+    assert!(!prepared.is_absolute());
+}
+
+#[test]
+fn an_absolute_timeout_is_told_apart_from_a_relative_one() {
+    let relative = PreparedTimeout::after(Timespec::new(1, 0), Count::Timer, timespec_store())
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let absolute = PreparedTimeout::at(Timespec::new(1, 0), Count::Timer, timespec_store())
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    assert!(!relative.is_absolute());
+    assert!(absolute.is_absolute());
+}
+
+#[test]
+fn storage_too_small_for_a_timespec_is_rejected_with_it_handed_back() {
+    let store = MmapBuffer::with_capacity(core::mem::size_of::<Timespec>() - 1).expect("map");
+    let addr = store.stable_ptr();
+    let Err((returned, e)) = PreparedTimeout::after(Timespec::new(1, 0), Count::Timer, store)
+    else {
+        panic!("short storage must be refused");
+    };
+    assert_eq!(
+        e,
+        TimeoutError::StoreTooSmall {
+            needed: core::mem::size_of::<Timespec>(),
+            got: core::mem::size_of::<Timespec>() - 1,
+        }
+    );
+    // Rejection costs no allocation: the same mapping comes back.
+    assert_eq!(returned.stable_ptr(), addr);
+}
+
+#[test]
+fn misaligned_timespec_storage_is_rejected_rather_than_written_through() {
+    // Writing a `Timespec` through an unaligned pointer is UB, so this has
+    // to be caught before the duration is published rather than after.
+    // `MmapBuffer` is page-aligned and can never exercise this.
+    let store = MisalignedVecs::with_capacity(core::mem::size_of::<Timespec>() + 8);
+    let Err((_returned, e)) = PreparedTimeout::after(Timespec::new(2, 0), Count::Timer, store)
+    else {
+        panic!("misaligned storage must be refused");
+    };
+    assert_eq!(
+        e,
+        TimeoutError::StoreMisaligned {
+            needed: core::mem::align_of::<Timespec>(),
+        }
+    );
+}
+
+#[test]
+fn every_outcome_is_named_rather_than_read_as_a_plain_result() {
+    // -ETIME is the timer doing exactly what it was asked.
+    assert_eq!(Expiry::from_raw_for_test(-62), Expiry::Expired);
+    assert!(Expiry::from_raw_for_test(-62).is_expired());
+    assert!(Expiry::from_raw_for_test(-62).is_ok());
+    // 0 is the pre-empted case, which a plain result would call success.
+    assert_eq!(Expiry::from_raw_for_test(0), Expiry::CountReached);
+    assert!(!Expiry::from_raw_for_test(0).is_expired());
+    assert_eq!(Expiry::from_raw_for_test(-125), Expiry::Cancelled);
+    assert!(Expiry::from_raw_for_test(-125).is_ok());
+    // A real rejection is the only outcome that is not ok.
+    let failed = Expiry::from_raw_for_test(-22);
+    assert!(!failed.is_ok());
+    assert!(matches!(failed, Expiry::Failed(_)));
+}
+
+#[test]
+fn a_timeout_receipt_for_another_request_is_rejected() {
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut make = || {
+        let prepared =
+            PreparedTimeout::after(Timespec::from_millis(5_000), Count::Timer, timespec_store())
+                .unwrap_or_else(|(_, e)| panic!("{e}"));
+        sub.push_timeout(prepared)
+            .unwrap_or_else(|(_, e)| panic!("{e}"))
+    };
+    let first = make();
+    let second = make();
+
+    let foreign = Receipt {
+        ring: second.ring(),
+        id: second.id(),
+        result: -62,
+        flags: crate::types::CqeFlags::default(),
+    };
+    assert!(!first.matches(&foreign));
+    let Err((first, _)) = first.redeem(foreign) else {
+        panic!("a foreign receipt must not redeem");
+    };
+    drop((first, second));
+}
+
+#[test]
+fn a_timeout_push_that_does_not_fit_hands_the_storage_back() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let mut tickets = alloc_tickets(&mut sub);
+
+    let store = timespec_store();
+    let addr = store.stable_ptr();
+    let prepared = PreparedTimeout::after(Timespec::new(7, 0), Count::Completions(3), store)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let Err((returned, e)) = sub.push_timeout(prepared) else {
+        panic!("a full queue must reject the push");
+    };
+    assert_eq!(e, Error::Submit(SubmitError::QueueFull));
+    // A retry must issue the same request, so the duration has to still be
+    // published in the storage that came back.
+    assert_eq!(returned.published().tv_sec(), 7);
+    assert_eq!(returned.count(), Count::Completions(3));
+    assert_eq!(returned.into_store().stable_ptr(), addr);
+    tickets.clear();
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_timer_reports_expiry_rather_than_an_error() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let prepared =
+        PreparedTimeout::after(Timespec::from_millis(120), Count::Timer, timespec_store())
+            .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_timeout(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let started = std::time::Instant::now();
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    // The kernel's own encoding is negative for the successful case.
+    assert_eq!(done.raw_result(), -62);
+    assert_eq!(done.expiry(), Expiry::Expired);
+    assert!(done.expiry().is_ok());
+    // The staged duration is what the kernel waited for. Without this the
+    // test passes on storage that was never written, since a zero timespec
+    // also reports `-ETIME` — just immediately.
+    assert!(
+        started.elapsed() >= core::time::Duration::from_millis(100),
+        "expired after {:?}, so the staged duration never reached the kernel",
+        started.elapsed()
+    );
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_count_that_is_reached_first_is_not_reported_as_an_expiry() {
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    // Five seconds is far longer than the nop needs, so the count is what
+    // ends this timeout. A test with a short duration would pass whether
+    // or not the count was honoured.
+    let prepared = PreparedTimeout::after(
+        Timespec::from_millis(5_000),
+        Count::Completions(1),
+        timespec_store(),
+    )
+    .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_timeout(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.raw()
+        .push(crate::op::Sqe::nop().user_data(0))
+        .expect("nop");
+    sub.submit_and_wait(2).expect("submit");
+
+    let started = std::time::Instant::now();
+    let mut outcome = None;
+    while outcome.is_none() {
+        if let Some(receipt) = comp.reap()
+            && ticket.matches(&receipt)
+        {
+            outcome = Some(receipt);
+        }
+    }
+    let done = ticket
+        .redeem(outcome.expect("the timeout's own receipt"))
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(done.raw_result(), 0);
+    assert_eq!(done.expiry(), Expiry::CountReached);
+    assert!(!done.expiry().is_expired());
+    // It returned because the nop completed, not because 5s elapsed.
+    assert!(started.elapsed() < core::time::Duration::from_secs(2));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_zero_duration_expires_at_once_rather_than_being_rejected() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let prepared = PreparedTimeout::after(Timespec::new(0, 0), Count::Timer, timespec_store())
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_timeout(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(done.expiry(), Expiry::Expired);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn an_absolute_deadline_in_the_past_expires_rather_than_waiting() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    // One second after the epoch on the monotonic clock is long gone.
+    let prepared = PreparedTimeout::at(Timespec::new(1, 0), Count::Timer, timespec_store())
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_timeout(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let started = std::time::Instant::now();
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(done.expiry(), Expiry::Expired);
+    assert!(started.elapsed() < core::time::Duration::from_secs(1));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_cancelled_timeout_is_told_apart_from_one_that_expired() {
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let prepared = PreparedTimeout::after(
+        Timespec::from_millis(30_000),
+        Count::Timer,
+        timespec_store(),
+    )
+    .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_timeout(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit");
+
+    // Cancellation names the ticket's own key rather than a raw id the
+    // caller tracked separately.
+    sub.raw()
+        .push(crate::op::Sqe::timeout_remove(ticket.cancel_key()).user_data(u64::MAX))
+        .expect("push remove");
+    let started = std::time::Instant::now();
+    sub.submit_and_wait(2).expect("submit");
+
+    let mut mine = None;
+    while mine.is_none() {
+        if let Some(receipt) = comp.reap()
+            && ticket.matches(&receipt)
+        {
+            mine = Some(receipt);
+        }
+    }
+    let done = ticket
+        .redeem(mine.expect("the timeout's own receipt"))
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(done.raw_result(), -125);
+    assert_eq!(done.expiry(), Expiry::Cancelled);
+    // Removed on purpose, so this is not a failure.
+    assert!(done.expiry().is_ok());
+    assert!(!done.expiry().is_expired());
+    // It ended because it was removed, not because 30s elapsed.
+    assert!(started.elapsed() < core::time::Duration::from_secs(5));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_timeout_ticket_survives_moving_to_another_thread_before_completion() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let store = timespec_store();
+    let addr = store.stable_ptr();
+    let prepared = PreparedTimeout::after(Timespec::from_millis(30), Count::Timer, store)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_timeout(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit");
+
+    // The kernel may still be reading the timespec when the ticket moves.
+    let handle = std::thread::spawn(move || {
+        let receipt = comp.wait_one().expect("completion");
+        let done = ticket
+            .redeem(receipt)
+            .unwrap_or_else(|_| panic!("mismatch"));
+        done.into_parts()
+    });
+    let (expiry, store) = handle.join().expect("thread");
+    assert_eq!(expiry, Expiry::Expired);
+    // The storage came back at the same address it was staged at.
+    assert_eq!(store.stable_ptr(), addr);
 }

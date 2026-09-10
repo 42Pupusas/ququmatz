@@ -696,18 +696,41 @@ handing back a plausible-looking address. A *failed* receive writes
 nothing back at all, so the staged values survive and must not be read as
 an outcome.
 
+A timeout adds no new pointer shape — one fixed-size `Timespec` — but it
+is the first request whose *result* cannot be read the usual way. The
+kernel reports `-ETIME` when the timer ran to completion, which is the
+outcome the caller asked for, and `0` when it did not because enough other
+completions arrived first. A `Result` would call the working case an error
+and the pre-empted case a success, so `Expiry` names all four outcomes
+instead; `Cancelled` is separated from `Failed` for the same reason, since
+a removed timeout was removed on purpose.
+
+Its storage rule was decided by measurement rather than by analogy. The
+kernel copies the `Timespec` during `io_uring_enter` and never reads it
+again: a timeout staged at 300ms, submitted, then overwritten with 9000ms
+still fires at 300ms, and two timeouts sharing one slot in a single enter
+both use the value present at enter rather than at push. That is an
+argument for a borrow, and it fails on SQPOLL — `split_owned` accepts a
+polling ring, where the submitting thread never enters the kernel and the
+SQ thread consumed the entry tens of microseconds *after* `submit`
+returned. No call's return proves the copy has happened, so the borrow has
+nowhere safe to end and the storage is owned like everything else.
+
 **Scope limits.** The owned layer now covers read/write, vectored I/O,
 zero-copy send, `sendmsg`, `recvmsg`, multishot recv and accept, `openat`,
 `openat2`, direct open, direct accept, direct socket, `statx`, `renameat`,
-`unlinkat`, and `mkdirat` — every pointer-bearing family the finding's
-acceptance criteria name. `epoll_ctl`, `files_update`, and `timeout` still
+`unlinkat`, `mkdirat`, and `timeout` — every pointer-bearing family the
+finding's acceptance criteria name. `epoll_ctl` and `files_update` still
 go through the `unsafe` `Sqe` surface, which remains for lock-free users;
-all three carry only fixed-size scalar or struct arguments, so none
-introduces a shape the owned layer has not already modelled. Multishot
-`recvmsg`, which prepends an `io_uring_recvmsg_out` to each provided
-buffer, is also still raw. Neither direct accept nor direct socket has
-Miri coverage: neither owns userspace storage, so there is no pointer
-lifetime to model.
+both carry only fixed-size scalar or struct arguments, so neither
+introduces a shape the owned layer has not already modelled. Two things
+are deliberately still raw because they need more than a request type:
+multishot `recvmsg`, which prepends an `io_uring_recvmsg_out` to each
+provided buffer, and linked timeouts, which must be submitted
+*immediately after* the operation they cancel — nothing in a per-request
+`push` API expresses "these two SQEs are adjacent and in this order".
+Neither direct accept nor direct socket has Miri coverage: neither owns
+userspace storage, so there is no pointer lifetime to model.
 
 **Status (original): confirmed.**
 

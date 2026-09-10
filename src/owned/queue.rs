@@ -16,6 +16,7 @@ use super::rename::{PendingRename, PreparedRename};
 use super::request::{Pending, Prepared, Receipt};
 use super::sendmsg::{PendingSendmsg, PreparedSendmsg};
 use super::statx::{PendingStatx, PreparedStatx};
+use super::timeout::{PendingTimeout, PreparedTimeout};
 use super::vectored::{PendingVectored, PreparedVectored};
 use super::zerocopy::{PendingZc, PreparedZc};
 use crate::error::Error;
@@ -422,6 +423,44 @@ impl OwnedSubmitter {
             // either pointer and reclaiming both storages is sound.
             Err(e) => Err((Self::reclaim_statx(pending), e)),
         }
+    }
+
+    /// Queue a timeout, taking ownership of its `Timespec` storage.
+    ///
+    /// The kernel copies the duration during `io_uring_enter` rather than
+    /// re-reading it while the timer runs — but under SQPOLL the
+    /// submitting thread never enters the kernel, so no call's return
+    /// proves the copy has happened. The storage is therefore owned until
+    /// the completion like every other request.
+    ///
+    /// The completion reports [`Expiry`](super::Expiry) rather than a
+    /// `Result`: a timer that ran to completion reports `-ETIME`, which
+    /// the usual reading of a negative result would call a failure.
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact,
+    /// still owning its storage.
+    pub fn push_timeout<S: StableBufferMut>(
+        &mut self,
+        request: PreparedTimeout<S>,
+    ) -> Result<PendingTimeout<S>, (PreparedTimeout<S>, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            // The SQE never became kernel-visible, so the kernel never saw
+            // the timespec pointer and reclaiming the storage is sound.
+            Err(e) => Err((Self::reclaim_timeout(pending), e)),
+        }
+    }
+
+    /// Undo a timeout push that the kernel never observed.
+    fn reclaim_timeout<S: StableBufferMut>(pending: PendingTimeout<S>) -> PreparedTimeout<S> {
+        // SAFETY: only reached when `Submitter::push` reported the queue was
+        // full, which happens before the SQE is written or the tail is
+        // advanced. No kernel-visible pointer to the storage exists.
+        unsafe { pending.reclaim_unsubmitted() }
     }
 
     /// Undo a `statx` push that the kernel never observed.

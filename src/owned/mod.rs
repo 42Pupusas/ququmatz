@@ -263,6 +263,31 @@
 //! the `how_size` the kernel checks is this crate's own `size_of` rather
 //! than a caller parameter.
 //!
+//! # A timeout's result reads backwards
+//!
+//! Every request above treats a negative result as a failure. A timeout
+//! inverts that: the kernel reports `-ETIME` when the timer ran to
+//! completion — the thing that was asked for — and `0` when it did not,
+//! because enough other completions arrived first. A `Result` would call
+//! the working case an error and the pre-empted case a success, so
+//! [`TimeoutCompleted::expiry`] yields [`Expiry`] instead, which names all
+//! four outcomes. [`Count`] names the barrier for the same reason: `0` is
+//! a different kind of request, not a smaller number of one.
+//!
+//! The storage is the interesting part. Measured on a live ring, the
+//! kernel copies the `Timespec` during `io_uring_enter` and never reads it
+//! again — a timeout staged at 300ms, submitted, then overwritten with
+//! 9000ms still fires at 300ms. That almost argues for a borrow. It fails
+//! on SQPOLL: [`split_owned`](crate::IoUring::split_owned) accepts a
+//! polling ring, and there the submitting thread never enters the kernel
+//! at all, so no call's return proves the copy has happened and a borrow
+//! has nowhere safe to end. [`PreparedTimeout`] owns its storage until the
+//! completion like everything else.
+//!
+//! Linked timeouts stay on the [`Sqe`](crate::Sqe) surface: they must be
+//! submitted *immediately after* the operation they cancel, and nothing
+//! here expresses "these two SQEs are adjacent and in this order".
+//!
 //! # Example
 //!
 //! ```no_run
@@ -309,6 +334,7 @@ mod request;
 mod sendmsg;
 mod slot;
 mod statx;
+mod timeout;
 mod vectored;
 mod zerocopy;
 
@@ -346,5 +372,6 @@ pub use request::{Completed, Direction, Pending, Prepared, Receipt};
 pub use sendmsg::{PendingSendmsg, PreparedSendmsg, SendTarget, SendmsgCompleted};
 pub use slot::{DirectSlot, SlotIndex, SlotTarget};
 pub use statx::{PendingStatx, PreparedStatx, StatxCompleted, StatxError};
+pub use timeout::{Count, Expiry, PendingTimeout, PreparedTimeout, TimeoutCompleted, TimeoutError};
 pub use vectored::{PendingVectored, PreparedVectored, VectoredCompleted, VectoredError};
 pub use zerocopy::{PendingZc, PreparedZc, ZcCompleted};
