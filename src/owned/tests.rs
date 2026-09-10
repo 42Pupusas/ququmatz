@@ -4,8 +4,8 @@ extern crate std;
 
 use super::{
     Arrival, Completed, Delivery, Direction, Event, Incoming, MmapBuffer, Pending, PendingZc,
-    Prepared, PreparedAccept, PreparedMultishot, PreparedZc, Receipt, RingId, StableBuffer,
-    ZcCompleted,
+    Prepared, PreparedAccept, PreparedMultishot, PreparedVectored, PreparedZc, Receipt, RingId,
+    StableBuffer, VectoredError, ZcCompleted,
 };
 use crate::error::{Error, SubmitError};
 use crate::net::Socket;
@@ -1079,6 +1079,263 @@ fn an_accept_rejects_a_completion_belonging_to_another_request() {
     });
     assert!(!first.matches(&foreign));
     assert!(first.record(foreign).is_err());
+}
+
+/// Storage for an iovec array, deliberately misaligned for `IoVec`.
+///
+/// `MmapBuffer` is page-aligned so it can never exercise the alignment
+/// check; this offsets into its own mapping to produce an address that is
+/// stable but odd.
+struct MisalignedVecs {
+    inner: MmapBuffer,
+}
+
+impl MisalignedVecs {
+    fn with_capacity(len: usize) -> Self {
+        Self {
+            inner: MmapBuffer::with_capacity(len + 1).expect("map"),
+        }
+    }
+}
+
+// SAFETY: delegates to `MmapBuffer`, whose address is fixed for its whole
+// life; offsetting by a constant one byte keeps it fixed and in bounds,
+// and this type is the sole owner of those bytes.
+unsafe impl StableBuffer for MisalignedVecs {
+    fn stable_ptr(&self) -> *const u8 {
+        unsafe { self.inner.stable_ptr().add(1) }
+    }
+
+    fn stable_len(&self) -> usize {
+        self.inner.stable_len() - 1
+    }
+}
+
+// SAFETY: as above; the mapping is writable and the address matches.
+unsafe impl super::StableBufferMut for MisalignedVecs {
+    fn stable_mut_ptr(&mut self) -> *mut u8 {
+        unsafe { self.inner.stable_mut_ptr().add(1) }
+    }
+}
+
+#[test]
+fn a_vectored_write_gathers_every_buffer_in_order() {
+    let pair = SocketPair::connected();
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let parts: [&[u8]; 3] = [b"vectored ", b"io ", b"in order"];
+    let mut bufs = parts.map(|p| {
+        let mut b = MmapBuffer::with_capacity(p.len()).expect("map");
+        b.as_mut_slice().copy_from_slice(p);
+        b
+    });
+    let lens = parts.map(<[u8]>::len);
+    // Make each buffer larger than its message so `with_lens` has to do
+    // real work rather than coinciding with capacity.
+    for (b, p) in bufs.iter_mut().zip(parts.iter()) {
+        assert_eq!(b.len(), p.len());
+    }
+
+    let vecs = MmapBuffer::with_capacity(4096).expect("map");
+    let request = PreparedVectored::writev(pair.client(), bufs, vecs, 0)
+        .unwrap_or_else(|(_, _, e)| panic!("{e}"))
+        .with_lens(lens);
+    assert_eq!(request.count(), 3);
+    assert_eq!(request.total_len(), 20);
+
+    let ticket = sub
+        .push_vectored(request)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatched"));
+    let (result, bufs, _vecs) = done.into_parts();
+    assert_eq!(result.expect("write ok"), 20);
+    // The owners came back intact, not consumed by the operation.
+    assert_eq!(bufs[0].as_slice(), b"vectored ");
+
+    let mut seen = [0u8; 32];
+    let n = pair.read_server(&mut seen[..20]);
+    assert_eq!(&seen[..n], b"vectored io in order");
+}
+
+#[test]
+fn a_vectored_read_scatters_across_buffers_filling_them_in_order() {
+    let pair = SocketPair::connected();
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    // Four bytes per buffer, twelve bytes sent: every descriptor fills.
+    let bufs = [(); 3].map(|()| MmapBuffer::with_capacity(4).expect("map"));
+    let vecs = MmapBuffer::with_capacity(4096).expect("map");
+    let request = PreparedVectored::readv(pair.server, bufs, vecs, 0)
+        .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+    assert_eq!(request.total_len(), 12);
+
+    let ticket = sub
+        .push_vectored(request)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit");
+    pair.write_client(b"abcdefghijkl");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatched"));
+    let (result, bufs, _vecs) = done.into_parts();
+    assert_eq!(result.expect("read ok"), 12);
+    // Order matters: the kernel fills descriptor 0 before descriptor 1.
+    assert_eq!(bufs[0].as_slice(), b"abcd");
+    assert_eq!(bufs[1].as_slice(), b"efgh");
+    assert_eq!(bufs[2].as_slice(), b"ijkl");
+}
+
+#[test]
+fn a_vectored_ticket_survives_moving_to_another_thread_before_completion() {
+    // The reason the descriptor array cannot live inline in the ticket.
+    // `Pending` is `Send` and is *meant* to cross threads; if the array
+    // moved with it, the kernel would be left reading a dead address. This
+    // moves the ticket while the request is genuinely in flight.
+    let pair = SocketPair::connected();
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let bufs = [(); 2].map(|()| MmapBuffer::with_capacity(4).expect("map"));
+    let vecs = MmapBuffer::with_capacity(4096).expect("map");
+    let ticket = sub
+        .push_vectored(
+            PreparedVectored::readv(pair.server, bufs, vecs, 0)
+                .unwrap_or_else(|(_, _, e)| panic!("{e}")),
+        )
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit");
+
+    // In flight now. Hand the ticket to another thread and back.
+    let ticket = std::thread::spawn(move || ticket).join().expect("join");
+
+    pair.write_client(b"12345678");
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatched"));
+    let (result, bufs, _vecs) = done.into_parts();
+    assert_eq!(result.expect("read ok"), 8);
+    assert_eq!(bufs[0].as_slice(), b"1234");
+    assert_eq!(bufs[1].as_slice(), b"5678");
+}
+
+#[test]
+fn descriptor_storage_too_small_is_rejected_with_everything_handed_back() {
+    let bufs = [(); 4].map(|()| MmapBuffer::with_capacity(8).expect("map"));
+    let addrs = bufs.each_ref().map(StableBuffer::stable_ptr);
+    // One IoVec is 16 bytes on this target, so 8 bytes cannot hold four.
+    let vecs = MmapBuffer::with_capacity(8).expect("map");
+
+    let (bufs, _vecs, err) = PreparedVectored::<_, _, 4>::writev(RawFd::from_raw(1), bufs, vecs, 0)
+        .err()
+        .expect("too small");
+    assert!(matches!(err, VectoredError::ArrayTooSmall { .. }));
+    // Nothing was consumed: the same buffers came back, unmoved.
+    assert_eq!(bufs.each_ref().map(StableBuffer::stable_ptr), addrs);
+}
+
+#[test]
+fn misaligned_descriptor_storage_is_rejected_rather_than_written_through() {
+    // An unaligned write of an IoVec would be UB, so this must be caught
+    // before the array is stamped, not after.
+    let bufs = [(); 2].map(|()| MmapBuffer::with_capacity(8).expect("map"));
+    let vecs = MisalignedVecs::with_capacity(4096);
+
+    let (_bufs, _vecs, err) =
+        PreparedVectored::<_, _, 2>::writev(RawFd::from_raw(1), bufs, vecs, 0)
+            .err()
+            .expect("misaligned");
+    assert!(matches!(err, VectoredError::ArrayMisaligned { .. }));
+}
+
+#[test]
+fn with_lens_shortens_each_descriptor_but_never_extends_it() {
+    let bufs = [(); 2].map(|()| MmapBuffer::with_capacity(64).expect("map"));
+    let vecs = MmapBuffer::with_capacity(4096).expect("map");
+    let request = PreparedVectored::writev(RawFd::from_raw(1), bufs, vecs, 0)
+        .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+    assert_eq!(request.total_len(), 128);
+
+    // Asking for more than capacity is clamped per buffer, so the array can
+    // never describe memory the owners do not have.
+    let request = request.with_lens([5, 4096]);
+    assert_eq!(request.total_len(), 69);
+}
+
+#[test]
+fn a_vectored_push_that_does_not_fit_hands_all_the_storage_back() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut held = std::vec::Vec::new();
+    loop {
+        let bufs = [(); 2].map(|()| MmapBuffer::with_capacity(8).expect("map"));
+        let addrs = bufs.each_ref().map(StableBuffer::stable_ptr);
+        let vecs = MmapBuffer::with_capacity(4096).expect("map");
+        let request = PreparedVectored::writev(RawFd::from_raw(1), bufs, vecs, 0)
+            .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+        match sub.push_vectored(request) {
+            Ok(ticket) => held.push(ticket),
+            Err((returned, e)) => {
+                assert!(matches!(e, Error::Submit(SubmitError::QueueFull)));
+                // Every owner came back, and the target survived the round
+                // trip rather than being reset to a default fd.
+                assert_eq!(
+                    returned.buffers().each_ref().map(StableBuffer::stable_ptr),
+                    addrs
+                );
+                assert_eq!(returned.fd(), RawFd::from_raw(1));
+                assert_eq!(returned.total_len(), 16);
+                break;
+            }
+        }
+    }
+    core::mem::forget(held);
+}
+
+#[test]
+fn a_vectored_receipt_for_another_request_is_rejected() {
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let make = |sub: &mut super::OwnedSubmitter| {
+        let bufs = [(); 2].map(|()| MmapBuffer::with_capacity(8).expect("map"));
+        let vecs = MmapBuffer::with_capacity(4096).expect("map");
+        sub.push_vectored(
+            PreparedVectored::writev(RawFd::from_raw(1), bufs, vecs, 0)
+                .unwrap_or_else(|(_, _, e)| panic!("{e}")),
+        )
+        .unwrap_or_else(|(_, e)| panic!("{e}"))
+    };
+    let first = make(&mut sub);
+    let second = make(&mut sub);
+
+    let foreign = Receipt {
+        ring: second.ring(),
+        id: second.id(),
+        result: 16,
+        flags: crate::types::CqeFlags::default(),
+    };
+    assert!(!first.matches(&foreign));
+    let Err((first, _)) = first.redeem(foreign) else {
+        panic!("a foreign receipt must not redeem");
+    };
+    // The ticket survived the rejection still owning everything.
+    assert_eq!(first.count(), 2);
+    // Neither ticket is ever redeemed, so both deliberately leak their
+    // storage rather than freeing memory the kernel could still reach.
+    // `PendingVectored` has no destructor, so dropping them is that leak.
+    #[allow(clippy::drop_non_drop)]
+    drop((first, second));
 }
 
 #[test]

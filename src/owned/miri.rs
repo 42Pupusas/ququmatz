@@ -13,16 +13,18 @@
 
 extern crate std;
 
+use core::mem::align_of;
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::boxed::Box;
 use std::vec::Vec;
 
 use super::event::PartialReceipt;
 use super::identity::{RequestId, RequestIdSource, RingId};
+use super::vectored::{PendingVectored, PreparedVectored};
 use super::zerocopy::{PendingZc, PreparedZc};
 use super::{Direction, Pending, Prepared, Receipt, StableBuffer, StableBufferMut};
 use crate::op::Sqe;
-use crate::types::{CqeFlags, MsgFlags, RawFd};
+use crate::types::{CqeFlags, IoVec, MsgFlags, RawFd};
 
 /// Heap storage standing in for an `MmapBuffer`.
 ///
@@ -36,18 +38,39 @@ use crate::types::{CqeFlags, MsgFlags, RawFd};
 struct HeapBuffer {
     ptr: *mut u8,
     len: usize,
+    align: usize,
 }
 
 impl HeapBuffer {
-    fn layout(len: usize) -> Layout {
-        Layout::from_size_align(len, 1).expect("valid layout")
+    fn layout_of(len: usize, align: usize) -> Layout {
+        Layout::from_size_align(len, align).expect("valid layout")
     }
 
+    fn layout(&self) -> Layout {
+        Self::layout_of(self.len, self.align)
+    }
+
+    /// Byte storage, aligned to 1 like the data buffers it stands in for.
     fn with_capacity(len: usize) -> Self {
+        Self::with_alignment(len, 1)
+    }
+
+    /// Storage for an `IoVec` array.
+    ///
+    /// Descriptor storage genuinely has to be aligned for `IoVec`, and a
+    /// byte-aligned allocation is not — Miri rejects it, where the system
+    /// allocator happens to hand back aligned addresses and hides the
+    /// problem. `MmapBuffer` is page-aligned, so this matches what real
+    /// callers pass.
+    fn for_descriptors(len: usize) -> Self {
+        Self::with_alignment(len, align_of::<IoVec>())
+    }
+
+    fn with_alignment(len: usize, align: usize) -> Self {
         assert!(len > 0, "zero-length test buffer");
-        let ptr = unsafe { alloc_zeroed(Self::layout(len)) };
+        let ptr = unsafe { alloc_zeroed(Self::layout_of(len, align)) };
         assert!(!ptr.is_null(), "allocation failed");
-        Self { ptr, len }
+        Self { ptr, len, align }
     }
 
     fn as_slice(&self) -> &[u8] {
@@ -74,7 +97,17 @@ impl HeapBuffer {
     unsafe fn reclaim_leaked(ptr: *mut u8, len: usize) {
         // SAFETY: the caller guarantees this pointer came from
         // `with_capacity(len)` and is otherwise unreachable.
-        unsafe { dealloc(ptr, Self::layout(len)) };
+        unsafe { dealloc(ptr, Self::layout_of(len, 1)) };
+    }
+
+    /// Free leaked descriptor storage, which has its own alignment.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must come from `for_descriptors(len)` and be unreachable.
+    unsafe fn reclaim_leaked_descriptors(ptr: *mut u8, len: usize) {
+        // SAFETY: as above, with the alignment `for_descriptors` used.
+        unsafe { dealloc(ptr, Self::layout_of(len, align_of::<IoVec>())) };
     }
 }
 
@@ -82,7 +115,7 @@ impl Drop for HeapBuffer {
     fn drop(&mut self) {
         // SAFETY: `ptr` came from `alloc_zeroed` with this exact layout and
         // is freed exactly once, since `Pending` never drops its buffer.
-        unsafe { dealloc(self.ptr, Self::layout(self.len)) };
+        unsafe { dealloc(self.ptr, self.layout()) };
     }
 }
 
@@ -231,6 +264,57 @@ impl Lifecycle {
         let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
         (FakeKernel::holding(sqe), pending)
     }
+
+    fn submit_vectored<B: StableBuffer, V: StableBufferMut, const N: usize>(
+        &self,
+        prepared: PreparedVectored<B, V, N>,
+    ) -> (FakeKernel, PendingVectored<B, V, N>) {
+        let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
+        (FakeKernel::holding(sqe), pending)
+    }
+}
+
+impl FakeKernel {
+    /// Walk the published `iovec` array the way the kernel does: read the
+    /// descriptor, then follow *its* pointer to the data.
+    ///
+    /// This double indirection is the whole reason vectored I/O is riskier
+    /// than scalar. The SQE's address is the array, not the bytes, so the
+    /// array has to survive independently of the buffers — and Miri only
+    /// notices a stale array pointer if the access goes through this path
+    /// rather than through the owner.
+    fn descriptor(&self, i: usize) -> IoVec {
+        // The `PreparedVectored` that built this SQE rejected storage that
+        // was not aligned for `IoVec`, so this address is aligned.
+        #[allow(clippy::cast_ptr_alignment)]
+        let base = self.published_ptr().cast::<IoVec>();
+        // SAFETY: the `PreparedVectored` that built this SQE checked the
+        // storage holds `N` aligned descriptors, and the owner is alive for
+        // this call, so `base.add(i)` is in bounds and initialised.
+        unsafe { base.add(i).read() }
+    }
+
+    /// Fill descriptor `i`'s buffer, as a `readv` completion would.
+    fn complete_readv(&self, i: usize, fill: u8) -> usize {
+        let vec = self.descriptor(i);
+        for j in 0..vec.len() {
+            // SAFETY: the descriptor names a buffer owned by the live
+            // `PendingVectored`, which keeps it allocated and unaliased.
+            unsafe { vec.base().add(j).write(fill) };
+        }
+        vec.len()
+    }
+
+    /// Read descriptor `i`'s buffer back, as a `writev` submission would.
+    fn observe_writev(&self, i: usize) -> Vec<u8> {
+        let vec = self.descriptor(i);
+        let mut seen = Vec::with_capacity(vec.len());
+        for j in 0..vec.len() {
+            // SAFETY: as above; the owner outlives this call.
+            seen.push(unsafe { vec.base().add(j).read() });
+        }
+        seen
+    }
 }
 
 #[test]
@@ -247,6 +331,149 @@ fn kernel_write_through_the_sqe_pointer_lands_in_the_owned_buffer() {
     let completed = pending.redeem(receipt).ok().expect("receipt matches");
     assert_eq!(completed.result().expect("ok"), 64);
     assert!(completed.buffer().as_slice().iter().all(|&b| b == 0xAB));
+}
+
+#[test]
+fn the_kernel_reaches_every_vectored_buffer_through_the_published_array() {
+    let cycle = Lifecycle::new();
+    let bufs = [(); 3].map(|()| HeapBuffer::with_capacity(4));
+    let vecs = HeapBuffer::for_descriptors(256);
+    let prepared = PreparedVectored::readv(RawFd::from_raw(7), bufs, vecs, 0)
+        .ok()
+        .expect("storage fits");
+    let (kernel, pending) = cycle.submit_vectored(prepared);
+
+    // Each write goes array-first, so a stale or misplaced descriptor would
+    // be a Miri error rather than a silently wrong byte.
+    let mut total = 0usize;
+    for (i, fill) in [0xA1u8, 0xB2, 0xC3].into_iter().enumerate() {
+        total += kernel.complete_readv(i, fill);
+    }
+    let receipt = kernel.post_completion(cycle.ring, i32::try_from(total).expect("fits"));
+
+    let completed = pending.redeem(receipt).ok().expect("receipt matches");
+    assert_eq!(completed.result().expect("ok"), 12);
+    let bufs = completed.buffers();
+    assert!(bufs[0].as_slice().iter().all(|&b| b == 0xA1));
+    assert!(bufs[1].as_slice().iter().all(|&b| b == 0xB2));
+    assert!(bufs[2].as_slice().iter().all(|&b| b == 0xC3));
+}
+
+#[test]
+fn a_vectored_ticket_keeps_its_array_valid_across_moves() {
+    // The hazard that decided the design: a `PendingVectored` is `Send` and
+    // is meant to move to a completion thread, but the kernel holds a
+    // pointer *into* it. Moving the ticket must not disturb the array, and
+    // under Miri a relocated or invalidated array is a hard error rather
+    // than a wrong answer.
+    let cycle = Lifecycle::new();
+    let bufs = [(); 2].map(|()| HeapBuffer::with_capacity(8));
+    let vecs = HeapBuffer::for_descriptors(256);
+    let prepared = PreparedVectored::readv(RawFd::from_raw(7), bufs, vecs, 0)
+        .ok()
+        .expect("storage fits");
+    let (kernel, pending) = cycle.submit_vectored(prepared);
+
+    // Move it around the way an application would: into a box, out again,
+    // and through another owner.
+    let boxed = Box::new(pending);
+    let pending = *boxed;
+    let moved = core::hint::black_box(pending);
+
+    // The kernel writes *after* all that movement, through the pointer it
+    // captured before any of it.
+    let mut total = 0usize;
+    for i in 0..2 {
+        total += kernel.complete_readv(i, 0x5A);
+    }
+    let receipt = kernel.post_completion(cycle.ring, i32::try_from(total).expect("fits"));
+
+    let completed = moved.redeem(receipt).ok().expect("receipt matches");
+    assert_eq!(completed.result().expect("ok"), 16);
+    assert!(
+        completed
+            .buffers()
+            .iter()
+            .all(|b| b.as_slice().iter().all(|&x| x == 0x5A))
+    );
+}
+
+#[test]
+fn a_gather_write_publishes_the_bytes_each_buffer_staged() {
+    let cycle = Lifecycle::new();
+    let mut bufs = [(); 2].map(|()| HeapBuffer::with_capacity(4));
+    bufs[0].as_mut_slice().copy_from_slice(b"abcd");
+    bufs[1].as_mut_slice().copy_from_slice(b"efgh");
+    let vecs = HeapBuffer::for_descriptors(256);
+    let prepared = PreparedVectored::writev(RawFd::from_raw(1), bufs, vecs, 0)
+        .ok()
+        .expect("storage fits");
+    let (kernel, pending) = cycle.submit_vectored(prepared);
+
+    assert_eq!(kernel.observe_writev(0), b"abcd");
+    assert_eq!(kernel.observe_writev(1), b"efgh");
+
+    let receipt = kernel.post_completion(cycle.ring, 8);
+    let completed = pending.redeem(receipt).ok().expect("receipt matches");
+    assert_eq!(completed.result().expect("ok"), 8);
+}
+
+#[test]
+fn abandoning_a_vectored_ticket_leaks_rather_than_freeing_live_storage() {
+    // Same failure mode as the scalar case, but with two kinds of storage
+    // to leak: the buffers and the array naming them. Freeing either while
+    // the kernel holds a pointer would be the unsound choice.
+    let cycle = Lifecycle::new();
+    let bufs = [(); 2].map(|()| HeapBuffer::with_capacity(8));
+    let buf_addrs = bufs.each_ref().map(|b| (b.ptr, b.len));
+    let vecs = HeapBuffer::for_descriptors(256);
+    let vec_addr = (vecs.ptr, vecs.len);
+    let prepared = PreparedVectored::readv(RawFd::from_raw(7), bufs, vecs, 0)
+        .ok()
+        .expect("storage fits");
+    let (kernel, pending) = cycle.submit_vectored(prepared);
+
+    // Abandoning the ticket. `PendingVectored` holds every owner in a
+    // `ManuallyDrop`, so it has no destructor of its own and this frees
+    // nothing -- which is the point: the kernel still holds pointers into
+    // all of it.
+    #[allow(clippy::drop_non_drop)]
+    drop(pending);
+
+    // The kernel still writes, and the storage must still be there.
+    for i in 0..2 {
+        kernel.complete_readv(i, 0x77);
+    }
+    assert_eq!(kernel.observe_writev(0), [0x77; 8]);
+
+    // Hand the leaked storage back so Miri's leak checker stays on for
+    // every other test rather than being disabled wholesale.
+    for (ptr, len) in buf_addrs {
+        // SAFETY: the abandoned ticket leaked these and the stand-in kernel
+        // has finished with them, so nothing else can reach them.
+        unsafe { HeapBuffer::reclaim_leaked(ptr, len) };
+    }
+    // SAFETY: as above, with the descriptor array's own alignment.
+    unsafe { HeapBuffer::reclaim_leaked_descriptors(vec_addr.0, vec_addr.1) };
+}
+
+#[test]
+fn reclaiming_an_unpublished_vectored_request_returns_usable_storage() {
+    let cycle = Lifecycle::new();
+    let bufs = [(); 2].map(|()| HeapBuffer::with_capacity(8));
+    let vecs = HeapBuffer::for_descriptors(256);
+    let prepared = PreparedVectored::writev(RawFd::from_raw(3), bufs, vecs, 0)
+        .ok()
+        .expect("storage fits");
+    let (_kernel, pending) = cycle.submit_vectored(prepared);
+
+    // SAFETY: this test never publishes the SQE, so the kernel holds no
+    // pointer into the storage.
+    let mut recovered = unsafe { pending.reclaim_unsubmitted() };
+    // The target survived the round trip rather than being reset.
+    assert_eq!(recovered.fd().as_i32(), 3);
+    // And the storage is writable again, so nothing was left half-owned.
+    recovered.buffers_mut()[0].as_mut_slice()[0] = 1;
 }
 
 #[test]

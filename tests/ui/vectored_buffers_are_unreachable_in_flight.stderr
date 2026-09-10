@@ -1,0 +1,11 @@
+error[E0599]: no method named `buffers` found for reference `&PendingVectored<MmapBuffer, MmapBuffer, 2>` in the current scope
+ --> tests/ui/vectored_buffers_are_unreachable_in_flight.rs:7:20
+  |
+7 |     let _ = ticket.buffers();
+  |                    ^^^^^^^ method not found in `&PendingVectored<MmapBuffer, MmapBuffer, 2>`
+
+error[E0599]: no method named `into_parts` found for struct `PendingVectored<B, V, N>` in the current scope
+  --> tests/ui/vectored_buffers_are_unreachable_in_flight.rs:14:20
+   |
+14 |     let _ = ticket.into_parts();
+   |                    ^^^^^^^^^^ method not found in `PendingVectored<MmapBuffer, MmapBuffer, 2>`

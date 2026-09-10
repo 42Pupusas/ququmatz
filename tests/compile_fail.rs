@@ -49,6 +49,16 @@ fn a_multishot_arrival_cannot_escape_or_alias_its_pool() {
     t.compile_fail("tests/ui/two_arrivals_cannot_be_held_at_once.rs");
 }
 
+/// Vectored I/O hands the kernel two things to hold: the buffers, and the
+/// `iovec` array naming them. Neither may be reachable while the request is
+/// in flight, and neither may be reclaimed without a receipt — freeing the
+/// array strands the kernel just as surely as freeing a buffer.
+#[test]
+fn vectored_storage_is_unreachable_until_redeemed() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/vectored_buffers_are_unreachable_in_flight.rs");
+}
+
 /// An accepted connection is owned rather than borrowed, so the compiler
 /// cannot tie it to a pool the way it does an arrival. What it can do is
 /// refuse to let the result be thrown away unread, which is the failure

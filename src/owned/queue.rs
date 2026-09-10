@@ -1,11 +1,12 @@
 //! Split submission/completion halves for owned requests.
 
 use super::accept::{MultishotAccept, PreparedAccept};
-use super::buffer::StableBuffer;
+use super::buffer::{StableBuffer, StableBufferMut};
 use super::event::{Event, PartialReceipt};
 use super::identity::{RequestIdSource, RingId};
 use super::multishot::{MultishotRecv, PreparedMultishot};
 use super::request::{Pending, Prepared, Receipt};
+use super::vectored::{PendingVectored, PreparedVectored};
 use super::zerocopy::{PendingZc, PreparedZc};
 use crate::error::Error;
 use crate::ring::{Completer, IoUring, Submitter};
@@ -115,6 +116,37 @@ impl OwnedSubmitter {
             // before submission returns it exactly as it arrived.
             Err(e) => Err((request, e)),
         }
+    }
+
+    /// Queue a vectored operation, taking ownership of every buffer and of
+    /// the descriptor array naming them.
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact,
+    /// still owning all of its storage.
+    pub fn push_vectored<B: StableBuffer, V: StableBufferMut, const N: usize>(
+        &mut self,
+        request: PreparedVectored<B, V, N>,
+    ) -> Result<PendingVectored<B, V, N>, (PreparedVectored<B, V, N>, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            // The SQE never became kernel-visible, so no pointer to the
+            // buffers or to the descriptor array ever reached the kernel.
+            Err(e) => Err((Self::reclaim_vectored(pending), e)),
+        }
+    }
+
+    /// Undo a vectored push that the kernel never observed.
+    fn reclaim_vectored<B, V, const N: usize>(
+        pending: PendingVectored<B, V, N>,
+    ) -> PreparedVectored<B, V, N> {
+        // SAFETY: only reached when `Submitter::push` reported the queue was
+        // full, which happens before the SQE is written or the tail is
+        // advanced. No kernel-visible pointer to the storage exists.
+        unsafe { pending.reclaim_unsubmitted() }
     }
 
     /// Undo a push that the kernel never observed.

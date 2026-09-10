@@ -282,6 +282,54 @@ terminal CQE carrying a buffer id** pins the fold, since CQ overflow cannot
 be forced deterministically from userspace; it was verified by making
 `Done` drop its payload again, which fails on the missing arrival.
 
+**Vectored I/O.** Covered by `PreparedVectored` / `PendingVectored` /
+`VectoredCompleted` in `src/owned/vectored.rs`. Every other request hands
+the kernel one pointer to the data. A vectored one hands it a pointer to an
+**array of `IoVec`**, which the kernel dereferences to reach the buffers —
+so there are two regions it touches, and both must stay put for the whole
+operation.
+
+The buffers are the easy half: `StableBuffer` already promises the bytes
+do not move when the owner does, so `[B; N]` sits inline in the ticket and
+moving the ticket moves `N` owners rather than `N * len` bytes.
+
+The array is the trap, and it decided the whole design. It cannot live
+inline in the ticket, because a `Pending` is deliberately `Send` and is
+*expected* to be handed to a completion thread — an inline array would
+relocate the exact bytes the kernel is about to read, leaving it following
+a pointer into a dead stack slot. Nothing in the type system would notice:
+the request would still compile, still submit, and still read or write
+whatever now occupies that address. Since that is precisely the guarantee
+`StableBuffer` encodes, the array's storage is *required to implement it*
+rather than getting a new trait, and the caller supplies it so one
+allocation can serve many requests.
+
+Size and alignment are checked before the array is written, not after: an
+unaligned `IoVec` write is UB, so discovering the problem afterwards is too
+late. Both checks hand back every owner untouched, so a rejected request
+never costs a buffer. `PendingVectored` also carries the target fd and
+offset purely so a queue-full retry comes back aimed where the caller
+aimed it — an earlier draft reconstructed it with `fd: 0`, which would
+have silently retargeted a retry at stdin.
+
+**Miri found a real defect in the test fixtures here.** The `HeapBuffer`
+stand-in allocates with `align 1`, which is right for data but wrong for
+descriptors, and Miri rejected it where the system allocator had been
+handing back aligned addresses and hiding the problem. The fix belonged in
+the fixture rather than the check: `HeapBuffer::for_descriptors` now
+allocates at `align_of::<IoVec>()`, matching the page-aligned `MmapBuffer`
+real callers pass. Five Miri tests cover the module, walking the array the
+way the kernel does — read the descriptor, then follow *its* pointer — so a
+stale array is a hard error rather than a wrong byte. They pass under both
+Stacked Borrows and Tree Borrows with the leak checker on.
+
+Ordering is load-bearing and was verified by reversing the descriptor
+write loop, which fails three tests with visibly transposed data. The
+alignment check was verified by disabling it, which fails the misalignment
+test. `tests/ui/vectored_buffers_are_unreachable_in_flight.rs` pins that
+neither the buffers nor the array can be reached or reclaimed while the
+request is in flight.
+
 **Multishot accept.** Covered by `PreparedAccept` / `MultishotAccept` /
 `Incoming` in `src/owned/accept.rs`. It shares the `MORE`/re-arm state
 machine with recv, and the same terminal-CQE-carries-a-resource hazard, but
@@ -325,8 +373,8 @@ not "prevented". An earlier draft asserted the stronger claim and passed
 for the wrong reason — a type mismatch I had introduced in the fixture
 itself, not the lint.
 
-**Scope limits.** Vectored I/O, paths, and `statx` still go through the
-`unsafe` constructors and need their own owned request types. The direct
+**Scope limits.** Paths and `statx` still go through the `unsafe`
+constructors and need their own owned request types. The direct
 (registered-file-table) accept variants are also unmodelled: they yield
 table indices rather than descriptors, which is a third ownership story
 again. The `unsafe` `Sqe` surface remains for those and for lock-free

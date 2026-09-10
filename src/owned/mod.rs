@@ -50,6 +50,22 @@
 //! brings a pool buffer id along — so [`PartialReceipt`] keeps the kernel's
 //! flags rather than discarding them.
 //!
+//! # Vectored I/O has a second thing to keep still
+//!
+//! A scalar request hands the kernel one pointer. [`PreparedVectored`]
+//! hands it a pointer to an **array of `IoVec`**, which the kernel
+//! dereferences to reach the data — so two separate regions must stay put,
+//! the buffers and the array naming them. The buffers are already covered:
+//! [`StableBuffer`] promises the bytes do not move even when the owner
+//! does, so `[B; N]` sits inline in the ticket.
+//!
+//! The array cannot. A ticket is `Send` and is *meant* to be moved to a
+//! completion thread, so an inline array would relocate the exact bytes the
+//! kernel is about to read. That is the same guarantee [`StableBuffer`]
+//! already encodes, so the array's storage is required to implement it
+//! rather than getting a new trait, and it is checked for size and
+//! alignment before anything is written into it.
+//!
 //! # Multishot borrows instead of owning
 //!
 //! [`PreparedMultishot`] is the exception to the ownership rule above: one
@@ -115,6 +131,7 @@ mod identity;
 mod multishot;
 mod queue;
 mod request;
+mod vectored;
 mod zerocopy;
 
 #[cfg(test)]
@@ -134,4 +151,5 @@ pub use identity::{RequestId, RingId};
 pub use multishot::{Armed, Arrival, Delivery, Finished, MultishotRecv, PreparedMultishot};
 pub use queue::{OwnedCompleter, OwnedSubmitter};
 pub use request::{Completed, Direction, Pending, Prepared, Receipt};
+pub use vectored::{PendingVectored, PreparedVectored, VectoredCompleted, VectoredError};
 pub use zerocopy::{PendingZc, PreparedZc, ZcCompleted};
