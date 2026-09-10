@@ -314,7 +314,7 @@ fn sqe_field_offsets() {
 #[test]
 fn sqe_builder_read_places_fields_correctly() {
     let mut buf = [0u8; 32];
-    let sqe = Sqe::read(RawFd::from_raw(42), &mut buf, 100).user_data(99);
+    let sqe = unsafe { Sqe::read(RawFd::from_raw(42), &mut buf, 100) }.user_data(99);
     let inner = sqe.0;
 
     assert_eq!(Opcode::Read, inner.opcode);
@@ -328,7 +328,7 @@ fn sqe_builder_read_places_fields_correctly() {
 #[test]
 fn sqe_builder_write_places_fields_correctly() {
     let buf = [1u8; 16];
-    let sqe = Sqe::write(RawFd::from_raw(7), &buf, 0).user_data(55);
+    let sqe = unsafe { Sqe::write(RawFd::from_raw(7), &buf, 0) }.user_data(55);
     let inner = sqe.0;
 
     assert_eq!(Opcode::Write, inner.opcode);
@@ -343,7 +343,7 @@ fn sqe_builder_write_places_fields_correctly() {
 fn sqe_builder_readv_places_fields_correctly() {
     let mut buf = [0u8; 8];
     let vecs = [unsafe { IoVec::new(buf.as_mut_ptr(), buf.len()) }];
-    let sqe = Sqe::readv(RawFd::from_raw(3), &vecs, 50).user_data(10);
+    let sqe = unsafe { Sqe::readv(RawFd::from_raw(3), &vecs, 50) }.user_data(10);
     let inner = sqe.0;
 
     assert_eq!(Opcode::Readv, inner.opcode);
@@ -358,12 +358,17 @@ fn sqe_builder_readv_places_fields_correctly() {
 fn sqe_builder_openat_places_fields_correctly() {
     use crate::types::DirFd;
     let path = c"/tmp/test";
-    let sqe = Sqe::openat(
-        DirFd::Cwd,
-        path,
-        OpenFlags::default(),
-        FileMode::OWNER_READ | FileMode::OWNER_WRITE | FileMode::GROUP_READ | FileMode::OTHER_READ,
-    )
+    let sqe = unsafe {
+        Sqe::openat(
+            DirFd::Cwd,
+            path,
+            OpenFlags::default(),
+            FileMode::OWNER_READ
+                | FileMode::OWNER_WRITE
+                | FileMode::GROUP_READ
+                | FileMode::OTHER_READ,
+        )
+    }
     .user_data(77);
     let inner = sqe.0;
 
@@ -485,7 +490,7 @@ fn sqe_link_chain_flags() {
 #[test]
 fn sqe_builder_timeout_places_fields_correctly() {
     let ts = Timespec::new(1, 500_000_000);
-    let sqe = Sqe::timeout(&ts, 3, TimeoutFlags::default()).user_data(42);
+    let sqe = unsafe { Sqe::timeout(&ts, 3, TimeoutFlags::default()) }.user_data(42);
     let inner = sqe.0;
 
     assert_eq!(Opcode::Timeout, inner.opcode);
@@ -575,7 +580,7 @@ fn fsync_on_tmpfile() {
 
     // Write some data first
     let buf = b"fsync test";
-    ring.push(Sqe::write(RawFd::from_raw(fd as usize), buf, 0).user_data(1))
+    ring.push(unsafe { Sqe::write(RawFd::from_raw(fd as usize), buf, 0) }.user_data(1))
         .expect("push write");
     ring.submit_and_wait(1).expect("submit");
     ring.complete().expect("write cqe");
@@ -599,13 +604,15 @@ fn statx_on_tmp() {
     let mut buf = Statx::default();
 
     ring.push(
-        Sqe::statx(
-            crate::types::DirFd::Cwd,
-            c"/tmp",
-            StatxFlags::default(),
-            StatxMask::BASIC_STATS,
-            &mut buf,
-        )
+        unsafe {
+            Sqe::statx(
+                crate::types::DirFd::Cwd,
+                c"/tmp",
+                StatxFlags::default(),
+                StatxMask::BASIC_STATS,
+                &mut buf,
+            )
+        }
         .user_data(1),
     )
     .expect("push statx");
@@ -627,7 +634,7 @@ fn timeout_expiry() {
 
     // 50ms timeout with count=0 (pure timer)
     let ts = Timespec::from_millis(50);
-    ring.push(Sqe::timeout(&ts, 0, TimeoutFlags::default()).user_data(1))
+    ring.push(unsafe { Sqe::timeout(&ts, 0, TimeoutFlags::default()) }.user_data(1))
         .expect("push");
     ring.submit_and_wait(1).expect("submit");
 
@@ -785,7 +792,7 @@ fn read_write_roundtrip() {
     let fd = open_tmpfile(&mut ring);
 
     let write_buf = b"hello io_uring!";
-    ring.push(Sqe::write(RawFd::from_raw(fd as usize), write_buf, 0).user_data(1))
+    ring.push(unsafe { Sqe::write(RawFd::from_raw(fd as usize), write_buf, 0) }.user_data(1))
         .expect("failed to push write");
     ring.submit_and_wait(1).expect("failed to submit write");
 
@@ -794,7 +801,7 @@ fn read_write_roundtrip() {
     assert_eq!(cqe.result, write_buf.len() as i32);
 
     let mut read_buf = [0u8; 64];
-    ring.push(Sqe::read(RawFd::from_raw(fd as usize), &mut read_buf, 0).user_data(2))
+    ring.push(unsafe { Sqe::read(RawFd::from_raw(fd as usize), &mut read_buf, 0) }.user_data(2))
         .expect("failed to push read");
     ring.submit_and_wait(1).expect("failed to submit read");
 
@@ -824,7 +831,7 @@ fn vectored_read_write() {
         unsafe { IoVec::new(buf_a.as_mut_ptr(), buf_a.len()) },
         unsafe { IoVec::new(buf_b.as_mut_ptr(), buf_b.len()) },
     ];
-    ring.push(Sqe::writev(RawFd::from_raw(fd as usize), &write_vecs, 0).user_data(1))
+    ring.push(unsafe { Sqe::writev(RawFd::from_raw(fd as usize), &write_vecs, 0) }.user_data(1))
         .expect("failed to push writev");
     ring.submit_and_wait(1).expect("failed to submit writev");
 
@@ -834,7 +841,7 @@ fn vectored_read_write() {
 
     let mut read_buf = [0u8; 64];
     let read_vecs = [unsafe { IoVec::new(read_buf.as_mut_ptr(), read_buf.len()) }];
-    ring.push(Sqe::readv(RawFd::from_raw(fd as usize), &read_vecs, 0).user_data(2))
+    ring.push(unsafe { Sqe::readv(RawFd::from_raw(fd as usize), &read_vecs, 0) }.user_data(2))
         .expect("failed to push readv");
     ring.submit_and_wait(1).expect("failed to submit readv");
 
@@ -1024,7 +1031,7 @@ fn tcp_handshake(ring: &mut IoUring, listener: i32, client: i32, port: u16) -> i
             core::mem::size_of::<SockAddrIn>(),
         )
     };
-    ring.push(Sqe::connect(RawFd::from_raw(client as usize), addr_bytes).user_data(2))
+    ring.push(unsafe { Sqe::connect(RawFd::from_raw(client as usize), addr_bytes) }.user_data(2))
         .expect("push connect");
     ring.submit_and_wait(2).expect("submit handshake");
 
@@ -1072,7 +1079,7 @@ fn tcp_send_recv_roundtrip() {
             core::mem::size_of::<SockAddrIn>(),
         )
     };
-    ring.push(Sqe::connect(RawFd::from_raw(client as usize), addr_bytes).user_data(2))
+    ring.push(unsafe { Sqe::connect(RawFd::from_raw(client as usize), addr_bytes) }.user_data(2))
         .expect("push connect");
 
     ring.submit_and_wait(2).expect("submit");
@@ -1095,8 +1102,11 @@ fn tcp_send_recv_roundtrip() {
 
     // Send from client, recv on server
     let msg = b"hello from io_uring!";
-    ring.push(Sqe::send(RawFd::from_raw(client as usize), msg, MsgFlags::default()).user_data(3))
-        .expect("push send");
+    ring.push(
+        unsafe { Sqe::send(RawFd::from_raw(client as usize), msg, MsgFlags::default()) }
+            .user_data(3),
+    )
+    .expect("push send");
     ring.submit_and_wait(1).expect("submit send");
     let cqe = ring.complete().expect("send cqe");
     assert_eq!(cqe.user_data, 3);
@@ -1104,11 +1114,13 @@ fn tcp_send_recv_roundtrip() {
 
     let mut recv_buf = [0u8; 64];
     ring.push(
-        Sqe::recv(
-            RawFd::from_raw(server_fd as usize),
-            &mut recv_buf,
-            MsgFlags::default(),
-        )
+        unsafe {
+            Sqe::recv(
+                RawFd::from_raw(server_fd as usize),
+                &mut recv_buf,
+                MsgFlags::default(),
+            )
+        }
         .user_data(4),
     )
     .expect("push recv");
@@ -1155,7 +1167,7 @@ fn provided_buffer_ring_buffer_mut_allows_inplace_edit() {
             core::mem::size_of::<SockAddrIn>(),
         )
     };
-    ring.push(Sqe::connect(RawFd::from_raw(client as usize), addr_bytes).user_data(2))
+    ring.push(unsafe { Sqe::connect(RawFd::from_raw(client as usize), addr_bytes) }.user_data(2))
         .expect("push connect");
     ring.submit_and_wait(2).expect("submit");
 
@@ -1169,8 +1181,11 @@ fn provided_buffer_ring_buffer_mut_allows_inplace_edit() {
     assert!(server_fd >= 0);
 
     let msg = b"mutate me";
-    ring.push(Sqe::send(RawFd::from_raw(client as usize), msg, MsgFlags::default()).user_data(3))
-        .expect("push send");
+    ring.push(
+        unsafe { Sqe::send(RawFd::from_raw(client as usize), msg, MsgFlags::default()) }
+            .user_data(3),
+    )
+    .expect("push send");
     let recv_sqe = unsafe {
         Sqe::recv_ptr(
             RawFd::from_raw(server_fd as usize),
@@ -1289,7 +1304,7 @@ fn provided_buffer_ring_recv() {
             core::mem::size_of::<SockAddrIn>(),
         )
     };
-    ring.push(Sqe::connect(RawFd::from_raw(client as usize), addr_bytes).user_data(2))
+    ring.push(unsafe { Sqe::connect(RawFd::from_raw(client as usize), addr_bytes) }.user_data(2))
         .expect("push connect");
     ring.submit_and_wait(2).expect("submit");
 
@@ -1312,8 +1327,11 @@ fn provided_buffer_ring_recv() {
     // Send from client; recv on server using buffer select (len=0
     // tells the kernel to use the selected buffer's length).
     let msg = b"provided buffers!";
-    ring.push(Sqe::send(RawFd::from_raw(client as usize), msg, MsgFlags::default()).user_data(3))
-        .expect("push send");
+    ring.push(
+        unsafe { Sqe::send(RawFd::from_raw(client as usize), msg, MsgFlags::default()) }
+            .user_data(3),
+    )
+    .expect("push send");
     let recv_sqe = unsafe {
         Sqe::recv_ptr(
             RawFd::from_raw(server_fd as usize),
@@ -1846,7 +1864,8 @@ fn sqe_builder_epoll_ctl_places_fields_correctly() {
         data: 42,
     };
     let sqe =
-        Sqe::epoll_ctl(RawFd::from_raw(9), EpollOp::Add, RawFd::from_raw(4), &event).user_data(88);
+        unsafe { Sqe::epoll_ctl(RawFd::from_raw(9), EpollOp::Add, RawFd::from_raw(4), &event) }
+            .user_data(88);
     let inner = sqe.0;
     assert_eq!(Opcode::EpollCtl, inner.opcode);
     assert_eq!(inner.fd, 9); // epfd
@@ -1878,7 +1897,7 @@ fn sqe_builder_openat2_places_fields_correctly() {
         resolve: 0,
     };
     let path = c"/tmp/x";
-    let sqe = Sqe::openat2(types::AT_FDCWD, path, &how).user_data(99);
+    let sqe = unsafe { Sqe::openat2(types::AT_FDCWD, path, &how) }.user_data(99);
     let inner = sqe.0;
     assert_eq!(Opcode::Openat2, inner.opcode);
     assert_eq!(inner.fd, types::AT_FDCWD);
@@ -1892,7 +1911,7 @@ fn sqe_builder_openat2_places_fields_correctly() {
 fn sqe_builder_send_zc_places_fields_correctly() {
     use crate::types::{MsgFlags, Opcode};
     let buf = b"zero copy!";
-    let sqe = Sqe::send_zc(RawFd::from_raw(5), buf, MsgFlags::NOSIGNAL).user_data(66);
+    let sqe = unsafe { Sqe::send_zc(RawFd::from_raw(5), buf, MsgFlags::NOSIGNAL) }.user_data(66);
     let inner = sqe.0;
     assert_eq!(Opcode::SendZc, inner.opcode);
     assert_eq!(inner.fd, 5);
@@ -1906,7 +1925,7 @@ fn sqe_builder_send_zc_places_fields_correctly() {
 fn sqe_builder_files_update_places_fields_correctly() {
     use crate::types::Opcode;
     let fds = [3i32, 4, -1];
-    let sqe = Sqe::files_update(&fds, 2).user_data(44);
+    let sqe = unsafe { Sqe::files_update(&fds, 2) }.user_data(44);
     let inner = sqe.0;
     assert_eq!(Opcode::FilesUpdate, inner.opcode);
     assert_eq!(inner.addr, fds.as_ptr() as u64);
@@ -1980,8 +1999,8 @@ fn sqe_builder_recv_multishot_places_fields_correctly() {
 fn sqe_builder_with_poll_first_sets_ioprio_bit() {
     use crate::types::{IORING_RECVSEND_POLL_FIRST, MsgFlags, Opcode, SendRecvFlag};
     let buf = [0u8; 4];
-    let sqe =
-        Sqe::send(RawFd::from_raw(9), &buf, MsgFlags::default()).with(SendRecvFlag::PollFirst);
+    let sqe = unsafe { Sqe::send(RawFd::from_raw(9), &buf, MsgFlags::default()) }
+        .with(SendRecvFlag::PollFirst);
     let inner = sqe.0;
     assert_eq!(Opcode::Send, inner.opcode);
     assert_eq!(inner.fd, 9);
@@ -1995,8 +2014,8 @@ fn sqe_builder_with_poll_first_sets_ioprio_bit() {
 fn sqe_builder_with_fixed_buf_sets_ioprio_and_index() {
     use crate::types::{IORING_RECVSEND_FIXED_BUF, MsgFlags, SendRecvFlag};
     let buf = [0u8; 4];
-    let sqe =
-        Sqe::send(RawFd::from_raw(3), &buf, MsgFlags::default()).with(SendRecvFlag::FixedBuf(7));
+    let sqe = unsafe { Sqe::send(RawFd::from_raw(3), &buf, MsgFlags::default()) }
+        .with(SendRecvFlag::FixedBuf(7));
     let inner = sqe.0;
     assert_eq!(
         inner.ioprio & IORING_RECVSEND_FIXED_BUF,
@@ -2009,8 +2028,8 @@ fn sqe_builder_with_fixed_buf_sets_ioprio_and_index() {
 fn sqe_builder_with_report_usage_sets_ioprio_bit() {
     use crate::types::{IORING_SEND_ZC_REPORT_USAGE, MsgFlags, Opcode, SendRecvFlag};
     let buf = [0u8; 4];
-    let sqe =
-        Sqe::send_zc(RawFd::from_raw(2), &buf, MsgFlags::default()).with(SendRecvFlag::ReportUsage);
+    let sqe = unsafe { Sqe::send_zc(RawFd::from_raw(2), &buf, MsgFlags::default()) }
+        .with(SendRecvFlag::ReportUsage);
     let inner = sqe.0;
     assert_eq!(Opcode::SendZc, inner.opcode);
     assert_eq!(
@@ -2025,7 +2044,7 @@ fn sqe_builder_with_chains_multiple_flags() {
         IORING_RECVSEND_FIXED_BUF, IORING_RECVSEND_POLL_FIRST, MsgFlags, SendRecvFlag,
     };
     let buf = [0u8; 4];
-    let sqe = Sqe::send(RawFd::from_raw(5), &buf, MsgFlags::default())
+    let sqe = unsafe { Sqe::send(RawFd::from_raw(5), &buf, MsgFlags::default()) }
         .with(SendRecvFlag::PollFirst)
         .with(SendRecvFlag::FixedBuf(3));
     let inner = sqe.0;
@@ -2038,7 +2057,7 @@ fn sqe_builder_with_chains_multiple_flags() {
 fn sqe_builder_personality_sets_field() {
     use crate::types::MsgFlags;
     let buf = [0u8; 4];
-    let sqe = Sqe::send(RawFd::from_raw(1), &buf, MsgFlags::default()).personality(42);
+    let sqe = unsafe { Sqe::send(RawFd::from_raw(1), &buf, MsgFlags::default()) }.personality(42);
     assert_eq!(sqe.0.personality, 42);
 }
 
@@ -2382,7 +2401,7 @@ fn splice_pipe_roundtrip() {
     let msg = b"splice test data";
 
     // Write to the pipe's write end directly
-    ring.push(Sqe::write(RawFd::from_raw(write_end as usize), msg, 0).user_data(1))
+    ring.push(unsafe { Sqe::write(RawFd::from_raw(write_end as usize), msg, 0) }.user_data(1))
         .expect("push write");
     ring.submit_and_wait(1).expect("submit write");
     let cqe = ring.complete().expect("write cqe");
@@ -2408,7 +2427,7 @@ fn splice_pipe_roundtrip() {
 
     // Verify the data landed in the file
     let mut read_buf = [0u8; 64];
-    ring.push(Sqe::read(RawFd::from_raw(fd as usize), &mut read_buf, 0).user_data(3))
+    ring.push(unsafe { Sqe::read(RawFd::from_raw(fd as usize), &mut read_buf, 0) }.user_data(3))
         .expect("push read");
     ring.submit_and_wait(1).expect("submit read");
     let cqe = ring.complete().expect("read cqe");
@@ -2428,7 +2447,7 @@ fn fadvise_roundtrip() {
     let fd = open_tmpfile(&mut ring);
 
     let buf = b"fadvise data";
-    ring.push(Sqe::write(RawFd::from_raw(fd as usize), buf, 0).user_data(1))
+    ring.push(unsafe { Sqe::write(RawFd::from_raw(fd as usize), buf, 0) }.user_data(1))
         .expect("push");
     ring.submit_and_wait(1).expect("submit");
     ring.complete().expect("write cqe");
@@ -2465,7 +2484,7 @@ fn openat2_basic() {
         mode: 0o600,
         resolve: 0,
     };
-    ring.push(Sqe::openat2(types::AT_FDCWD, &path, &how).user_data(1))
+    ring.push(unsafe { Sqe::openat2(types::AT_FDCWD, &path, &how) }.user_data(1))
         .expect("push openat2");
     ring.submit_and_wait(1).expect("submit");
     let cqe = ring.complete().expect("openat2 cqe");
@@ -2474,12 +2493,8 @@ fn openat2_basic() {
 
     let _ = syscall::close(RawFd::from_raw(cqe.result as usize));
     // cleanup
-    ring.push(Sqe::unlinkat(
-        crate::types::DirFd::Cwd,
-        &path,
-        UnlinkFlags::default(),
-    ))
-    .expect("push unlinkat");
+    ring.push(unsafe { Sqe::unlinkat(crate::types::DirFd::Cwd, &path, UnlinkFlags::default()) })
+        .expect("push unlinkat");
     ring.submit_and_wait(1).expect("submit unlinkat");
     let _ = ring.complete();
 }
@@ -2509,7 +2524,7 @@ fn send_zc_roundtrip() {
             mem::size_of::<SockAddrIn>(),
         )
     };
-    ring.push(Sqe::connect(RawFd::from_raw(client as usize), addr_bytes).user_data(2))
+    ring.push(unsafe { Sqe::connect(RawFd::from_raw(client as usize), addr_bytes) }.user_data(2))
         .expect("push connect");
     ring.submit_and_wait(2).expect("submit accept+connect");
 
@@ -2527,14 +2542,19 @@ fn send_zc_roundtrip() {
     // CqeFlags::NOTIF). The NOTIF may arrive in any order relative to other ops.
     let msg = b"zero copy send";
     let mut recv_buf = [0u8; 64];
-    ring.push(Sqe::send_zc(RawFd::from_raw(client as usize), msg, MsgFlags::NOSIGNAL).user_data(3))
-        .expect("push send_zc");
     ring.push(
-        Sqe::recv(
-            RawFd::from_raw(server_fd as usize),
-            &mut recv_buf,
-            MsgFlags::default(),
-        )
+        unsafe { Sqe::send_zc(RawFd::from_raw(client as usize), msg, MsgFlags::NOSIGNAL) }
+            .user_data(3),
+    )
+    .expect("push send_zc");
+    ring.push(
+        unsafe {
+            Sqe::recv(
+                RawFd::from_raw(server_fd as usize),
+                &mut recv_buf,
+                MsgFlags::default(),
+            )
+        }
         .user_data(4),
     )
     .expect("push recv");
@@ -2646,12 +2666,14 @@ fn accept_with_addr_roundtrip() {
     let mut peer_addrlen = mem::size_of::<SockAddrIn>() as u32;
 
     ring.push(
-        Sqe::accept_with_addr(
-            RawFd::from_raw(listener as usize),
-            &mut peer_addr,
-            &mut peer_addrlen,
-            AcceptFlags::default(),
-        )
+        unsafe {
+            Sqe::accept_with_addr(
+                RawFd::from_raw(listener as usize),
+                &mut peer_addr,
+                &mut peer_addrlen,
+                AcceptFlags::default(),
+            )
+        }
         .user_data(1),
     )
     .expect("push accept_with_addr");
@@ -2668,7 +2690,7 @@ fn accept_with_addr_roundtrip() {
             mem::size_of::<SockAddrIn>(),
         )
     };
-    ring.push(Sqe::connect(RawFd::from_raw(client as usize), addr_bytes).user_data(2))
+    ring.push(unsafe { Sqe::connect(RawFd::from_raw(client as usize), addr_bytes) }.user_data(2))
         .expect("push connect");
 
     ring.submit_and_wait(2).expect("submit");
@@ -2708,7 +2730,7 @@ fn update_registered_files_replaces_slot() {
     // Slot 0 now points to fd2; use a regular write through the fixed slot.
     let msg = b"via updated fixed fd";
     ring.push(
-        Sqe::write(RawFd::from_raw(0), msg, 0)
+        unsafe { Sqe::write(RawFd::from_raw(0), msg, 0) }
             .fixed_file()
             .user_data(1),
     )

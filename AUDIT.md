@@ -75,7 +75,29 @@ It reported **52 types, 8 levels, 89 dependency edges, 37 skip edges, 6 back-edg
 
 ### Q-01 — Safe SQEs erase lifetimes and permit arbitrary raw submissions
 
-**Status: confirmed.**
+**Status: Phase 0 containment fixed.** Every `Sqe` constructor that stores a
+pointer derived from caller data — whether it took a structured
+reference/slice/`&CStr` or a raw pointer directly — is now `unsafe fn`,
+including `Sqe::from_raw`. This closes the specific defect described below
+(a safe constructor call compiling without any `unsafe` token at the actual
+unsound boundary) but is containment, not the Phase 2 owned-request/lease
+redesign the original remediation calls for: callers can still write
+`unsafe { Sqe::read(...) }` around a dangling buffer and get past the
+compiler, because the contract is still documented-and-trusted rather than
+type-enforced. Eight `trybuild` compile-fail regression tests
+(`tests/ui/*_requires_unsafe.rs`, driven by `tests/compile_fail.rs`) pin
+that every previously-safe pointer-bearing constructor now fails to compile
+without an `unsafe` block; they will catch a regression back to an
+accidentally-safe signature but do not — and cannot — prove the unsafe
+contracts callers write are actually upheld. The five `do_*` convenience
+methods in `src/ring/ops.rs` build their now-unsafe SQEs internally inside
+an `unsafe` block justified by `run_one`'s submit-and-wait-before-return
+structure; that justification still carries Q-03's residual
+completion-correlation caveat below. The full Phase 2 fix — owned in-flight
+requests whose lifetime the type system ties to the operation's terminal
+completion — remains open.
+
+**Status (original): confirmed.**
 
 **Evidence:** `src/op/mod.rs:21–69` defines `Sqe` without a lifetime, derives `Copy`/`Clone`, acknowledges that constructors only borrow during construction, and exposes safe `from_raw`. `src/op/file.rs:57–98` converts slices into pointers. `IoUring::push` and `Submitter::push` in `src/ring/mod.rs` accept those entries safely; subsequent publication/submission is also safe. Related pointer-bearing constructors exist in the network/control/buffer operation modules. `src/ring/register.rs::register_buffers` accepts `IoVec` descriptions without owning the backing storage.
 

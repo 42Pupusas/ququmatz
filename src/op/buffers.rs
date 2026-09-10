@@ -65,9 +65,16 @@ impl Sqe {
     }
 
     /// Prepare a `files_update` operation from a slice.
+    ///
+    /// # Safety
+    ///
+    /// `fds` is borrowed only for this call — the returned `Sqe` stores a
+    /// raw pointer derived from it, not the borrow itself. The caller must
+    /// ensure the memory `fds` points to remains valid until the kernel
+    /// posts the completion for this operation.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn files_update(fds: &[i32], offset: u32) -> Self {
+    pub unsafe fn files_update(fds: &[i32], offset: u32) -> Self {
         debug_assert!(fds.len() <= u32::MAX as usize);
         unsafe { Self::files_update_ptr(fds.as_ptr(), fds.len() as u32, offset) }
     }

@@ -25,14 +25,21 @@ impl IoUring {
 
     /// Read from `fd` into `buf` at `offset`. Returns the byte count.
     ///
-    /// The buffer is borrowed for the entire submit-and-wait cycle, so
-    /// this is fully safe — no lifetime concerns.
+    /// `buf` is borrowed for the entire submit-and-wait cycle inside this
+    /// call, which upholds `Sqe::read`'s safety contract without the
+    /// caller needing an `unsafe` block themselves. See this crate's `Sqe`
+    /// documentation for the completion-correlation caveat that still
+    /// applies to every synchronous `do_*` helper.
     ///
     /// # Errors
     ///
     /// Returns an [`Error`] if the submission or the kernel operation fails.
     pub fn do_read(&mut self, fd: RawFd, buf: &mut [u8], offset: u64) -> Result<u32, Error> {
-        self.run_one(Sqe::read(fd, buf, offset))
+        // Safety: `buf` is borrowed by this call for its entire duration —
+        // `run_one` submits and waits for the single completion before
+        // returning, so the kernel cannot still be accessing `buf` after
+        // this method returns.
+        self.run_one(unsafe { Sqe::read(fd, buf, offset) })
     }
 
     /// Write `buf` to `fd` at `offset`. Returns the byte count.
@@ -41,7 +48,9 @@ impl IoUring {
     ///
     /// Returns an [`Error`] if the submission or the kernel operation fails.
     pub fn do_write(&mut self, fd: RawFd, buf: &[u8], offset: u64) -> Result<u32, Error> {
-        self.run_one(Sqe::write(fd, buf, offset))
+        // Safety: see `do_read` — `buf` outlives the kernel's access to it
+        // because `run_one` submits and waits before returning.
+        self.run_one(unsafe { Sqe::write(fd, buf, offset) })
     }
 
     /// Open a file relative to `dfd`. Returns the new fd as `u32`.
@@ -56,7 +65,9 @@ impl IoUring {
         flags: OpenFlags,
         mode: FileMode,
     ) -> Result<u32, Error> {
-        self.run_one(Sqe::openat(dfd, path, flags, mode))
+        // Safety: see `do_read` — `path` outlives the kernel's access to
+        // it because `run_one` submits and waits before returning.
+        self.run_one(unsafe { Sqe::openat(dfd, path, flags, mode) })
     }
 
     /// Close a file descriptor via io\_uring.
@@ -74,7 +85,9 @@ impl IoUring {
     ///
     /// Returns an [`Error`] if the submission or the kernel operation fails.
     pub fn do_send(&mut self, fd: RawFd, buf: &[u8], flags: MsgFlags) -> Result<u32, Error> {
-        self.run_one(Sqe::send(fd, buf, flags))
+        // Safety: see `do_read` — `buf` outlives the kernel's access to it
+        // because `run_one` submits and waits before returning.
+        self.run_one(unsafe { Sqe::send(fd, buf, flags) })
     }
 
     /// Receive data from a socket into `buf`. Returns the byte count.
@@ -83,7 +96,9 @@ impl IoUring {
     ///
     /// Returns an [`Error`] if the submission or the kernel operation fails.
     pub fn do_recv(&mut self, fd: RawFd, buf: &mut [u8], flags: MsgFlags) -> Result<u32, Error> {
-        self.run_one(Sqe::recv(fd, buf, flags))
+        // Safety: see `do_read` — `buf` outlives the kernel's access to it
+        // because `run_one` submits and waits before returning.
+        self.run_one(unsafe { Sqe::recv(fd, buf, flags) })
     }
 
     /// Accept a connection (without capturing the peer address). Returns
@@ -109,7 +124,10 @@ impl IoUring {
         mask: StatxMask,
         statx_buf: &mut Statx,
     ) -> Result<u32, Error> {
-        self.run_one(Sqe::statx(dfd, path, flags, mask, statx_buf))
+        // Safety: see `do_read` — `path` and `statx_buf` outlive the
+        // kernel's access to them because `run_one` submits and waits
+        // before returning.
+        self.run_one(unsafe { Sqe::statx(dfd, path, flags, mask, statx_buf) })
     }
 
     /// Fsync a file descriptor.

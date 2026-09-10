@@ -8,8 +8,15 @@ impl Sqe {
     ///
     /// `epfd` is the epoll fd, `op` is Add/Del/Mod, `fd` is the target fd,
     /// and `event` is the event to register (ignored for `Del`).
+    ///
+    /// # Safety
+    ///
+    /// `event` is borrowed only for this call — the returned `Sqe` stores
+    /// a raw pointer derived from it, not the borrow itself. The caller
+    /// must ensure the memory `event` points to remains valid until the
+    /// kernel posts the completion for this operation.
     #[must_use]
-    pub fn epoll_ctl(epfd: RawFd, op: EpollOp, fd: RawFd, event: &EpollEvent) -> Self {
+    pub unsafe fn epoll_ctl(epfd: RawFd, op: EpollOp, fd: RawFd, event: &EpollEvent) -> Self {
         unsafe { Self::epoll_ctl_ptr(epfd, op, fd, core::ptr::from_ref(event)) }
     }
 

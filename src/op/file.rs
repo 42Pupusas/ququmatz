@@ -57,9 +57,17 @@ impl Sqe {
     ///
     /// Reads up to `buf.len()` bytes from `fd` at `offset` into `buf`.
     /// Use offset `u64::MAX` (`-1` as unsigned) for current file position.
+    ///
+    /// # Safety
+    ///
+    /// `buf` is borrowed only for this call — the returned `Sqe` stores a
+    /// raw pointer derived from it, not the borrow itself. The caller must
+    /// ensure the memory `buf` points to remains valid, writable, and
+    /// exclusively accessible (no other live reference to it) until the
+    /// kernel posts the completion for this operation.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn read(fd: RawFd, buf: &mut [u8], offset: u64) -> Self {
+    pub unsafe fn read(fd: RawFd, buf: &mut [u8], offset: u64) -> Self {
         debug_assert!(buf.len() <= u32::MAX as usize);
         unsafe { Self::read_ptr(fd, buf.as_mut_ptr(), buf.len() as u32, offset) }
     }
@@ -68,9 +76,16 @@ impl Sqe {
     ///
     /// Writes `buf.len()` bytes from `buf` to `fd` at `offset`.
     /// Use offset `u64::MAX` (`-1` as unsigned) for current file position.
+    ///
+    /// # Safety
+    ///
+    /// `buf` is borrowed only for this call — the returned `Sqe` stores a
+    /// raw pointer derived from it, not the borrow itself. The caller must
+    /// ensure the memory `buf` points to remains valid and readable until
+    /// the kernel posts the completion for this operation.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn write(fd: RawFd, buf: &[u8], offset: u64) -> Self {
+    pub unsafe fn write(fd: RawFd, buf: &[u8], offset: u64) -> Self {
         debug_assert!(buf.len() <= u32::MAX as usize);
         unsafe { Self::write_ptr(fd, buf.as_ptr(), buf.len() as u32, offset) }
     }
@@ -78,9 +93,16 @@ impl Sqe {
     /// Prepare a vectored read operation.
     ///
     /// Reads from `fd` at `offset` into the buffers described by `iovecs`.
+    ///
+    /// # Safety
+    ///
+    /// `iovecs` and every buffer each `IoVec` describes must remain valid,
+    /// writable, and exclusively accessible until the kernel posts the
+    /// completion for this operation. Borrowing `iovecs` here does not
+    /// extend to the resulting `Sqe`.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn readv(fd: RawFd, iovecs: &[IoVec], offset: u64) -> Self {
+    pub unsafe fn readv(fd: RawFd, iovecs: &[IoVec], offset: u64) -> Self {
         debug_assert!(iovecs.len() <= u32::MAX as usize);
         unsafe { Self::readv_ptr(fd, iovecs.as_ptr(), iovecs.len() as u32, offset) }
     }
@@ -88,9 +110,16 @@ impl Sqe {
     /// Prepare a vectored write operation.
     ///
     /// Writes to `fd` at `offset` from the buffers described by `iovecs`.
+    ///
+    /// # Safety
+    ///
+    /// `iovecs` and every buffer each `IoVec` describes must remain valid
+    /// and readable until the kernel posts the completion for this
+    /// operation. Borrowing `iovecs` here does not extend to the resulting
+    /// `Sqe`.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn writev(fd: RawFd, iovecs: &[IoVec], offset: u64) -> Self {
+    pub unsafe fn writev(fd: RawFd, iovecs: &[IoVec], offset: u64) -> Self {
         debug_assert!(iovecs.len() <= u32::MAX as usize);
         unsafe { Self::writev_ptr(fd, iovecs.as_ptr(), iovecs.len() as u32, offset) }
     }
@@ -221,8 +250,20 @@ impl Sqe {
     ///
     /// Opens a file relative to `dfd`. Use [`DirFd::Cwd`] to resolve the
     /// path relative to the current working directory.
+    ///
+    /// # Safety
+    ///
+    /// `path` is borrowed only for this call — the returned `Sqe` stores a
+    /// raw pointer derived from it, not the borrow itself. The caller must
+    /// ensure the memory `path` points to remains valid until the kernel
+    /// posts the completion for this operation.
     #[must_use]
-    pub fn openat(dfd: DirFd, path: &core::ffi::CStr, flags: OpenFlags, mode: FileMode) -> Self {
+    pub unsafe fn openat(
+        dfd: DirFd,
+        path: &core::ffi::CStr,
+        flags: OpenFlags,
+        mode: FileMode,
+    ) -> Self {
         unsafe { Self::openat_ptr(dfd.as_raw(), path.as_ptr().cast(), flags, mode) }
     }
 
@@ -247,8 +288,15 @@ impl Sqe {
     ///
     /// Like `openat` but accepts an [`OpenHow`] struct for extended control
     /// over flags, mode, and path resolution.
+    ///
+    /// # Safety
+    ///
+    /// `path` and `how` are borrowed only for this call — the returned
+    /// `Sqe` stores raw pointers derived from them, not the borrows
+    /// themselves. The caller must ensure both remain valid until the
+    /// kernel posts the completion for this operation.
     #[must_use]
-    pub fn openat2(dfd: i32, path: &core::ffi::CStr, how: &OpenHow) -> Self {
+    pub unsafe fn openat2(dfd: i32, path: &core::ffi::CStr, how: &OpenHow) -> Self {
         unsafe {
             Self::openat2_ptr(
                 dfd,
@@ -286,8 +334,16 @@ impl Sqe {
     }
 
     /// Prepare a statx operation.
+    ///
+    /// # Safety
+    ///
+    /// `path` and `statx_buf` are borrowed only for this call — the
+    /// returned `Sqe` stores raw pointers derived from them, not the
+    /// borrows themselves. The caller must ensure `path` remains valid and
+    /// `statx_buf` remains valid, writable, and exclusively accessible
+    /// until the kernel posts the completion for this operation.
     #[must_use]
-    pub fn statx(
+    pub unsafe fn statx(
         dfd: DirFd,
         path: &core::ffi::CStr,
         flags: StatxFlags,
@@ -331,8 +387,15 @@ impl Sqe {
     }
 
     /// Prepare a renameat operation.
+    ///
+    /// # Safety
+    ///
+    /// `old_path` and `new_path` are borrowed only for this call — the
+    /// returned `Sqe` stores raw pointers derived from them, not the
+    /// borrows themselves. The caller must ensure both remain valid until
+    /// the kernel posts the completion for this operation.
     #[must_use]
-    pub fn renameat(
+    pub unsafe fn renameat(
         old_dfd: DirFd,
         old_path: &core::ffi::CStr,
         new_dfd: DirFd,
@@ -376,8 +439,15 @@ impl Sqe {
     }
 
     /// Prepare an unlinkat operation.
+    ///
+    /// # Safety
+    ///
+    /// `path` is borrowed only for this call — the returned `Sqe` stores a
+    /// raw pointer derived from it, not the borrow itself. The caller must
+    /// ensure the memory `path` points to remains valid until the kernel
+    /// posts the completion for this operation.
     #[must_use]
-    pub fn unlinkat(dfd: DirFd, path: &core::ffi::CStr, flags: UnlinkFlags) -> Self {
+    pub unsafe fn unlinkat(dfd: DirFd, path: &core::ffi::CStr, flags: UnlinkFlags) -> Self {
         unsafe { Self::unlinkat_ptr(dfd.as_raw(), path.as_ptr().cast(), flags) }
     }
 
@@ -398,8 +468,15 @@ impl Sqe {
     }
 
     /// Prepare a mkdirat operation.
+    ///
+    /// # Safety
+    ///
+    /// `path` is borrowed only for this call — the returned `Sqe` stores a
+    /// raw pointer derived from it, not the borrow itself. The caller must
+    /// ensure the memory `path` points to remains valid until the kernel
+    /// posts the completion for this operation.
     #[must_use]
-    pub fn mkdirat(dfd: DirFd, path: &core::ffi::CStr, mode: FileMode) -> Self {
+    pub unsafe fn mkdirat(dfd: DirFd, path: &core::ffi::CStr, mode: FileMode) -> Self {
         unsafe { Self::mkdirat_ptr(dfd.as_raw(), path.as_ptr().cast(), mode) }
     }
 

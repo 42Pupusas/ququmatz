@@ -1,0 +1,7 @@
+error[E0133]: call to unsafe function `op::control::<impl Sqe>::timeout` is unsafe and requires unsafe block
+ --> tests/ui/timeout_requires_unsafe.rs:5:16
+  |
+5 |     let _sqe = Sqe::timeout(&ts, 0, TimeoutFlags::default());
+  |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+  |
+  = note: consult the function's documentation for information on how to avoid undefined behavior

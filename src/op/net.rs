@@ -73,9 +73,16 @@ impl Sqe {
     }
 
     /// Prepare a connect operation.
+    ///
+    /// # Safety
+    ///
+    /// `addr` is borrowed only for this call — the returned `Sqe` stores a
+    /// raw pointer derived from it, not the borrow itself. The caller must
+    /// ensure the memory `addr` points to remains valid until the kernel
+    /// posts the completion for this operation.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn connect(fd: RawFd, addr: &[u8]) -> Self {
+    pub unsafe fn connect(fd: RawFd, addr: &[u8]) -> Self {
         unsafe { Self::connect_ptr(fd, addr.as_ptr(), addr.len() as u32) }
     }
 
@@ -130,8 +137,16 @@ impl Sqe {
     ///
     /// On completion `addr` is populated with the peer's `SockAddrIn` and
     /// `addrlen` is updated to the actual address length.
+    ///
+    /// # Safety
+    ///
+    /// `addr` and `addrlen` are borrowed only for this call — the returned
+    /// `Sqe` stores raw pointers derived from them, not the borrows
+    /// themselves. The caller must ensure both remain valid, writable, and
+    /// exclusively accessible until the kernel posts the completion for
+    /// this operation.
     #[must_use]
-    pub fn accept_with_addr(
+    pub unsafe fn accept_with_addr(
         fd: RawFd,
         addr: &mut SockAddrIn,
         addrlen: &mut u32,
@@ -162,9 +177,16 @@ impl Sqe {
     }
 
     /// Prepare a send operation.
+    ///
+    /// # Safety
+    ///
+    /// `buf` is borrowed only for this call — the returned `Sqe` stores a
+    /// raw pointer derived from it, not the borrow itself. The caller must
+    /// ensure the memory `buf` points to remains valid and readable until
+    /// the kernel posts the completion for this operation.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn send(fd: RawFd, buf: &[u8], flags: MsgFlags) -> Self {
+    pub unsafe fn send(fd: RawFd, buf: &[u8], flags: MsgFlags) -> Self {
         debug_assert!(buf.len() <= u32::MAX as usize);
         unsafe { Self::send_ptr(fd, buf.as_ptr(), buf.len() as u32, flags) }
     }
@@ -187,9 +209,17 @@ impl Sqe {
     }
 
     /// Prepare a recv operation.
+    ///
+    /// # Safety
+    ///
+    /// `buf` is borrowed only for this call — the returned `Sqe` stores a
+    /// raw pointer derived from it, not the borrow itself. The caller must
+    /// ensure the memory `buf` points to remains valid, writable, and
+    /// exclusively accessible until the kernel posts the completion for
+    /// this operation.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn recv(fd: RawFd, buf: &mut [u8], flags: MsgFlags) -> Self {
+    pub unsafe fn recv(fd: RawFd, buf: &mut [u8], flags: MsgFlags) -> Self {
         debug_assert!(buf.len() <= u32::MAX as usize);
         unsafe { Self::recv_ptr(fd, buf.as_mut_ptr(), buf.len() as u32, flags) }
     }
@@ -229,8 +259,16 @@ impl Sqe {
     }
 
     /// Prepare a sendmsg operation.
+    ///
+    /// # Safety
+    ///
+    /// `msg` and every buffer it references are borrowed only for this call
+    /// — the returned `Sqe` stores a raw pointer derived from `msg`, not
+    /// the borrow itself. The caller must ensure `msg` and everything it
+    /// points to remain valid and readable until the kernel posts the
+    /// completion for this operation.
     #[must_use]
-    pub fn sendmsg(fd: RawFd, msg: &MsgHdr, flags: MsgFlags) -> Self {
+    pub unsafe fn sendmsg(fd: RawFd, msg: &MsgHdr, flags: MsgFlags) -> Self {
         unsafe { Self::sendmsg_ptr(fd, core::ptr::from_ref(msg), flags) }
     }
 
@@ -252,8 +290,16 @@ impl Sqe {
     }
 
     /// Prepare a recvmsg operation.
+    ///
+    /// # Safety
+    ///
+    /// `msg` and every buffer it references are borrowed only for this call
+    /// — the returned `Sqe` stores a raw pointer derived from `msg`, not
+    /// the borrow itself. The caller must ensure `msg` and everything it
+    /// points to remain valid, writable, and exclusively accessible until
+    /// the kernel posts the completion for this operation.
     #[must_use]
-    pub fn recvmsg(fd: RawFd, msg: &mut MsgHdr, flags: MsgFlags) -> Self {
+    pub unsafe fn recvmsg(fd: RawFd, msg: &mut MsgHdr, flags: MsgFlags) -> Self {
         unsafe { Self::recvmsg_ptr(fd, core::ptr::from_mut(msg), flags) }
     }
 
@@ -303,9 +349,17 @@ impl Sqe {
     /// Like `send`, but the kernel maps the buffer directly into the NIC
     /// without copying. The CQE with `CqeFlags::NOTIF` set confirms when
     /// the kernel has released the buffer — do not free `buf` before then.
+    ///
+    /// # Safety
+    ///
+    /// `buf` is borrowed only for this call — the returned `Sqe` stores a
+    /// raw pointer derived from it, not the borrow itself. The caller must
+    /// ensure the memory `buf` points to remains valid and readable until
+    /// the kernel posts the `CqeFlags::NOTIF` completion that releases it
+    /// — not merely the first completion, which may only signal submission.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn send_zc(fd: RawFd, buf: &[u8], flags: MsgFlags) -> Self {
+    pub unsafe fn send_zc(fd: RawFd, buf: &[u8], flags: MsgFlags) -> Self {
         debug_assert!(buf.len() <= u32::MAX as usize);
         unsafe { Self::send_zc_ptr(fd, buf.as_ptr(), buf.len() as u32, flags) }
     }

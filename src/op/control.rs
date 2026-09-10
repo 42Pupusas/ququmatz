@@ -61,8 +61,15 @@ impl Sqe {
     ///
     /// Completes when either `count` completions have occurred or the timeout
     /// expires, whichever comes first. Use `count = 0` for a pure timer.
+    ///
+    /// # Safety
+    ///
+    /// `ts` is borrowed only for this call — the returned `Sqe` stores a
+    /// raw pointer derived from it, not the borrow itself. The caller must
+    /// ensure the memory `ts` points to remains valid until the kernel
+    /// posts the completion for this operation.
     #[must_use]
-    pub fn timeout(ts: &Timespec, count: u32, flags: TimeoutFlags) -> Self {
+    pub unsafe fn timeout(ts: &Timespec, count: u32, flags: TimeoutFlags) -> Self {
         unsafe { Self::timeout_ptr(core::ptr::from_ref(ts), count, flags) }
     }
 
@@ -70,8 +77,15 @@ impl Sqe {
     ///
     /// Must be submitted immediately after a linked SQE. If the timeout fires
     /// before the linked operation completes, the linked operation is cancelled.
+    ///
+    /// # Safety
+    ///
+    /// `ts` is borrowed only for this call — the returned `Sqe` stores a
+    /// raw pointer derived from it, not the borrow itself. The caller must
+    /// ensure the memory `ts` points to remains valid until the kernel
+    /// posts the completion for this operation.
     #[must_use]
-    pub fn link_timeout(ts: &Timespec, flags: TimeoutFlags) -> Self {
+    pub unsafe fn link_timeout(ts: &Timespec, flags: TimeoutFlags) -> Self {
         unsafe { Self::link_timeout_ptr(core::ptr::from_ref(ts), flags) }
     }
 

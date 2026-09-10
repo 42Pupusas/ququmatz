@@ -23,6 +23,7 @@ dhat = { version = "0.3", optional = true }
 [dev-dependencies]
 divan = "0.1"
 io-uring = "0.7"
+trybuild = "1"
 
 [[bench]]
 name = "io_uring"

@@ -23,23 +23,40 @@ mod net;
 /// Use the constructor methods to create an `Sqe` for a specific operation,
 /// then chain modifiers like `user_data()` before pushing.
 ///
-/// # Safe vs `_ptr` constructors
+/// # Every pointer-bearing constructor is `unsafe`
 ///
-/// Most operations have two constructor variants:
+/// `Sqe` carries no lifetime parameter — it is `Copy`, gets pushed into a
+/// queue, and is read back by the kernel at an unspecified later point,
+/// possibly after the constructor call (and any borrow it performed) has
+/// long since ended. A constructor that accepts a slice or `&CStr` and
+/// stores a raw pointer derived from it therefore cannot make the
+/// resulting `Sqe` safe merely by taking a reference: the reference expires
+/// at the end of the constructor call, not at the end of the operation.
 ///
-/// - **Safe** (e.g. [`read`](Self::read)) — accepts slices, `&CStr`, or
-///   references. Prevents length mismatches and null-termination bugs at
-///   compile time.
-/// - **`_ptr`** (e.g. [`read_ptr`](Self::read_ptr)) — accepts raw pointers.
-///   Marked `unsafe`. Use these when you need full control or are working
-///   with pre-registered buffers.
+/// Accordingly, **every constructor that stores a pointer to caller data**
+/// — whether it takes a structured reference/slice/`&CStr` or a raw
+/// pointer directly — is `unsafe fn`. The safety contract is the same for
+/// both forms: the referenced memory must remain valid, exclusively owned
+/// as required by the operation (readable for sources, writable for
+/// destinations, not aliased by other live references), and unmoved until
+/// the kernel has posted the completion (or, for multishot/zero-copy
+/// operations, until the terminal completion that releases the buffer).
+/// Structured-argument constructors are still worth using over the raw
+/// `_ptr` twins — they prevent length mismatches and null-termination bugs
+/// — but they do not remove the caller's obligation to uphold that
+/// lifetime themselves.
 ///
-/// **Lifetime note:** The safe constructors borrow the underlying data *only
-/// for the duration of the constructor call* — the resulting `Sqe` stores a
-/// raw pointer internally. The caller must ensure the data remains valid
-/// until the io\_uring operation completes. The [`IoUring::do_read`] family
-/// of methods enforces this automatically by borrowing across the full
-/// submit-and-wait cycle.
+/// A handful of constructors genuinely have no such obligation, because
+/// they store no pointer at all (e.g. [`nop`](Self::nop), [`close`](Self::close),
+/// [`fsync`](Self::fsync)) or because the pointer they store is opaque
+/// `user_data`/`fd`/`id` correlation state rather than kernel-dereferenced
+/// memory (e.g. [`cancel`](Self::cancel), [`poll_remove`](Self::poll_remove)).
+/// Those remain safe `fn`s.
+///
+/// The [`IoUring::do_read`] family of methods builds its unsafe SQEs
+/// internally and upholds this contract by borrowing the buffer across the
+/// full submit-and-wait cycle — see that module's documentation for the
+/// residual caveat about completion correlation.
 #[derive(Clone, Copy, Debug)]
 pub struct Sqe(pub(crate) IoUringSqe);
 
@@ -60,10 +77,19 @@ impl Sqe {
 
     /// Construct an `Sqe` from a raw kernel SQE.
     ///
-    /// The caller is responsible for ensuring the SQE is valid
-    /// for the intended operation.
+    /// # Safety
+    ///
+    /// `sqe` must be a completely valid submission for its `opcode`: every
+    /// field the kernel reads for that opcode must be set correctly,
+    /// including any `addr`/`off`/`splice_fd_in` fields that the kernel
+    /// interprets as pointers. If any such pointer is set, the memory it
+    /// references must remain valid, correctly sized, and exclusively
+    /// owned as the operation requires until the kernel posts the
+    /// completion. This constructor performs no validation at all — it is
+    /// the least-checked way to build an `Sqe` and should be reserved for
+    /// lock-free protocols that write the kernel layout directly.
     #[must_use]
-    pub const fn from_raw(sqe: IoUringSqe) -> Self {
+    pub const unsafe fn from_raw(sqe: IoUringSqe) -> Self {
         Self(sqe)
     }
 
