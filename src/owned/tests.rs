@@ -3,11 +3,13 @@
 extern crate std;
 
 use super::{
-    Arrival, Completed, Delivery, Direction, Event, MmapBuffer, Pending, PendingZc, Prepared,
-    PreparedMultishot, PreparedZc, Receipt, RingId, StableBuffer, ZcCompleted,
+    Arrival, Completed, Delivery, Direction, Event, Incoming, MmapBuffer, Pending, PendingZc,
+    Prepared, PreparedAccept, PreparedMultishot, PreparedZc, Receipt, RingId, StableBuffer,
+    ZcCompleted,
 };
 use crate::error::{Error, SubmitError};
-use crate::types::{MsgFlags, RawFd};
+use crate::net::Socket;
+use crate::types::{AcceptFlags, MsgFlags, RawFd};
 
 /// Static proof that a ticket crosses a thread boundary. The whole design
 /// exists to make this true.
@@ -350,6 +352,73 @@ fn tickets_survive_being_moved_to_another_thread() {
     let (result, buf) = handle.join().expect("completion thread");
     assert_eq!(result.expect("write ok"), 4);
     assert_eq!(&buf.as_slice()[..4], b"nyaa");
+}
+
+/// A bound, listening loopback socket that nothing has accepted from, for
+/// exercising accept itself.
+struct Listener {
+    fd: RawFd,
+    addr: crate::types::SockAddrIn,
+}
+
+impl Listener {
+    fn bound() -> Self {
+        use crate::syscall;
+        use crate::types::{self, SockAddrIn};
+
+        let fd = syscall::socket(types::AF_INET, types::SOCK_STREAM, 0).expect("listener");
+        let one: i32 = 1;
+        syscall::setsockopt(
+            fd,
+            1,
+            2,
+            (&raw const one).cast(),
+            core::mem::size_of::<i32>() as u32,
+        )
+        .expect("setsockopt");
+
+        let wanted = SockAddrIn {
+            sin_family: types::AF_INET as u16,
+            sin_port: 0u16.to_be(),
+            sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+            sin_zero: [0; 8],
+        };
+        syscall::bind(
+            fd,
+            (&raw const wanted).cast(),
+            core::mem::size_of::<SockAddrIn>() as u32,
+        )
+        .expect("bind");
+        syscall::listen(fd, 16).expect("listen");
+
+        let mut addr = SockAddrIn::default();
+        let mut len = core::mem::size_of::<SockAddrIn>() as u32;
+        syscall::getsockname(fd, (&raw mut addr).cast(), &raw mut len).expect("getsockname");
+
+        Self { fd, addr }
+    }
+
+    /// Connect a client, returning it so the caller controls its lifetime.
+    fn connect(&self) -> RawFd {
+        use crate::syscall;
+        use crate::types::SockAddrIn;
+
+        let client =
+            syscall::socket(crate::types::AF_INET, crate::types::SOCK_STREAM, 0).expect("client");
+        syscall::connect(
+            client,
+            (&raw const self.addr).cast(),
+            core::mem::size_of::<SockAddrIn>() as u32,
+        )
+        .expect("connect");
+        client
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        let _ = crate::syscall::close(self.fd);
+    }
 }
 
 /// A connected TCP pair on loopback, for exercising real socket ops.
@@ -838,6 +907,178 @@ fn a_multishot_rejects_a_completion_belonging_to_another_request() {
     });
     assert!(!first.matches(&foreign));
     assert!(first.record(foreign, &mut pool).is_err());
+}
+
+#[test]
+fn a_real_multishot_accept_yields_many_connections_from_one_submission() {
+    let listener = Listener::bound();
+    let ring = crate::IoUring::new(16).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut ticket = sub
+        .push_accept(PreparedAccept::on(listener.fd, AcceptFlags::default()))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit");
+
+    let mut clients = std::vec::Vec::new();
+    let mut accepted = std::vec::Vec::new();
+    for _ in 0..3 {
+        clients.push(listener.connect());
+
+        loop {
+            comp.wait(1).expect("wait");
+            let Some(event) = comp.reap_event() else {
+                comp.sync();
+                continue;
+            };
+            match ticket.record(event).expect("our request") {
+                Incoming::Connection(socket) => {
+                    accepted.push(socket);
+                    break;
+                }
+                Incoming::Empty(res) => panic!("empty accept: {res}"),
+                Incoming::Done(fin) => panic!("accept ended: {:?}", fin.result()),
+            }
+        }
+        comp.sync();
+    }
+
+    assert_eq!(accepted.len(), 3, "one armed accept served three clients");
+    // Distinct connections, not the same descriptor reported three times.
+    let mut raw: std::vec::Vec<RawFd> = accepted.iter().map(Socket::fd).collect();
+    raw.sort_unstable();
+    raw.dedup();
+    assert_eq!(raw.len(), 3, "each accept installed its own descriptor");
+
+    // The connections are live: a write on each reaches its client.
+    for (socket, client) in accepted.iter().zip(&clients) {
+        let sent = socket.send(b"hi", MsgFlags::default()).expect("send");
+        assert_eq!(sent, 2);
+        let mut seen = [0u8; 2];
+        let got = crate::syscall::read(*client, seen.as_mut_ptr(), seen.len()).expect("read");
+        assert_eq!(&seen[..got], b"hi");
+    }
+
+    for client in clients {
+        let _ = crate::syscall::close(client);
+    }
+}
+
+#[test]
+fn a_finished_accept_hands_back_the_connection_folded_into_its_last_cqe() {
+    // io_accept() calls fd_install before deciding whether the request
+    // continues, so when it cannot post the extra CQE -- a full completion
+    // queue -- the installed descriptor rides out on the terminal CQE. A
+    // Done that dropped it would leak a live connection. CQ overflow cannot
+    // be forced deterministically from userspace, so this synthesises the
+    // terminal CQE the kernel would emit.
+    let listener = Listener::bound();
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut ticket = sub
+        .push_accept(PreparedAccept::on(listener.fd, AcceptFlags::default()))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    // A real descriptor, so the Socket that adopts it closes something
+    // valid rather than a fabricated number.
+    let client = listener.connect();
+    let mut peer = crate::types::SockAddrIn::default();
+    let mut peer_len = core::mem::size_of::<crate::types::SockAddrIn>() as u32;
+    let installed =
+        crate::syscall::accept4(listener.fd, (&raw mut peer).cast(), &raw mut peer_len, 0)
+            .expect("accept");
+
+    let terminal = Event::Complete(super::request::Receipt {
+        ring: ticket.ring(),
+        id: ticket.id(),
+        result: installed.as_i32(),
+        flags: crate::types::CqeFlags::default(),
+    });
+
+    let incoming = ticket.record(terminal).expect("our request");
+    assert!(!incoming.armed().is_armed(), "terminal means not armed");
+    let Incoming::Done(finished) = incoming else {
+        panic!("a terminal CQE is a Done");
+    };
+    let socket = finished.last().expect("the folded connection");
+    assert_eq!(socket.fd(), installed);
+
+    // It is a live connection, not just a number: it can still talk.
+    let sent = socket.send(b"ok", MsgFlags::default()).expect("send");
+    assert_eq!(sent, 2);
+    let mut seen = [0u8; 2];
+    let got = crate::syscall::read(client, seen.as_mut_ptr(), seen.len()).expect("read");
+    assert_eq!(&seen[..got], b"ok");
+
+    let (_receipt, last) = finished.into_parts();
+    assert!(last.is_some(), "into_parts surrenders the connection");
+    drop(last);
+    let _ = crate::syscall::close(client);
+}
+
+#[test]
+fn a_failed_accept_completion_carries_no_connection() {
+    // A negative result is an errno, not a descriptor. Adopting it would
+    // build a Socket that closes a nonsense fd on drop.
+    let listener = Listener::bound();
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut ticket = sub
+        .push_accept(PreparedAccept::on(listener.fd, AcceptFlags::default()))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let failed = Event::Complete(super::request::Receipt {
+        ring: ticket.ring(),
+        id: ticket.id(),
+        result: -9,
+        flags: crate::types::CqeFlags::default(),
+    });
+    let Incoming::Done(finished) = ticket.record(failed).expect("our request") else {
+        panic!("a terminal CQE is a Done");
+    };
+    assert!(finished.last().is_none(), "an errno is not a descriptor");
+    assert!(finished.result().is_err(), "EBADF is reported as an error");
+
+    let armed_failure = Event::Partial(super::event::PartialReceipt {
+        ring: ticket.ring(),
+        id: ticket.id(),
+        result: -11,
+        flags: crate::types::CqeFlags::MORE,
+    });
+    let incoming = ticket.record(armed_failure).expect("our request");
+    assert!(incoming.armed().is_armed(), "still accepting");
+    assert!(
+        matches!(incoming, Incoming::Empty(-11)),
+        "a non-terminal error carries the errno, not a socket"
+    );
+}
+
+#[test]
+fn an_accept_rejects_a_completion_belonging_to_another_request() {
+    let listener = Listener::bound();
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut first = sub
+        .push_accept(PreparedAccept::on(listener.fd, AcceptFlags::default()))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let second = sub
+        .push_accept(PreparedAccept::on(listener.fd, AcceptFlags::default()))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    assert_ne!(first.id().raw(), second.id().raw());
+
+    // Accepting another request's completion would adopt a descriptor that
+    // belongs to a different listener's stream.
+    let foreign = Event::Partial(super::event::PartialReceipt {
+        ring: second.ring(),
+        id: second.id(),
+        result: 7,
+        flags: crate::types::CqeFlags::MORE,
+    });
+    assert!(!first.matches(&foreign));
+    assert!(first.record(foreign).is_err());
 }
 
 #[test]

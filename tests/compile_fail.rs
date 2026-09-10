@@ -48,3 +48,13 @@ fn a_multishot_arrival_cannot_escape_or_alias_its_pool() {
     t.compile_fail("tests/ui/arrival_cannot_outlive_its_pool.rs");
     t.compile_fail("tests/ui/two_arrivals_cannot_be_held_at_once.rs");
 }
+
+/// An accepted connection is owned rather than borrowed, so the compiler
+/// cannot tie it to a pool the way it does an arrival. What it can do is
+/// refuse to let the result be thrown away unread, which is the failure
+/// that would leak a live descriptor.
+#[test]
+fn an_accepted_connection_cannot_be_discarded_unread() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/an_accepted_connection_cannot_be_dropped_silently.rs");
+}

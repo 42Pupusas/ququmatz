@@ -22,6 +22,7 @@ use core::mem;
 ///
 /// Closes the underlying fd on drop. Use [`Socket::fd`] to obtain the raw
 /// descriptor for io\_uring operations.
+#[derive(Debug)]
 pub struct Socket {
     fd: RawFd,
 }

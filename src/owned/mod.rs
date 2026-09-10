@@ -65,6 +65,14 @@
 //! a separate one, so [`Finished`] hands that slot back rather than
 //! dropping it.
 //!
+//! [`PreparedAccept`] shares that state machine but not the ownership
+//! story, which is why it is a separate type rather than a parameter on
+//! the other. A recv arrival *borrows* a pool slot the kernel is waiting
+//! to reuse; an accepted connection is *owned* outright, already installed
+//! into this process by the kernel, releasable only by `close`. So
+//! [`Incoming::Connection`] carries a plain [`Socket`](crate::net::Socket)
+//! with no lifetime, and dropping it closes rather than recycles.
+//!
 //! # Abandonment leaks instead of corrupting
 //!
 //! Dropping or [`forget`](core::mem::forget)ting a [`Pending`] does not
@@ -100,6 +108,7 @@
 //! drop(buf);
 //! ```
 
+mod accept;
 mod buffer;
 mod event;
 mod identity;
@@ -118,6 +127,7 @@ mod event_tests;
 #[cfg(test)]
 mod miri;
 
+pub use accept::{AcceptFinished, Incoming, MultishotAccept, PreparedAccept};
 pub use buffer::{MmapBuffer, StableBuffer, StableBufferMut};
 pub use event::{Event, PartialReceipt};
 pub use identity::{RequestId, RingId};

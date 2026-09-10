@@ -1,5 +1,6 @@
 //! Split submission/completion halves for owned requests.
 
+use super::accept::{MultishotAccept, PreparedAccept};
 use super::buffer::StableBuffer;
 use super::event::{Event, PartialReceipt};
 use super::identity::{RequestIdSource, RingId};
@@ -88,6 +89,29 @@ impl OwnedSubmitter {
         match self.inner.push(sqe) {
             Ok(()) => Ok(pending),
             // The request owns no buffer, so handing back the copy taken
+            // before submission returns it exactly as it arrived.
+            Err(e) => Err((request, e)),
+        }
+    }
+
+    /// Queue a multishot accept on a listening socket.
+    ///
+    /// One armed request yields a CQE per connection. Each accepted
+    /// descriptor is owned by the caller from the moment it is read, so
+    /// drain the completions or the process runs out of descriptors.
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact.
+    pub fn push_accept(
+        &mut self,
+        request: PreparedAccept,
+    ) -> Result<MultishotAccept, (PreparedAccept, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            // The request owns nothing, so handing back the copy taken
             // before submission returns it exactly as it arrived.
             Err(e) => Err((request, e)),
         }

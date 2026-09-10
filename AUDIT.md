@@ -282,12 +282,55 @@ terminal CQE carrying a buffer id** pins the fold, since CQ overflow cannot
 be forced deterministically from userspace; it was verified by making
 `Done` drop its payload again, which fails on the missing arrival.
 
-**Scope limits.** Vectored I/O, paths, `statx`, and multishot *accept* still
-go through the `unsafe` constructors and need their own owned request
-types. Multishot accept shares the `MORE`/re-arm state machine with recv
-but yields file descriptors rather than pool buffers, so it needs a
-different guard rather than a generic parameter on this one. The `unsafe`
-`Sqe` surface remains for those and for lock-free users.
+**Multishot accept.** Covered by `PreparedAccept` / `MultishotAccept` /
+`Incoming` in `src/owned/accept.rs`. It shares the `MORE`/re-arm state
+machine with recv, and the same terminal-CQE-carries-a-resource hazard, but
+deliberately does *not* share `Arrival` — the ownership stories are
+opposites. A recv arrival **borrows** a pool slot the kernel is waiting to
+reuse, so it carries a lifetime and recycles on drop. An accepted
+connection is **owned**: `io_accept()` has already called `fd_install`, so
+the descriptor belongs to this process whether or not anyone reads the CQE,
+and the only release is `close`. There is no pool to borrow from, so
+`Incoming::Connection` carries a plain `Socket` with no lifetime at all.
+Making one type serve both, with the slot as a generic parameter, would
+have forced a fictional lifetime onto the accept side.
+
+The terminal-CQE hazard is identical in shape and was fixed before it
+could ship: `io_accept()` installs the fd, then only afterwards decides
+whether to post an aux CQE, falling through to `io_req_set_res(req, ret,
+cflags)` with `ret` still the descriptor. So `AcceptFinished` carries the
+final `Socket`, and `into_parts` returns both halves rather than offering a
+receipt-only accessor that would leak a live connection.
+
+The peer address is deliberately not captured. `io_uring_prep_multishot_
+accept(3)` warns that a single `addr` is reused for every connection, so a
+fast second connection can overwrite the first before it is read; an API
+that returned that racing value would be handing out data it cannot
+vouch for.
+
+Four real-kernel tests: three clients served from one armed submission with
+distinct live descriptors (verified by swapping in a single-shot `accept`,
+which ends the request after the first connection), a synthesised terminal
+CQE carrying a real accepted fd (verified by making `Done` drop its
+payload), a negative result yielding no socket in both the armed and
+terminal cases, and a foreign completion rejected.
+
+The compile-fail fixture here claims less than the arrival ones, on
+purpose. Ownership means no lifetime, so the compiler cannot force a caller
+to deal with a connection — dropping a `Socket` is legal and closes it.
+What is pinned is that ignoring a completion is never silent, and the
+fixture sets `#![deny(unused_must_use)]` itself rather than relying on the
+lint being hard by default, because the guarantee really is "diagnosable",
+not "prevented". An earlier draft asserted the stronger claim and passed
+for the wrong reason — a type mismatch I had introduced in the fixture
+itself, not the lint.
+
+**Scope limits.** Vectored I/O, paths, and `statx` still go through the
+`unsafe` constructors and need their own owned request types. The direct
+(registered-file-table) accept variants are also unmodelled: they yield
+table indices rather than descriptors, which is a third ownership story
+again. The `unsafe` `Sqe` surface remains for those and for lock-free
+users.
 
 **Status (original): confirmed.**
 
