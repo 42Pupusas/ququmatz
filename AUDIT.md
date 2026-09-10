@@ -464,11 +464,57 @@ registered table failing rather than leaking a descriptor, and a foreign
 receipt rejected), nine on the encoding and resolution rules, and four
 under Miri including the abandonment path.
 
-**Scope limits.** `statx` still goes through the `unsafe` constructors and
-needs its own owned request type. Direct **accept** and **socket** are also
-still unmodelled — they share the slot vocabulary now in place, so they are
-a smaller step than direct open was, but they are not done. The `unsafe`
-`Sqe` surface remains for those and for lock-free users.
+**`statx`.** Covered by `PreparedStatx` / `PendingStatx` / `StatxCompleted`
+in `src/owned/statx.rs`. It is the only owned request where the kernel
+*writes a typed structure* rather than moving bytes, and that changes both
+ends of the operation.
+
+Every other request is bounded by the SQE's length field, so a destination
+that is too small yields a short transfer. `statx` has no length for its
+destination anywhere in the SQE: `io_statx_prep` takes `addr2` and the
+kernel writes a whole `struct statx` there, reporting only success or
+`-errno`. An undersized destination is therefore a fixed-size write past
+the end of the allocation that nothing in the result reveals, and a
+misaligned one is UB for the same write. Both are checked before the
+request can exist, and both hand every storage back, so a rejected request
+costs nothing. The reserved mask bit (`STATX__RESERVED`, `0x8000_0000`) is
+rejected up front too, since the kernel fails it with `EINVAL`.
+
+What comes back is also different in kind. A read's byte count describes
+bytes that are all meaningful; a `statx` result is *partially* valid, and
+which fields the kernel filled is reported in-band by `stx_mask`. The man
+page is explicit that this need not equal the requested mask — a filesystem
+may decline a requested field and may volunteer an unrequested one — so
+reading `stx_size` without consulting the mask reads whatever the kernel
+left there, often a plausible dummy value rather than an obviously wrong
+one. `Statx` therefore gained mask-gated accessors returning `Option`, and
+`StatxCompleted::stat` returns `None` on failure rather than a zeroed
+struct, because a failed `statx` does not write the destination at all.
+
+All three guards were verified by disabling each in turn; each fails its
+test. The alignment check was re-verified after being rewritten to satisfy
+Clippy's `cast_ptr_alignment`, since the rewrite moved the test from a cast
+to an address computation. Nine unit tests and five under Miri cover the
+module, including both regions staying valid across a ticket move, the
+abandonment path leaking *both*, and reclaim preserving flags and mask.
+`tests/ui/an_in_flight_statx_destination_is_unreachable.rs` pins that
+neither the path nor the destination is reachable in flight.
+
+`AT_EMPTY_PATH` is deliberately not reachable: it requires an empty path,
+which `OwnedPath` rejects by construction. That mode stays on the `unsafe`
+`Sqe::statx_ptr`.
+
+**Scope limits.** The owned layer now covers read/write, vectored I/O,
+zero-copy send, multishot recv and accept, `openat`, direct open, and
+`statx`. **Direct accept is not done**: a draft existed but its two
+real-kernel tests failed — the descriptor watermark moved, meaning
+connections *were* consuming process descriptors, and a full table returned
+`-ENFILE` as a terminal completion rather than staying armed. The draft was
+removed rather than committed, so `IORING_FILE_INDEX_ALLOC` on a multishot
+accept remains unmodelled and unverified. Direct socket, `renameat`,
+`unlinkat`, `mkdirat`, `openat2`, `epoll_ctl`, `files_update`, `timeout`,
+and the `msghdr`-based send/recv also still go through the `unsafe` `Sqe`
+surface, which remains for lock-free users.
 
 **Status (original): confirmed.**
 

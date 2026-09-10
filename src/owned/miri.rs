@@ -24,11 +24,14 @@ use super::identity::{RequestId, RequestIdSource, RingId};
 use super::open::{PendingOpen, PreparedOpen};
 use super::path::OwnedPath;
 use super::slot::SlotTarget;
+use super::statx::{PendingStatx, PreparedStatx};
 use super::vectored::{PendingVectored, PreparedVectored};
 use super::zerocopy::{PendingZc, PreparedZc};
 use super::{Direction, Pending, Prepared, Receipt, StableBuffer, StableBufferMut};
 use crate::op::Sqe;
-use crate::types::{CqeFlags, FileMode, IoVec, MsgFlags, OpenFlags, RawFd};
+use crate::types::{
+    CqeFlags, FileMode, IoVec, MsgFlags, OpenFlags, RawFd, Statx, StatxFlags, StatxMask,
+};
 
 /// Heap storage standing in for an `MmapBuffer`.
 ///
@@ -291,6 +294,52 @@ impl Lifecycle {
     ) -> (FakeKernel, PendingDirectOpen<S>) {
         let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
         (FakeKernel::holding(sqe), pending)
+    }
+
+    fn submit_statx<S: StableBuffer, D: StableBufferMut>(
+        &self,
+        prepared: PreparedStatx<S, D>,
+    ) -> (FakeKernel, PendingStatx<S, D>) {
+        let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
+        (FakeKernel::holding(sqe), pending)
+    }
+}
+
+impl FakeKernel {
+    /// The `addr2` destination as a pointer to a `Statx`.
+    ///
+    /// `statx` is the only owned request where the kernel writes through a
+    /// *second* published address, so this is the access that has to be
+    /// checked separately from the path scan at `addr`.
+    fn published_dest(&self) -> *mut Statx {
+        let addr = usize::try_from(self.sqe.0.off).expect("address fits a pointer");
+        core::ptr::with_exposed_provenance_mut::<Statx>(addr)
+    }
+
+    /// Fill the destination the way a successful `statx` does: a whole
+    /// fixed-size struct, with no length in the SQE to bound it.
+    ///
+    /// The write is `size_of::<Statx>()` bytes regardless of how much room
+    /// the caller provided, which is exactly why the destination is size-
+    /// and alignment-checked before the request can exist.
+    fn complete_statx(&self, ring: RingId, mask: StatxMask, size: u64) -> Receipt {
+        let dst = self.published_dest();
+        let filled = Statx {
+            stx_mask: mask.bits(),
+            stx_size: size,
+            stx_nlink: 1,
+            ..Statx::default()
+        };
+        // SAFETY: the live `PendingStatx` owns storage that was checked to
+        // hold an aligned `Statx`, and its contract keeps those bytes
+        // allocated and unaliased until it is redeemed.
+        unsafe { dst.write(filled) };
+        Receipt {
+            ring,
+            id: RequestId::from_raw(self.user_data()),
+            result: 0,
+            flags: CqeFlags::from_raw(0),
+        }
     }
 }
 
@@ -908,6 +957,155 @@ fn abandoning_an_open_ticket_leaks_rather_than_freeing_the_path() {
     // SAFETY: the abandoned ticket leaked this and the stand-in kernel has
     // finished, so nothing else can reach it.
     unsafe { HeapBuffer::reclaim_leaked(leaked.0, leaked.1) };
+}
+
+/// Heap storage aligned for a `Statx`, sized exactly.
+fn statx_dest() -> HeapBuffer {
+    HeapBuffer::with_alignment(core::mem::size_of::<Statx>(), align_of::<Statx>())
+}
+
+#[test]
+fn the_kernel_writes_a_whole_statx_into_storage_the_ticket_keeps_alive() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedStatx::cwd(
+        heap_path(b"/etc/hostname"),
+        StatxFlags::default(),
+        StatxMask::BASIC_STATS,
+        statx_dest(),
+    )
+    .ok()
+    .expect("destination fits");
+    let (kernel, pending) = cycle.submit_statx(prepared);
+
+    // Two separate regions, both live: the path is scanned at `addr` and
+    // the struct is written at `addr2`, while only the ticket owns either.
+    assert_eq!(kernel.resolve_path(), b"/etc/hostname");
+    let receipt = kernel.complete_statx(cycle.ring, StatxMask::BASIC_STATS, 4096);
+
+    let done = pending.redeem(receipt).ok().expect("receipt matches");
+    let stat = done.stat().expect("a successful statx carries a struct");
+    assert_eq!(stat.size(), Some(4096));
+    assert_eq!(stat.nlink(), Some(1));
+    let (path, dest) = done.into_parts();
+    assert_eq!(path.as_bytes(), b"/etc/hostname");
+    drop((path.into_storage(), dest));
+}
+
+#[test]
+fn a_statx_destination_stays_writable_while_the_ticket_moves() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedStatx::cwd(
+        heap_path(b"/tmp/moved"),
+        StatxFlags::default(),
+        StatxMask::SIZE,
+        statx_dest(),
+    )
+    .ok()
+    .expect("destination fits");
+    let (kernel, pending) = cycle.submit_statx(prepared);
+
+    // The hazard the design exists for, with two regions rather than one:
+    // both must survive the ticket being boxed, moved and passed through
+    // an opaque call before the kernel touches either.
+    let pending = Box::new(pending);
+    let pending = core::hint::black_box(pending);
+    let pending = *pending;
+
+    assert_eq!(kernel.resolve_path(), b"/tmp/moved");
+    let receipt = kernel.complete_statx(cycle.ring, StatxMask::SIZE, 17);
+
+    let done = pending.redeem(receipt).ok().expect("receipt matches");
+    assert_eq!(done.stat().expect("statx ok").size(), Some(17));
+    let (path, dest) = done.into_parts();
+    drop((path.into_storage(), dest));
+}
+
+#[test]
+fn a_failed_statx_reads_nothing_from_the_untouched_destination() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedStatx::cwd(
+        heap_path(b"/nope"),
+        StatxFlags::default(),
+        StatxMask::BASIC_STATS,
+        statx_dest(),
+    )
+    .ok()
+    .expect("destination fits");
+    let (kernel, pending) = cycle.submit_statx(prepared);
+
+    // -ENOENT: the kernel never wrote the destination, so reading it would
+    // return whatever was there before. `stat` must decline instead.
+    let receipt = Receipt {
+        ring: cycle.ring,
+        id: RequestId::from_raw(kernel.user_data()),
+        result: -2,
+        flags: CqeFlags::from_raw(0),
+    };
+    let done = pending.redeem(receipt).ok().expect("receipt matches");
+    assert!(!done.is_ok());
+    assert!(done.stat().is_none());
+    let (path, dest) = done.into_parts();
+    drop((path.into_storage(), dest));
+}
+
+#[test]
+fn abandoning_a_statx_ticket_leaks_both_regions_rather_than_freeing_them() {
+    let cycle = Lifecycle::new();
+    let path_storage = HeapBuffer::with_capacity(64);
+    let leaked_path = (path_storage.ptr, path_storage.len);
+    let dest = statx_dest();
+    let leaked_dest = (dest.ptr, dest.len);
+
+    let path = OwnedPath::copy_into(path_storage, b"/tmp/abandoned")
+        .ok()
+        .expect("storage fits");
+    let prepared = PreparedStatx::cwd(path, StatxFlags::default(), StatxMask::SIZE, dest)
+        .ok()
+        .expect("destination fits");
+    let (kernel, pending) = cycle.submit_statx(prepared);
+
+    // Dropping frees neither region: the kernel may still be reading the
+    // path *or* writing the struct, so both leak on purpose.
+    drop(pending);
+    assert_eq!(kernel.resolve_path(), b"/tmp/abandoned");
+    let _ = kernel.complete_statx(cycle.ring, StatxMask::SIZE, 1);
+
+    // SAFETY: the abandoned ticket leaked both and the stand-in kernel has
+    // finished, so nothing else can reach either allocation.
+    unsafe {
+        HeapBuffer::reclaim_leaked(leaked_path.0, leaked_path.1);
+        dealloc(
+            leaked_dest.0,
+            Layout::from_size_align(leaked_dest.1, align_of::<Statx>()).expect("valid layout"),
+        );
+    }
+}
+
+#[test]
+fn reclaiming_an_unpublished_statx_returns_both_storages_and_its_target() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedStatx::at(
+        crate::types::DirFd::Cwd,
+        heap_path(b"/tmp/retry"),
+        StatxFlags::SYMLINK_NOFOLLOW,
+        StatxMask::INO,
+        statx_dest(),
+    )
+    .ok()
+    .expect("destination fits");
+    let (_kernel, pending) = cycle.submit_statx(prepared);
+
+    // SAFETY: this SQE was never published, so the kernel holds no pointer
+    // into either region.
+    let recovered = unsafe { pending.reclaim_unsubmitted() };
+
+    // Every field survived, not just the storage: a retry must stat the
+    // same path with the same flags and mask.
+    assert_eq!(recovered.path().as_bytes(), b"/tmp/retry");
+    assert_eq!(recovered.flags(), StatxFlags::SYMLINK_NOFOLLOW);
+    assert_eq!(recovered.mask(), StatxMask::INO);
+    let (path, dest) = recovered.into_parts();
+    drop((path.into_storage(), dest));
 }
 
 #[test]

@@ -151,6 +151,132 @@ pub struct Statx {
     pub(crate) _spare3: [u64; 12],
 }
 
+impl StatxMask {
+    /// Construct from an arbitrary raw value, including bits with no
+    /// associated named constant.
+    ///
+    /// Test-only: exercises the reserved-bit rejection in
+    /// [`PreparedStatx`](crate::owned::PreparedStatx) against a bit that
+    /// cannot be spelled through the named constants, since real callers
+    /// only ever OR those together.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn from_raw_for_test(bits: u32) -> Self {
+        Self(bits)
+    }
+}
+
+impl Statx {
+    /// Whether the kernel filled every field in `wanted`.
+    ///
+    /// The kernel may decline a requested field or volunteer an
+    /// unrequested one, so this is the only way to know.
+    #[must_use]
+    pub const fn has(&self, wanted: StatxMask) -> bool {
+        self.stx_mask & wanted.bits() == wanted.bits()
+    }
+
+    /// File size, or `None` if the kernel did not fill it.
+    #[must_use]
+    pub const fn size(&self) -> Option<u64> {
+        if self.has(StatxMask::SIZE) {
+            Some(self.stx_size)
+        } else {
+            None
+        }
+    }
+
+    /// File type and mode bits, or `None` if not filled.
+    #[must_use]
+    pub const fn mode(&self) -> Option<u16> {
+        if self.has(StatxMask::MODE) {
+            Some(self.stx_mode)
+        } else {
+            None
+        }
+    }
+
+    /// Hard link count, or `None` if not filled.
+    #[must_use]
+    pub const fn nlink(&self) -> Option<u32> {
+        if self.has(StatxMask::NLINK) {
+            Some(self.stx_nlink)
+        } else {
+            None
+        }
+    }
+
+    /// Owning user id, or `None` if not filled.
+    #[must_use]
+    pub const fn uid(&self) -> Option<u32> {
+        if self.has(StatxMask::UID) {
+            Some(self.stx_uid)
+        } else {
+            None
+        }
+    }
+
+    /// Owning group id, or `None` if not filled.
+    #[must_use]
+    pub const fn gid(&self) -> Option<u32> {
+        if self.has(StatxMask::GID) {
+            Some(self.stx_gid)
+        } else {
+            None
+        }
+    }
+
+    /// Inode number, or `None` if not filled.
+    #[must_use]
+    pub const fn ino(&self) -> Option<u64> {
+        if self.has(StatxMask::INO) {
+            Some(self.stx_ino)
+        } else {
+            None
+        }
+    }
+
+    /// Allocated 512-byte blocks, or `None` if not filled.
+    #[must_use]
+    pub const fn blocks(&self) -> Option<u64> {
+        if self.has(StatxMask::BLOCKS) {
+            Some(self.stx_blocks)
+        } else {
+            None
+        }
+    }
+
+    /// Last modification time, or `None` if not filled.
+    #[must_use]
+    pub const fn mtime(&self) -> Option<StatxTimestamp> {
+        if self.has(StatxMask::MTIME) {
+            Some(self.stx_mtime)
+        } else {
+            None
+        }
+    }
+
+    /// Last access time, or `None` if not filled.
+    #[must_use]
+    pub const fn atime(&self) -> Option<StatxTimestamp> {
+        if self.has(StatxMask::ATIME) {
+            Some(self.stx_atime)
+        } else {
+            None
+        }
+    }
+
+    /// Last status change time, or `None` if not filled.
+    #[must_use]
+    pub const fn ctime(&self) -> Option<StatxTimestamp> {
+        if self.has(StatxMask::CTIME) {
+            Some(self.stx_ctime)
+        } else {
+            None
+        }
+    }
+}
+
 bitflags! {
     /// Flags for renameat2.
     pub struct RenameFlags(u32);

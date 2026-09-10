@@ -4,13 +4,16 @@ extern crate std;
 
 use super::{
     Arrival, Completed, Delivery, DirectOpenError, DirectSlot, Direction, Event, Incoming,
-    MmapBuffer, OwnedPath, PathError, Pending, PendingZc, Prepared, PreparedAccept,
-    PreparedDirectOpen, PreparedMultishot, PreparedOpen, PreparedVectored, PreparedZc, Receipt,
-    RingId, SlotIndex, SlotTarget, StableBuffer, VectoredError, ZcCompleted,
+    MmapBuffer, OwnedPath, PathError, Pending, PendingStatx, PendingZc, Prepared, PreparedAccept,
+    PreparedDirectOpen, PreparedMultishot, PreparedOpen, PreparedStatx, PreparedVectored,
+    PreparedZc, Receipt, RingId, SlotIndex, SlotTarget, StableBuffer, StatxError, VectoredError,
+    ZcCompleted,
 };
 use crate::error::{Error, SubmitError};
 use crate::net::Socket;
-use crate::types::{AcceptFlags, DirFd, FileMode, MsgFlags, OpenFlags, RawFd};
+use crate::types::{
+    AcceptFlags, DirFd, FileMode, MsgFlags, OpenFlags, RawFd, Statx, StatxFlags, StatxMask,
+};
 
 /// Static proof that a ticket crosses a thread boundary. The whole design
 /// exists to make this true.
@@ -1833,6 +1836,39 @@ fn a_direct_open_receipt_for_another_request_is_rejected() {
     drop((first, second));
 }
 
+#[cfg(not(miri))]
+#[test]
+fn probe_existing_socket_sqe_encoding() {
+    let mut ring = crate::IoUring::new(4).expect("ring");
+    ring.push(
+        crate::Sqe::socket(
+            crate::types::AddressFamily::Inet,
+            crate::types::SocketType::Stream,
+            0,
+            crate::types::SocketFlags::NONBLOCK,
+        )
+        .user_data(1),
+    )
+    .expect("push");
+    ring.submit_and_wait(1).expect("submit");
+    let cqe = ring.complete().expect("cqe");
+    std::eprintln!("PROBE socket-with-flags res={}", cqe.result);
+
+    ring.push(
+        crate::Sqe::socket(
+            crate::types::AddressFamily::Inet,
+            crate::types::SocketType::Stream,
+            0,
+            crate::types::SocketFlags::default(),
+        )
+        .user_data(2),
+    )
+    .expect("push");
+    ring.submit_and_wait(1).expect("submit");
+    let cqe = ring.complete().expect("cqe");
+    std::eprintln!("PROBE socket-no-flags res={}", cqe.result);
+}
+
 #[test]
 fn a_slot_from_one_ring_is_not_confused_with_anothers() {
     let mine = RingId::next();
@@ -1876,4 +1912,209 @@ fn an_open_receipt_for_another_request_is_rejected() {
     // Neither ticket is redeemed, so both leak their path storage rather
     // than freeing bytes the kernel may still be reading.
     drop((first, second));
+}
+
+const _: () = assert_send::<PendingStatx<MmapBuffer, MmapBuffer>>();
+const _: () = assert_send::<PreparedStatx<MmapBuffer, MmapBuffer>>();
+
+/// A destination big and aligned enough for a `Statx`.
+fn statx_dest() -> MmapBuffer {
+    MmapBuffer::with_capacity(core::mem::size_of::<Statx>()).expect("map")
+}
+
+#[test]
+fn a_destination_too_small_for_a_statx_is_rejected_with_the_storage_back() {
+    let short = MmapBuffer::with_capacity(core::mem::size_of::<Statx>() - 1).expect("map");
+    let got = short.stable_len();
+    let Err((path, returned, e)) = PreparedStatx::cwd(
+        path_of(b"/tmp"),
+        StatxFlags::default(),
+        StatxMask::BASIC_STATS,
+        short,
+    ) else {
+        panic!("a short destination must be refused");
+    };
+    assert_eq!(
+        e,
+        StatxError::DestTooSmall {
+            needed: core::mem::size_of::<Statx>(),
+            got,
+        }
+    );
+    // Both storages come back, so a rejected request costs nothing.
+    assert_eq!(path.as_bytes(), b"/tmp");
+    assert_eq!(returned.stable_len(), got);
+}
+
+#[test]
+fn a_misaligned_destination_is_rejected_rather_than_written_through() {
+    // The kernel writes a `repr(C)` struct with 8-byte alignment through
+    // this pointer. An unaligned write would be UB, so it must be caught
+    // before submission, not discovered afterwards.
+    let dest = MisalignedVecs::with_capacity(core::mem::size_of::<Statx>() + 8);
+    let Err((path, _dest, e)) = PreparedStatx::cwd(
+        path_of(b"/tmp"),
+        StatxFlags::default(),
+        StatxMask::BASIC_STATS,
+        dest,
+    ) else {
+        panic!("a misaligned destination must be refused");
+    };
+    assert_eq!(
+        e,
+        StatxError::DestMisaligned {
+            needed: core::mem::align_of::<Statx>(),
+        }
+    );
+    assert_eq!(path.as_bytes(), b"/tmp");
+}
+
+#[test]
+fn a_mask_with_the_reserved_bit_is_rejected_before_submission() {
+    let Err((path, dest, e)) = PreparedStatx::cwd(
+        path_of(b"/tmp"),
+        StatxFlags::default(),
+        StatxMask::from_raw_for_test(0x8000_0000),
+        statx_dest(),
+    ) else {
+        panic!("the reserved mask bit must be refused");
+    };
+    assert_eq!(e, StatxError::ReservedMaskBit);
+    assert_eq!(path.as_bytes(), b"/tmp");
+    drop(dest);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_statx_fills_the_destination_and_returns_both_storages() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let path = path_of(b"/etc/hostname");
+    let path_addr = path.as_bytes().as_ptr();
+    let dest = statx_dest();
+    let dest_addr = dest.stable_ptr();
+
+    let prepared = PreparedStatx::cwd(path, StatxFlags::default(), StatxMask::BASIC_STATS, dest)
+        .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+    let ticket = sub
+        .push_statx(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert!(done.is_ok(), "statx failed: {}", done.raw_result());
+
+    let stat = done.stat().expect("a successful statx must carry a struct");
+    // A regular file with a plausible mode, read through the mask gate.
+    assert!(stat.has(StatxMask::TYPE));
+    let mode = stat.mode().expect("mode was requested and is basic");
+    assert_eq!(mode & 0o170_000, 0o100_000, "S_IFREG expected");
+    assert!(stat.nlink().expect("nlink") >= 1);
+
+    let (path, dest) = done.into_parts();
+    // Both storages came back at the addresses they went in at.
+    assert_eq!(path.as_bytes().as_ptr(), path_addr);
+    assert_eq!(dest.stable_ptr(), dest_addr);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_failed_statx_reports_the_errno_and_carries_no_struct() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let prepared = PreparedStatx::cwd(
+        path_of(b"/nonexistent/definitely/not/here"),
+        StatxFlags::default(),
+        StatxMask::BASIC_STATS,
+        statx_dest(),
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+    let ticket = sub
+        .push_statx(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+
+    assert!(!done.is_ok());
+    assert_eq!(done.raw_result(), -2, "ENOENT");
+    // The kernel never wrote the destination, so there is nothing to read
+    // and `stat` says so rather than handing back stale bytes.
+    assert!(done.stat().is_none());
+    let (path, _) = done.into_parts();
+    assert_eq!(path.as_bytes(), b"/nonexistent/definitely/not/here");
+}
+
+#[cfg(not(miri))]
+#[test]
+fn every_accessor_agrees_with_the_mask_rather_than_the_request() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    // Ask for only the size. The kernel may volunteer more, and the mask
+    // is the only way to tell what actually arrived.
+    let prepared = PreparedStatx::cwd(
+        path_of(b"/etc/hostname"),
+        StatxFlags::default(),
+        StatxMask::SIZE,
+        statx_dest(),
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+    let ticket = sub
+        .push_statx(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    let stat = done.stat().expect("statx ok");
+
+    // What was asked for is present.
+    assert!(stat.has(StatxMask::SIZE));
+    assert!(stat.size().is_some());
+    // Every accessor agrees with the mask, whether or not it was requested
+    // — that consistency is the property, not any particular field.
+    assert_eq!(stat.mode().is_some(), stat.has(StatxMask::MODE));
+    assert_eq!(stat.ino().is_some(), stat.has(StatxMask::INO));
+    assert_eq!(stat.mtime().is_some(), stat.has(StatxMask::MTIME));
+    assert_eq!(stat.uid().is_some(), stat.has(StatxMask::UID));
+    assert_eq!(stat.blocks().is_some(), stat.has(StatxMask::BLOCKS));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_statx_ticket_survives_moving_to_another_thread_before_completion() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let prepared = PreparedStatx::cwd(
+        path_of(b"/etc/hostname"),
+        StatxFlags::default(),
+        StatxMask::BASIC_STATS,
+        statx_dest(),
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+    let ticket = sub
+        .push_statx(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let handle = std::thread::spawn(move || {
+        let receipt = comp.wait_one().expect("completion");
+        let done = ticket
+            .redeem(receipt)
+            .unwrap_or_else(|_| panic!("mismatch"));
+        done.stat().expect("statx ok").size()
+    });
+    assert!(handle.join().expect("thread").is_some());
 }

@@ -115,6 +115,22 @@
 //! this design survives `mem::forget` where a borrowed-guard design cannot.
 //! Normal redemption reclaims everything.
 //!
+//! # `statx` writes a struct, not bytes
+//!
+//! Every other request is bounded by the SQE's length field, so a
+//! destination that is too small yields a short transfer. `statx` has no
+//! length for its destination at all: the kernel writes a whole
+//! [`Statx`](crate::types::Statx) at `addr2` and reports only success or
+//! `-errno`, so undersized or misaligned storage is a fixed-size write past
+//! the end rather than anything the result reveals. [`PreparedStatx`]
+//! checks both before the request can exist.
+//!
+//! What comes back differs too. A read's byte count describes bytes that
+//! are all meaningful; a `statx` result is *partially* valid, and which
+//! fields the kernel filled is reported in-band by `stx_mask` — which need
+//! not match what was asked for. The mask-gated accessors on `Statx` return
+//! `Option` for that reason and are the intended way to read one.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -152,6 +168,7 @@ mod path;
 mod queue;
 mod request;
 mod slot;
+mod statx;
 mod vectored;
 mod zerocopy;
 
@@ -176,5 +193,6 @@ pub use path::{OwnedPath, PathError};
 pub use queue::{OwnedCompleter, OwnedSubmitter};
 pub use request::{Completed, Direction, Pending, Prepared, Receipt};
 pub use slot::{DirectSlot, SlotIndex, SlotTarget};
+pub use statx::{PendingStatx, PreparedStatx, StatxCompleted, StatxError};
 pub use vectored::{PendingVectored, PreparedVectored, VectoredCompleted, VectoredError};
 pub use zerocopy::{PendingZc, PreparedZc, ZcCompleted};

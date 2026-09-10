@@ -71,6 +71,17 @@ fn an_in_flight_path_cannot_be_read_or_rewritten() {
     t.compile_fail("tests/ui/an_in_flight_path_is_unreachable.rs");
 }
 
+/// A `statx` is the only owned request where the kernel *writes* a
+/// fixed-size struct into caller storage, with no length anywhere in the
+/// SQE to bound it. Both regions it touches — the path it scans and the
+/// destination it fills — must therefore be unreachable while in flight,
+/// and neither reclaimable without a receipt.
+#[test]
+fn an_in_flight_statx_touches_two_regions_and_exposes_neither() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/an_in_flight_statx_destination_is_unreachable.rs");
+}
+
 /// A direct open produces a third kind of resource: a slot in the ring's
 /// file table, which is neither a borrowed pool buffer nor a descriptor
 /// this process owns. The distinction has to be a type error rather than a

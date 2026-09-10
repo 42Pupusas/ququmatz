@@ -8,6 +8,7 @@ use super::identity::{RequestIdSource, RingId};
 use super::multishot::{MultishotRecv, PreparedMultishot};
 use super::open::{PendingOpen, PreparedOpen};
 use super::request::{Pending, Prepared, Receipt};
+use super::statx::{PendingStatx, PreparedStatx};
 use super::vectored::{PendingVectored, PreparedVectored};
 use super::zerocopy::{PendingZc, PreparedZc};
 use crate::error::Error;
@@ -188,6 +189,39 @@ impl OwnedSubmitter {
             // the path pointer and reclaiming the storage is sound.
             Err(e) => Err((Self::reclaim_direct_open(pending), e)),
         }
+    }
+
+    /// Queue a `statx`, taking ownership of its path and destination.
+    ///
+    /// The kernel writes a fixed-size struct into the destination after
+    /// submission, so the storage is owned by the ticket until redeemed.
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact,
+    /// still owning both storages.
+    pub fn push_statx<S: StableBuffer, D: StableBufferMut>(
+        &mut self,
+        request: PreparedStatx<S, D>,
+    ) -> Result<PendingStatx<S, D>, (PreparedStatx<S, D>, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            // The SQE never became kernel-visible, so the kernel never saw
+            // either pointer and reclaiming both storages is sound.
+            Err(e) => Err((Self::reclaim_statx(pending), e)),
+        }
+    }
+
+    /// Undo a `statx` push that the kernel never observed.
+    fn reclaim_statx<S: StableBuffer, D: StableBufferMut>(
+        pending: PendingStatx<S, D>,
+    ) -> PreparedStatx<S, D> {
+        // SAFETY: only reached when `Submitter::push` reported the queue was
+        // full, which happens before the SQE is written or the tail is
+        // advanced. No kernel-visible pointer to either storage exists.
+        unsafe { pending.reclaim_unsubmitted() }
     }
 
     /// Undo a direct-open push that the kernel never observed.
