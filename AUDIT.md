@@ -667,25 +667,47 @@ checked once for size and alignment; the payload buffers stay inline under
 following its own `msg_iov`, so a freed staging region is a dangling-
 pointer error rather than a wrong byte.
 
-Measured while building it: `recvmsg` **writes back** into the caller's
-`msghdr`, making it the first region the kernel both reads and writes, and
-truncation is invisible in the CQE result — an 11-byte datagram delivered
-into a 2-byte buffer reports `2`, indistinguishable from a 2-byte datagram
-that arrived whole, with only the written-back `MSG_TRUNC` saying
-otherwise. `MsgOutFlags` exists as a separate output-only type for that
-reason. The written-back `msg_namelen` can also exceed the buffer the
-caller supplied, so it cannot be trusted to slice the address region.
+`recvmsg` chains the same three regions the other direction, and the
+difference is not symmetry: the kernel **writes** the header as well as
+reading it, so the staging region is a destination too. That makes it the
+first owned request whose most important result is not in the CQE.
+
+Measured, not assumed. An 11-byte datagram delivered into a 2-byte buffer
+completes with `2` — byte-for-byte what a 2-byte datagram that arrived
+whole reports. The nine discarded bytes appear nowhere in the result; only
+the written-back `MSG_TRUNC` distinguishes them, which is why `received`
+returns the count and the flags together as one value rather than letting
+a caller read the count alone. `MsgOutFlags` is a separate output-only
+type for the same reason. The identical shape on a *stream* socket sets no
+flag and loses nothing, so a short read there is not a loss.
+
+The peer address is the other place the header outranks the result, and
+the reported length cannot be used to read it. Three behaviours were
+measured against a real kernel: a connected socket writes nothing and
+reports `0` however much room was reserved; an IPv6 peer reports `28`
+while writing only the 16 bytes it was given, leaving the rest of the slot
+untouched; and an `AF_UNIX` peer with a short path reports a length
+*between* the two — 11 for `/tmp/qq1` — filling part of the slot and no
+more. Reading the whole slot in the last two cases mixes the kernel's
+bytes with whatever preceded them. `PeerAddress` therefore yields an IPv4
+address only when the reported length is exactly a whole `SockAddrIn` and
+the family written is `AF_INET`, and names the other outcomes instead of
+handing back a plausible-looking address. A *failed* receive writes
+nothing back at all, so the staged values survive and must not be read as
+an outcome.
 
 **Scope limits.** The owned layer now covers read/write, vectored I/O,
-zero-copy send, `sendmsg`, multishot recv and accept, `openat`, `openat2`,
-direct open, direct accept, direct socket, `statx`, `renameat`,
-`unlinkat`, and `mkdirat`. `epoll_ctl`, `files_update`, `timeout`, and
-`recvmsg` still go through the `unsafe` `Sqe` surface, which remains for
-lock-free users. `recvmsg` is the larger remaining piece: its header is an
-output as well as an input, so the completed state has to expose what the
-kernel wrote rather than only what was staged. Neither direct accept nor
-direct socket has Miri coverage: neither owns userspace storage, so there
-is no pointer lifetime to model.
+zero-copy send, `sendmsg`, `recvmsg`, multishot recv and accept, `openat`,
+`openat2`, direct open, direct accept, direct socket, `statx`, `renameat`,
+`unlinkat`, and `mkdirat` — every pointer-bearing family the finding's
+acceptance criteria name. `epoll_ctl`, `files_update`, and `timeout` still
+go through the `unsafe` `Sqe` surface, which remains for lock-free users;
+all three carry only fixed-size scalar or struct arguments, so none
+introduces a shape the owned layer has not already modelled. Multishot
+`recvmsg`, which prepends an `io_uring_recvmsg_out` to each provided
+buffer, is also still raw. Neither direct accept nor direct socket has
+Miri coverage: neither owns userspace storage, so there is no pointer
+lifetime to model.
 
 **Status (original): confirmed.**
 

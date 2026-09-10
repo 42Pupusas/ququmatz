@@ -138,6 +138,48 @@
 //! can be sent from without a `connect` per peer, and flags that belong to
 //! the message rather than the descriptor.
 //!
+//! # A received message answers in the header, not the result
+//!
+//! [`PreparedRecvmsg`] chains the same three regions the other direction,
+//! and the difference is not symmetry. The kernel **writes** the header as
+//! well as reading it, so the staging region is a destination too — which
+//! is why the completion's most important field is not in the CQE.
+//!
+//! An 11-byte datagram delivered into a 2-byte buffer completes with `2`.
+//! So does a 2-byte datagram that arrived whole. The nine discarded bytes
+//! appear nowhere in the result; only [`MsgOutFlags::TRUNC`], written back
+//! into `msg_flags`, tells them apart. [`RecvmsgCompleted::received`]
+//! therefore returns the count and the flags together as [`Received`],
+//! because the count alone cannot answer the question a caller has. The
+//! same shape on a *stream* socket sets no flag and loses nothing: the
+//! remainder stays queued, so a short read there is not a loss.
+//!
+//! The peer address is the other place the header outranks the result.
+//! [`PeerWanted`] reserves one `SockAddrIn`, and what comes back may be
+//! less than that, more, or nothing:
+//!
+//! - a connected socket writes no address and reports `0`, however much
+//!   room was reserved;
+//! - an IPv6 peer reports `28` while writing only the 16 bytes it was
+//!   given, leaving the rest of the slot untouched;
+//! - an `AF_UNIX` peer with a short path reports a length *between* the
+//!   two, filling part of the slot and no more.
+//!
+//! Reading the whole slot in the last two cases mixes the kernel's bytes
+//! with whatever preceded them. [`PeerAddress`] makes that unreachable:
+//! [`V4`](PeerAddress::V4) exists only when the reported length is exactly
+//! a whole `SockAddrIn` and the family written is `AF_INET`, and the other
+//! variants say why not rather than handing back a plausible-looking
+//! address.
+//!
+//! A *failed* receive writes nothing back at all, so the header still
+//! holds whatever the caller staged. That is why the outcome is reported
+//! through [`received`](RecvmsgCompleted::received) rather than by reading
+//! the header: after `EAGAIN`, the reserved length is still sitting there
+//! and would otherwise be read as a sender.
+//!
+//! [`MsgOutFlags::TRUNC`]: crate::types::MsgOutFlags::TRUNC
+//!
 //! # `statx` writes a struct, not bytes
 //!
 //! Every other request is bounded by the SQE's length field, so a
@@ -261,6 +303,7 @@ mod openat2;
 mod path;
 mod pathop;
 mod queue;
+mod recvmsg;
 mod rename;
 mod request;
 mod sendmsg;
@@ -295,6 +338,9 @@ pub use openat2::{Openat2Error, Openat2Mode, Opened2, PendingOpenat2, PreparedOp
 pub use path::{OwnedPath, PathError};
 pub use pathop::{PathOpCompleted, PathOpKind, PendingPathOp, PreparedPathOp};
 pub use queue::{OwnedCompleter, OwnedSubmitter};
+pub use recvmsg::{
+    PeerAddress, PeerWanted, PendingRecvmsg, PreparedRecvmsg, Received, RecvmsgCompleted,
+};
 pub use rename::{PendingRename, PreparedRename, RenameCompleted, RenameMode};
 pub use request::{Completed, Direction, Pending, Prepared, Receipt};
 pub use sendmsg::{PendingSendmsg, PreparedSendmsg, SendTarget, SendmsgCompleted};

@@ -25,6 +25,7 @@ use super::open::{PendingOpen, PreparedOpen};
 use super::openat2::{PendingOpenat2, PreparedOpenat2};
 use super::path::OwnedPath;
 use super::pathop::{PendingPathOp, PreparedPathOp};
+use super::recvmsg::{PeerWanted, PendingRecvmsg, PreparedRecvmsg};
 use super::rename::{PendingRename, PreparedRename};
 use super::sendmsg::{PendingSendmsg, PreparedSendmsg, SendTarget};
 use super::slot::SlotTarget;
@@ -343,6 +344,14 @@ impl Lifecycle {
         let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
         (FakeKernel::holding(sqe), pending)
     }
+
+    fn submit_recvmsg<B: StableBufferMut, R: StableBufferMut, const N: usize>(
+        &self,
+        prepared: PreparedRecvmsg<B, R, N>,
+    ) -> (FakeKernel, PendingRecvmsg<B, R, N>) {
+        let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
+        (FakeKernel::holding(sqe), pending)
+    }
 }
 
 impl FakeKernel {
@@ -397,6 +406,111 @@ impl FakeKernel {
             }
         }
         seen
+    }
+
+    /// Deliver `payload` the way a `recvmsg` does: read the header, follow
+    /// `msg_iov` to the descriptors, fill their buffers in order, then
+    /// **write back** into the header.
+    ///
+    /// The write-back is what separates this from `observe_sendmsg`. The
+    /// staging region is a destination as well as a source, so a ticket
+    /// that freed it early is caught here on a write rather than a read —
+    /// and the header is written *after* the buffers, matching the order
+    /// that makes a stale header visible.
+    ///
+    /// Returns the bytes accepted, which is less than `payload` when the
+    /// descriptors do not have room; that shortfall is exactly the
+    /// truncation a real datagram socket reports in `msg_flags`.
+    fn deliver_recvmsg(&self, payload: &[u8], peer: Option<SockAddrIn>) -> usize {
+        let hdr = self.read_msghdr();
+        let mut written = 0;
+        for i in 0..hdr.msg_iovlen {
+            let vec = self.message_descriptor(i);
+            for j in 0..vec.len() {
+                if written == payload.len() {
+                    break;
+                }
+                // SAFETY: the descriptor names a buffer owned by the live
+                // ticket, which keeps it allocated and unaliased.
+                unsafe { vec.base().add(j).write(payload[written]) };
+                written += 1;
+            }
+        }
+
+        let mut back = hdr;
+        back.msg_flags = if written < payload.len() {
+            crate::types::MsgOutFlags::TRUNC.bits().cast_signed()
+        } else {
+            0
+        };
+        match peer {
+            Some(addr) if !hdr.msg_name.is_null() => {
+                assert!(
+                    hdr.msg_namelen as usize >= core::mem::size_of::<SockAddrIn>(),
+                    "a reserved address slot must hold a whole SockAddrIn"
+                );
+                // The `MsgRegion` staged this at an 8-byte-aligned offset
+                // from an address checked for the same alignment.
+                #[allow(clippy::cast_ptr_alignment)]
+                let slot = hdr.msg_name.cast::<SockAddrIn>();
+                // SAFETY: the live ticket owns the storage this slot lies
+                // in and keeps it allocated and unaliased.
+                unsafe { slot.write(addr) };
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    back.msg_namelen = core::mem::size_of::<SockAddrIn>() as u32;
+                }
+            }
+            // A connected socket has no per-message sender, so the kernel
+            // reports a zero length however much room was reserved.
+            _ => back.msg_namelen = 0,
+        }
+
+        // The `MsgRegion` rejected storage not aligned for a `MsgHdr`.
+        #[allow(clippy::cast_ptr_alignment)]
+        let dst = self.published_ptr().cast::<MsgHdr>();
+        // SAFETY: the live ticket owns storage checked for size and
+        // alignment against `MsgHdr`, and keeps it allocated until redeemed.
+        unsafe { dst.write(back) };
+        written
+    }
+
+    /// Report an address larger than the slot the caller reserved, writing
+    /// only what fits — as the kernel does for an IPv6 peer into a
+    /// `sockaddr_in`.
+    fn deliver_oversized_peer(&self, payload: &[u8], reported: u32) -> usize {
+        self.deliver_with_reported_namelen(payload, reported, None)
+    }
+
+    /// Deliver, then claim `reported` bytes of address regardless of what
+    /// was written — with `wrote` optionally stamped into the slot first.
+    ///
+    /// Splitting the reported length from the bytes present is what a
+    /// variable-length address family does. `AF_UNIX` reports 11 into a
+    /// 16-byte slot; a caller believing the family field alone would still
+    /// be wrong for a family that *is* `AF_INET` but short.
+    fn deliver_with_reported_namelen(
+        &self,
+        payload: &[u8],
+        reported: u32,
+        wrote: Option<SockAddrIn>,
+    ) -> usize {
+        let written = self.deliver_recvmsg(payload, None);
+        let hdr = self.read_msghdr();
+        if let Some(addr) = wrote {
+            assert!(!hdr.msg_name.is_null(), "no slot to write an address into");
+            #[allow(clippy::cast_ptr_alignment)]
+            let slot = hdr.msg_name.cast::<SockAddrIn>();
+            // SAFETY: the live ticket owns the storage this slot lies in.
+            unsafe { slot.write(addr) };
+        }
+        let mut back = hdr;
+        back.msg_namelen = reported;
+        #[allow(clippy::cast_ptr_alignment)]
+        let dst = self.published_ptr().cast::<MsgHdr>();
+        // SAFETY: as in `deliver_recvmsg`; the live ticket owns this header.
+        unsafe { dst.write(back) };
+        written
     }
 
     /// Read the destination address the header names.
@@ -1620,6 +1734,254 @@ fn reclaiming_an_unpublished_sendmsg_returns_every_storage_and_its_header() {
     // message rather than one describing stale addresses.
     assert_eq!(prepared.published_header().msg_iovlen, 1);
     assert_eq!(prepared.total_len(), 6);
+    let (bufs, store) = prepared.into_parts();
+    drop((bufs, store));
+}
+
+#[test]
+fn the_kernel_fills_a_receives_buffers_by_following_the_header_it_published() {
+    let cycle = Lifecycle::new();
+    // Distinct sizes: equal buffers would pass even if the kernel filled
+    // them in the wrong order.
+    let prepared = PreparedRecvmsg::new(
+        RawFd::from_raw(7),
+        [
+            HeapBuffer::with_capacity(3),
+            HeapBuffer::with_capacity(4),
+            HeapBuffer::with_capacity(5),
+        ],
+        msg_region::<3>(),
+        PeerWanted::No,
+        MsgFlags::default(),
+    )
+    .ok()
+    .expect("staging fits");
+    let (kernel, pending) = cycle.submit_recvmsg(prepared);
+
+    // The kernel reaches every buffer through the header alone, then
+    // writes back into that same header — the region is both a source it
+    // reads and a destination it writes.
+    let written = kernel.deliver_recvmsg(b"onetwo!five5", None);
+    assert_eq!(written, 12);
+
+    let receipt = kernel.post_completion(cycle.ring, 12);
+    let done = pending.redeem(receipt).ok().expect("receipt matches");
+    assert_eq!(done.received().expect("ok").bytes(), 12);
+    assert!(!done.received().expect("ok").truncated());
+
+    let (_, _, bufs, store) = done.into_parts();
+    assert_eq!(bufs[0].as_slice(), b"one");
+    assert_eq!(bufs[1].as_slice(), b"two!");
+    assert_eq!(bufs[2].as_slice(), b"five5");
+    drop(store);
+}
+
+#[test]
+fn a_receives_three_regions_survive_the_ticket_moving_between_owners() {
+    // The same hazard as the send side, one direction worse: the kernel
+    // holds a pointer to a header whose contents are further pointers, and
+    // it *writes* through all of them. A region that relocated would have
+    // the kernel scribble wherever the stale addresses led.
+    let cycle = Lifecycle::new();
+    let prepared = PreparedRecvmsg::new(
+        RawFd::from_raw(7),
+        [HeapBuffer::with_capacity(6), HeapBuffer::with_capacity(4)],
+        msg_region::<2>(),
+        PeerWanted::Yes,
+        MsgFlags::default(),
+    )
+    .ok()
+    .expect("staging fits");
+    let (kernel, pending) = cycle.submit_recvmsg(prepared);
+
+    let pending = Box::new(pending);
+    let pending = core::hint::black_box(pending);
+    let pending = *pending;
+
+    let peer = SockAddrIn {
+        sin_family: 2,
+        sin_port: 4242u16.to_be(),
+        sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+        sin_zero: [0; 8],
+    };
+    assert_eq!(kernel.deliver_recvmsg(b"travelling", Some(peer)), 10);
+
+    let receipt = kernel.post_completion(cycle.ring, 10);
+    let done = pending.redeem(receipt).ok().expect("receipt matches");
+    // The address slot the kernel wrote is read back out of the region the
+    // ticket carried across the move.
+    assert_eq!(done.peer().v4().expect("a peer was written"), peer);
+
+    let (_, _, bufs, store) = done.into_parts();
+    assert_eq!(bufs[0].as_slice(), b"travel");
+    assert_eq!(bufs[1].as_slice(), b"ling");
+    drop(store);
+}
+
+#[test]
+fn a_truncated_receive_reports_through_the_header_the_kernel_wrote() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedRecvmsg::new(
+        RawFd::from_raw(7),
+        [HeapBuffer::with_capacity(2)],
+        msg_region::<1>(),
+        PeerWanted::No,
+        MsgFlags::default(),
+    )
+    .ok()
+    .expect("staging fits");
+    let (kernel, pending) = cycle.submit_recvmsg(prepared);
+
+    // Eleven bytes offered into two. The CQE below says 2 either way; the
+    // flag distinguishing loss from a whole short message lives only in
+    // the header, so reading it is a second dereference of owned storage.
+    assert_eq!(kernel.deliver_recvmsg(b"eleven byte", None), 2);
+
+    let receipt = kernel.post_completion(cycle.ring, 2);
+    let done = pending.redeem(receipt).ok().expect("receipt matches");
+    let received = done.received().expect("ok");
+    assert_eq!(received.bytes(), 2);
+    assert!(received.truncated());
+
+    let (_, _, bufs, store) = done.into_parts();
+    assert_eq!(bufs[0].as_slice(), b"el");
+    drop(store);
+}
+
+#[test]
+fn a_peer_too_large_for_the_slot_is_not_read_out_of_the_bytes_that_did_fit() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedRecvmsg::new(
+        RawFd::from_raw(7),
+        [HeapBuffer::with_capacity(4)],
+        msg_region::<1>(),
+        PeerWanted::Yes,
+        MsgFlags::default(),
+    )
+    .ok()
+    .expect("staging fits");
+    let (kernel, pending) = cycle.submit_recvmsg(prepared);
+
+    // 28 reported into 16 reserved, as an IPv6 peer does. Believing the
+    // reported length would read 12 bytes past the slot.
+    assert_eq!(kernel.deliver_oversized_peer(b"six", 28), 3);
+
+    let receipt = kernel.post_completion(cycle.ring, 3);
+    let done = pending.redeem(receipt).ok().expect("receipt matches");
+    assert!(done.peer().is_truncated());
+    assert!(done.peer().v4().is_none());
+
+    let (_, _, bufs, store) = done.into_parts();
+    drop((bufs, store));
+}
+
+#[test]
+fn a_short_address_is_refused_even_when_the_bytes_present_look_like_ipv4() {
+    // The nastiest shape: the kernel reports fewer bytes than the slot
+    // holds, but what it did write begins with AF_INET. A family check
+    // alone would accept it and read a port and address out of bytes the
+    // kernel never wrote. Only the reported length says otherwise.
+    let cycle = Lifecycle::new();
+    let prepared = PreparedRecvmsg::new(
+        RawFd::from_raw(7),
+        [HeapBuffer::with_capacity(4)],
+        msg_region::<1>(),
+        PeerWanted::Yes,
+        MsgFlags::default(),
+    )
+    .ok()
+    .expect("staging fits");
+    let (kernel, pending) = cycle.submit_recvmsg(prepared);
+
+    let looks_right = SockAddrIn {
+        sin_family: 2,
+        sin_port: 9999u16.to_be(),
+        sin_addr: u32::from_ne_bytes([10, 1, 2, 3]),
+        sin_zero: [0; 8],
+    };
+    assert_eq!(
+        kernel.deliver_with_reported_namelen(b"four", 11, Some(looks_right)),
+        4
+    );
+
+    let receipt = kernel.post_completion(cycle.ring, 4);
+    let done = pending.redeem(receipt).ok().expect("receipt matches");
+    assert!(
+        done.peer().v4().is_none(),
+        "11 of 16 bytes is not a whole address, whatever the family says"
+    );
+    assert!(!done.peer().is_truncated());
+
+    let (_, _, bufs, store) = done.into_parts();
+    drop((bufs, store));
+}
+
+#[test]
+fn abandoning_a_recvmsg_leaks_every_region_rather_than_freeing_them() {
+    let cycle = Lifecycle::new();
+    let region = msg_region::<2>();
+    let first = HeapBuffer::with_capacity(7);
+    let second = HeapBuffer::with_capacity(2);
+    let leaked_region = (region.ptr, region.len, region.align);
+    let leaked_bufs = [(first.ptr, first.len), (second.ptr, second.len)];
+
+    let prepared = PreparedRecvmsg::new(
+        RawFd::from_raw(7),
+        [first, second],
+        region,
+        PeerWanted::No,
+        MsgFlags::default(),
+    )
+    .ok()
+    .expect("staging fits");
+    let (kernel, pending) = cycle.submit_recvmsg(prepared);
+
+    // Everything leaks. A ticket that freed the staging region would leave
+    // the kernel *writing* a header into dead memory, and following the
+    // addresses it read from there to write further still.
+    drop(pending);
+    assert_eq!(kernel.deliver_recvmsg(b"abandoned", None), 9);
+
+    // SAFETY: the abandoned ticket leaked these and the stand-in kernel has
+    // finished, so nothing else can reach them.
+    unsafe {
+        dealloc(
+            leaked_region.0,
+            HeapBuffer::layout_of(leaked_region.1, leaked_region.2),
+        );
+        for (ptr, len) in leaked_bufs {
+            HeapBuffer::reclaim_leaked(ptr, len);
+        }
+    }
+}
+
+#[test]
+fn reclaiming_an_unpublished_recvmsg_returns_every_storage_and_its_header() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedRecvmsg::new(
+        RawFd::from_raw(7),
+        [HeapBuffer::with_capacity(6)],
+        msg_region::<1>(),
+        PeerWanted::Yes,
+        MsgFlags::DONTWAIT,
+    )
+    .ok()
+    .expect("staging fits");
+    let (_kernel, pending) = cycle.submit_recvmsg(prepared);
+
+    // SAFETY: this stands in for a rejected push — the SQE was built but
+    // never made visible to any kernel, so no storage is referenced.
+    let prepared = unsafe { pending.reclaim_unsubmitted() };
+    assert_eq!(prepared.flags(), MsgFlags::DONTWAIT);
+    assert_eq!(prepared.peer_wanted(), PeerWanted::Yes);
+    // The staged header survived the round trip, so a retry receives into
+    // the same regions rather than describing stale ones.
+    assert_eq!(prepared.published_header().msg_iovlen, 1);
+    assert_eq!(
+        u64::from(prepared.published_header().msg_namelen),
+        core::mem::size_of::<SockAddrIn>() as u64
+    );
+    assert_eq!(prepared.capacity(), 6);
     let (bufs, store) = prepared.into_parts();
     drop((bufs, store));
 }

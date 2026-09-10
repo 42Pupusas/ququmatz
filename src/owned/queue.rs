@@ -11,6 +11,7 @@ use super::multishot::{MultishotRecv, PreparedMultishot};
 use super::open::{PendingOpen, PreparedOpen};
 use super::openat2::{PendingOpenat2, PreparedOpenat2};
 use super::pathop::{PendingPathOp, PreparedPathOp};
+use super::recvmsg::{PendingRecvmsg, PreparedRecvmsg};
 use super::rename::{PendingRename, PreparedRename};
 use super::request::{Pending, Prepared, Receipt};
 use super::sendmsg::{PendingSendmsg, PreparedSendmsg};
@@ -310,6 +311,43 @@ impl OwnedSubmitter {
     fn reclaim_sendmsg<B: StableBuffer, R: StableBufferMut, const N: usize>(
         pending: PendingSendmsg<B, R, N>,
     ) -> PreparedSendmsg<B, R, N> {
+        // SAFETY: only reached when `Submitter::push` reported the queue was
+        // full, which happens before the SQE is written or the tail is
+        // advanced. No kernel-visible pointer to the staging storage exists.
+        unsafe { pending.reclaim_unsubmitted() }
+    }
+
+    /// Queue a `recvmsg`, taking ownership of its buffers and staging
+    /// storage.
+    ///
+    /// The kernel writes into both: the buffers take the payload, and the
+    /// header in the staging region is updated with the peer address's
+    /// size and the flags describing what happened. So the region is not
+    /// merely read after submission the way a `sendmsg`'s is — it is a
+    /// destination, and the ticket owns it for the whole operation.
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact,
+    /// still owning everything.
+    pub fn push_recvmsg<B: StableBufferMut, R: StableBufferMut, const N: usize>(
+        &mut self,
+        request: PreparedRecvmsg<B, R, N>,
+    ) -> Result<PendingRecvmsg<B, R, N>, (PreparedRecvmsg<B, R, N>, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            // The SQE never became kernel-visible, so the kernel never saw
+            // the header pointer and reclaiming everything is sound.
+            Err(e) => Err((Self::reclaim_recvmsg(pending), e)),
+        }
+    }
+
+    /// Undo a `recvmsg` push that the kernel never observed.
+    fn reclaim_recvmsg<B: StableBufferMut, R: StableBufferMut, const N: usize>(
+        pending: PendingRecvmsg<B, R, N>,
+    ) -> PreparedRecvmsg<B, R, N> {
         // SAFETY: only reached when `Submitter::push` reported the queue was
         // full, which happens before the SQE is written or the tail is
         // advanced. No kernel-visible pointer to the staging storage exists.

@@ -155,6 +155,19 @@ fn an_in_flight_message_hides_every_region_it_chains_together() {
     t.compile_fail("tests/ui/a_sendmsg_ticket_must_be_kept.rs");
 }
 
+/// A `recvmsg` chains the same three regions as a `sendmsg` and adds a
+/// direction: the kernel *writes* the header as well as reading it, so the
+/// staging region is a destination and not merely a description. Reading
+/// any of it in flight races a kernel write rather than observing a
+/// finished one, and the peer address in particular is meaningless until
+/// the length beside it has been written.
+#[test]
+fn an_in_flight_received_message_hides_what_the_kernel_is_writing() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/an_in_flight_received_message_is_unreachable.rs");
+    t.compile_fail("tests/ui/a_recvmsg_ticket_must_be_kept.rs");
+}
+
 /// An accepted connection is owned rather than borrowed, so the compiler
 /// cannot tie it to a pool the way it does an arrival. What it can do is
 /// refuse to let the result be thrown away unread, which is the failure

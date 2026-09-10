@@ -34,8 +34,8 @@
 //! The kernel does not write back into a `sendmsg` header — measured, not
 //! assumed: `msg_namelen`, `msg_controllen`, `msg_iovlen`, and `msg_flags`
 //! are all unchanged after a completed send. That is what separates this
-//! from [`PreparedRecvmsg`](super::PreparedRecvmsg), where the header is
-//! an output too, and it is why the payload buffers here need only
+//! from [`PreparedRecvmsg`](super::PreparedRecvmsg), whose header the
+//! kernel overwrites, and it is why the payload buffers here need only
 //! [`StableBuffer`] rather than [`StableBufferMut`].
 
 use core::mem::ManuallyDrop;

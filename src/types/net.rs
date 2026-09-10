@@ -127,6 +127,18 @@ bitflags! {
     const ERRQUEUE = 0x2000;
 }
 
+impl MsgOutFlags {
+    /// Adopt the `msg_flags` value the kernel wrote back.
+    ///
+    /// Unknown bits are kept rather than masked away: this describes what
+    /// a kernel reported, and a newer kernel may report a bit this crate
+    /// does not name yet.
+    #[must_use]
+    pub(crate) const fn from_raw(bits: u32) -> Self {
+        Self(bits)
+    }
+}
+
 bitflags! {
     /// Accept flags (same as socket flags that make sense for accept4).
     ///

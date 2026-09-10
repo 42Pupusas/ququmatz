@@ -2,18 +2,19 @@
 
 extern crate std;
 
-/// Only the kernel-backed tests name a path-op kind, and those are gated.
-#[cfg(not(miri))]
-use super::PathOpKind;
 use super::{
     Arrival, Completed, Delivery, DirectIncoming, DirectOpenError, DirectSlot, DirectSocketError,
     Direction, Event, Incoming, MmapBuffer, MsgRegionError, Openat2Error, Openat2Mode, OwnedPath,
-    PathError, Pending, PendingStatx, PendingZc, Prepared, PreparedAccept, PreparedDirectAccept,
-    PreparedDirectOpen, PreparedDirectSocket, PreparedMultishot, PreparedOpen, PreparedOpenat2,
-    PreparedPathOp, PreparedRename, PreparedSendmsg, PreparedStatx, PreparedVectored, PreparedZc,
-    Receipt, RenameMode, RingId, SendTarget, SlotIndex, SlotTarget, StableBuffer, StatxError,
-    VectoredError, ZcCompleted,
+    PathError, PeerWanted, Pending, PendingStatx, PendingZc, Prepared, PreparedAccept,
+    PreparedDirectAccept, PreparedDirectOpen, PreparedDirectSocket, PreparedMultishot,
+    PreparedOpen, PreparedOpenat2, PreparedPathOp, PreparedRecvmsg, PreparedRename,
+    PreparedSendmsg, PreparedStatx, PreparedVectored, PreparedZc, Receipt, RenameMode, RingId,
+    SendTarget, SlotIndex, SlotTarget, StableBuffer, StatxError, VectoredError, ZcCompleted,
 };
+/// Only the kernel-backed tests name a path-op kind or inspect a peer
+/// address, and those are gated.
+#[cfg(not(miri))]
+use super::{PathOpKind, PeerAddress};
 use crate::error::{Error, SubmitError};
 use crate::net::Socket;
 use crate::types::{
@@ -3949,4 +3950,748 @@ fn an_openat2_ticket_survives_moving_to_another_thread_before_completion() {
     });
     assert!(handle.join().expect("thread"));
     assert!(scratch.exists("crossing"));
+}
+
+/// An unconnected UDP socket bound on loopback, plus a sender aimed at it.
+///
+/// Datagram rather than stream because truncation is a datagram property:
+/// a stream socket leaves the remainder queued and reports nothing.
+#[cfg(not(miri))]
+struct DatagramPair {
+    tx: RawFd,
+    rx: RawFd,
+    tx_addr: SockAddrIn,
+}
+
+#[cfg(not(miri))]
+impl DatagramPair {
+    fn bound() -> Self {
+        let rx = Self::socket();
+        let rx_addr = Self::bind(rx);
+        let tx = Self::socket();
+        // The sender is bound too, so the receiver has a real peer address
+        // to report rather than an ephemeral unbound one.
+        let tx_addr = Self::bind(tx);
+        crate::syscall::connect(
+            tx,
+            (&raw const rx_addr).cast(),
+            core::mem::size_of::<SockAddrIn>() as u32,
+        )
+        .expect("connect tx");
+        Self { tx, rx, tx_addr }
+    }
+
+    fn socket() -> RawFd {
+        crate::syscall::socket(crate::types::AF_INET, 2, 0).expect("udp socket")
+    }
+
+    fn bind(fd: RawFd) -> SockAddrIn {
+        let wanted = SockAddrIn {
+            sin_family: crate::types::AF_INET as u16,
+            sin_port: 0u16.to_be(),
+            sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+            sin_zero: [0; 8],
+        };
+        crate::syscall::bind(
+            fd,
+            (&raw const wanted).cast(),
+            core::mem::size_of::<SockAddrIn>() as u32,
+        )
+        .expect("bind");
+        let mut bound = SockAddrIn::default();
+        let mut len = core::mem::size_of::<SockAddrIn>() as u32;
+        crate::syscall::getsockname(fd, (&raw mut bound).cast(), &raw mut len)
+            .expect("getsockname");
+        bound
+    }
+
+    fn send(&self, bytes: &[u8]) {
+        crate::syscall::sendto(self.tx, bytes.as_ptr(), bytes.len(), 0).expect("sendto");
+    }
+}
+
+#[cfg(not(miri))]
+impl Drop for DatagramPair {
+    fn drop(&mut self) {
+        let _ = crate::syscall::close(self.tx);
+        let _ = crate::syscall::close(self.rx);
+    }
+}
+
+/// An empty buffer of `n` bytes, for the kernel to fill.
+fn empty(n: usize) -> MmapBuffer {
+    MmapBuffer::with_capacity(n).expect("map")
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_recvmsg_scatters_one_message_across_every_buffer() {
+    let pair = DatagramPair::bound();
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    pair.send(b"abcdefghij");
+
+    let region = msg_region::<3>();
+    let region_addr = region.stable_ptr();
+    // Distinct sizes: three equal buffers would pass even if the kernel
+    // filled them in the wrong order.
+    let bufs = [empty(4), empty(4), empty(4)];
+    let addrs = [
+        bufs[0].stable_ptr(),
+        bufs[1].stable_ptr(),
+        bufs[2].stable_ptr(),
+    ];
+    let prepared =
+        PreparedRecvmsg::new(pair.rx, bufs, region, PeerWanted::Yes, MsgFlags::default())
+            .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+
+    let ticket = sub
+        .push_recvmsg(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+
+    let (received, peer, bufs, store) = done.into_parts();
+    let received = received.expect("recv ok");
+    assert_eq!(received.bytes(), 10);
+    // Ten bytes into twelve is not truncation, and reporting it as such
+    // would make the flag useless.
+    assert!(!received.truncated());
+
+    // Filled in descriptor order, the third only partly.
+    assert_eq!(&bufs[0].as_slice()[..4], b"abcd");
+    assert_eq!(&bufs[1].as_slice()[..4], b"efgh");
+    assert_eq!(&bufs[2].as_slice()[..2], b"ij");
+
+    // The peer address the kernel wrote into the staged slot is the
+    // sender's, read back through the region the ticket owns.
+    let addr = peer.v4().expect("a bound IPv4 peer");
+    assert_eq!(addr.sin_port, pair.tx_addr.sin_port);
+    assert_eq!(addr.sin_addr, pair.tx_addr.sin_addr);
+
+    for (buf, addr) in bufs.iter().zip(addrs.iter()) {
+        assert_eq!(buf.stable_ptr(), *addr);
+    }
+    assert_eq!(store.stable_ptr(), region_addr);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_truncated_datagram_reports_the_loss_that_its_byte_count_hides() {
+    let pair = DatagramPair::bound();
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    // Eleven bytes into two. The CQE will say 2 — the same 2 a two-byte
+    // datagram that arrived whole would say. Only the written-back flags
+    // distinguish them, which is the entire reason `received` returns both.
+    pair.send(b"eleven byte");
+
+    let prepared = PreparedRecvmsg::new(
+        pair.rx,
+        [empty(2)],
+        msg_region::<1>(),
+        PeerWanted::No,
+        MsgFlags::default(),
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+    let ticket = sub
+        .push_recvmsg(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+
+    let received = done.received().expect("recv ok");
+    assert_eq!(received.bytes(), 2);
+    assert!(
+        received.truncated(),
+        "nine discarded bytes must be reported somewhere"
+    );
+    assert_eq!(&done.buffers()[0].as_slice()[..2], b"el");
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_whole_datagram_of_the_same_length_is_not_reported_as_truncated() {
+    let pair = DatagramPair::bound();
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    // The control for the test above: same buffer, same reported count,
+    // nothing lost. Without this pair, a `truncated` that always returned
+    // true would pass.
+    pair.send(b"el");
+
+    let prepared = PreparedRecvmsg::new(
+        pair.rx,
+        [empty(2)],
+        msg_region::<1>(),
+        PeerWanted::No,
+        MsgFlags::default(),
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+    let ticket = sub
+        .push_recvmsg(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+
+    let received = done.received().expect("recv ok");
+    assert_eq!(received.bytes(), 2, "same count as the truncated case");
+    assert!(!received.truncated());
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_peer_larger_than_the_reserved_slot_is_reported_rather_than_handed_back_as_a_prefix() {
+    use crate::syscall;
+
+    // An IPv6 peer's address is 28 bytes; the staged slot is a 16-byte
+    // SockAddrIn. The kernel reports 28 and writes 16, so a `PeerAddress`
+    // built from the reported length would be a prefix read as an address.
+    const AF_INET6: i32 = 10;
+    let mut wanted = [0u8; 28];
+    wanted[0..2].copy_from_slice(&(AF_INET6 as u16).to_ne_bytes());
+    wanted[8..24].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+
+    let rx = syscall::socket(AF_INET6, 2, 0).expect("rx6");
+    syscall::bind(rx, wanted.as_ptr(), 28).expect("bind6");
+    let mut bound = [0u8; 28];
+    let mut len = 28u32;
+    syscall::getsockname(rx, bound.as_mut_ptr(), &raw mut len).expect("getsockname6");
+    let tx = syscall::socket(AF_INET6, 2, 0).expect("tx6");
+    syscall::connect(tx, bound.as_ptr(), 28).expect("connect6");
+    syscall::sendto(tx, b"six".as_ptr(), 3, 0).expect("sendto");
+
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let prepared = PreparedRecvmsg::new(
+        rx,
+        [empty(16)],
+        msg_region::<1>(),
+        PeerWanted::Yes,
+        MsgFlags::default(),
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+    let ticket = sub
+        .push_recvmsg(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+
+    assert_eq!(done.received().expect("recv ok").bytes(), 3);
+    let peer = done.peer();
+    assert!(peer.is_truncated(), "got {peer:?}");
+    assert_eq!(
+        peer,
+        PeerAddress::Truncated {
+            reported: 28,
+            reserved: core::mem::size_of::<SockAddrIn>() as u32,
+        }
+    );
+    // And no half-address escapes as if it were whole.
+    assert!(peer.v4().is_none());
+
+    let _ = syscall::close(tx);
+    let _ = syscall::close(rx);
+}
+
+/// A bound `AF_UNIX` datagram socket, which unlinks its path on drop.
+///
+/// Unix rather than IP because its addresses are *variable length*: a
+/// short path makes the kernel report a `msg_namelen` between one and the
+/// reserved 16, which is the only way to reach a partially written slot.
+#[cfg(not(miri))]
+struct UnixDatagram {
+    fd: RawFd,
+    path: std::string::String,
+}
+
+#[cfg(not(miri))]
+impl UnixDatagram {
+    const AF_UNIX: i32 = 1;
+
+    fn bound(path: &str) -> Self {
+        let _ = std::fs::remove_file(path);
+        let fd = crate::syscall::socket(Self::AF_UNIX, 2, 0).expect("unix socket");
+        let (addr, len) = Self::sockaddr_un(path);
+        crate::syscall::bind(fd, addr.as_ptr(), len).expect("bind unix");
+        Self {
+            fd,
+            path: std::string::String::from(path),
+        }
+    }
+
+    fn connect_to(&self, path: &str) {
+        let (addr, len) = Self::sockaddr_un(path);
+        crate::syscall::connect(self.fd, addr.as_ptr(), len).expect("connect unix");
+    }
+
+    fn send(&self, bytes: &[u8]) {
+        crate::syscall::sendto(self.fd, bytes.as_ptr(), bytes.len(), 0).expect("sendto unix");
+    }
+
+    /// `struct sockaddr_un` plus the length that covers family, path, and
+    /// the terminator — which is what the kernel reports back.
+    fn sockaddr_un(path: &str) -> ([u8; 110], u32) {
+        let mut addr = [0u8; 110];
+        addr[0..2].copy_from_slice(&(Self::AF_UNIX as u16).to_ne_bytes());
+        addr[2..2 + path.len()].copy_from_slice(path.as_bytes());
+        (addr, (2 + path.len() + 1) as u32)
+    }
+}
+
+#[cfg(not(miri))]
+impl Drop for UnixDatagram {
+    fn drop(&mut self) {
+        let _ = crate::syscall::close(self.fd);
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_peer_that_fills_only_part_of_the_slot_is_not_read_as_a_whole_address() {
+    // Measured: an AF_UNIX peer bound to `/tmp/qq-…` reports a
+    // `msg_namelen` of 11 into a 16-byte reservation. Fewer bytes than the
+    // slot holds, so the tail is whatever the region held before — reading
+    // all 16 would hand back `sin_family: 1` as though it were IPv4.
+    let listener = UnixDatagram::bound("/tmp/qq-recv-peer.sock");
+    let sender = UnixDatagram::bound("/tmp/qq-send");
+    sender.connect_to("/tmp/qq-recv-peer.sock");
+    sender.send(b"unix");
+
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let prepared = PreparedRecvmsg::new(
+        listener.fd,
+        [empty(8)],
+        msg_region::<1>(),
+        PeerWanted::Yes,
+        MsgFlags::default(),
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+    let ticket = sub
+        .push_recvmsg(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+
+    assert_eq!(done.received().expect("recv ok").bytes(), 4);
+    let reported = done.header().msg_namelen;
+    assert!(
+        reported > 0 && (reported as usize) < core::mem::size_of::<SockAddrIn>(),
+        "the partial-write case needs a length inside the slot, got {reported}"
+    );
+    // Neither a whole address nor an oversized one: partially written.
+    assert!(done.peer().v4().is_none(), "got {:?}", done.peer());
+    assert!(!done.peer().is_truncated());
+    assert_eq!(
+        done.peer(),
+        PeerAddress::Other {
+            family: UnixDatagram::AF_UNIX as u16,
+            reported,
+        }
+    );
+}
+
+#[test]
+fn the_address_slot_is_cleared_so_no_earlier_peer_can_be_reported_as_this_ones() {
+    // One staging region serving two requests is the point of handing it
+    // back. Without clearing, a receive whose kernel writes nothing would
+    // report the previous request's sender as its own.
+    let region = msg_region::<1>();
+    let first = PreparedRecvmsg::new(
+        RawFd::from_raw(3),
+        [empty(8)],
+        region,
+        PeerWanted::Yes,
+        MsgFlags::default(),
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+
+    // Stand in for a kernel write-back by stamping the slot the header
+    // names, exactly where a real completion would put a peer.
+    let hdr = first.published_header();
+    #[allow(clippy::cast_ptr_alignment)]
+    let slot = hdr.msg_name.cast::<SockAddrIn>();
+    let stale = SockAddrIn {
+        sin_family: 2,
+        sin_port: 9999u16.to_be(),
+        sin_addr: u32::from_ne_bytes([10, 1, 2, 3]),
+        sin_zero: [0; 8],
+    };
+    // SAFETY: the request owns this storage and staged a `SockAddrIn` here.
+    unsafe { slot.write(stale) };
+    let (_, region) = first.into_parts();
+
+    let second = PreparedRecvmsg::new(
+        RawFd::from_raw(3),
+        [empty(8)],
+        region,
+        PeerWanted::Yes,
+        MsgFlags::default(),
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+    let hdr = second.published_header();
+    #[allow(clippy::cast_ptr_alignment)]
+    let slot = hdr.msg_name.cast::<SockAddrIn>();
+    // SAFETY: as above, for the request now owning the same storage.
+    let seen = unsafe { slot.read() };
+    assert_eq!(
+        seen,
+        SockAddrIn::default(),
+        "the reused slot still holds the previous request's peer"
+    );
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_failed_recvmsg_reports_the_errno_rather_than_the_stale_header_it_left() {
+    let pair = DatagramPair::bound();
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    // Nothing sent, so DONTWAIT fails with EAGAIN. Verified against the
+    // kernel: a failure writes nothing back, so the header still holds the
+    // caller's own values — which must not be read as an outcome.
+    let prepared = PreparedRecvmsg::new(
+        pair.rx,
+        [empty(16)],
+        msg_region::<1>(),
+        PeerWanted::Yes,
+        MsgFlags::DONTWAIT,
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+    let ticket = sub
+        .push_recvmsg(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+
+    assert!(done.failed());
+    assert!(done.received().is_err());
+    // The staged reservation is still in the header; reporting it as a
+    // peer would invent a sender for a message that never arrived.
+    assert_eq!(
+        done.header().msg_namelen,
+        core::mem::size_of::<SockAddrIn>() as u32
+    );
+    assert_eq!(done.peer(), PeerAddress::None);
+
+    // The storage still comes back, so a failed receive costs nothing.
+    let (received, peer, bufs, store) = done.into_parts();
+    assert!(received.is_err());
+    assert_eq!(peer, PeerAddress::None);
+    assert_eq!(bufs[0].stable_len(), 16);
+    assert_eq!(store.stable_len(), msg_region::<1>().stable_len());
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_connected_receive_reports_no_peer_however_much_room_was_reserved() {
+    let pair = SocketPair::connected();
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    pair.write_client(b"hi");
+
+    // Room reserved, but a connected socket has no per-message sender, so
+    // the kernel writes back a zero length. Reading the staged slot anyway
+    // would report the zeroes as address 0.0.0.0.
+    let prepared = PreparedRecvmsg::new(
+        pair.server,
+        [empty(16)],
+        msg_region::<1>(),
+        PeerWanted::Yes,
+        MsgFlags::default(),
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+    let ticket = sub
+        .push_recvmsg(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+
+    let received = done.received().expect("recv ok");
+    assert_eq!(received.bytes(), 2);
+    // A stream socket leaves any remainder queued, so nothing is lost.
+    assert!(!received.truncated());
+    assert_eq!(done.header().msg_namelen, 0);
+    assert_eq!(done.peer(), PeerAddress::None);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_short_stream_read_is_not_a_truncation() {
+    let pair = SocketPair::connected();
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    // The same 11-into-2 shape that sets TRUNC on a datagram socket. Here
+    // the remaining nine bytes are still queued, so treating a short read
+    // as data loss would be wrong.
+    pair.write_client(b"eleven byte");
+
+    let prepared = PreparedRecvmsg::new(
+        pair.server,
+        [empty(2)],
+        msg_region::<1>(),
+        PeerWanted::No,
+        MsgFlags::default(),
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+    let ticket = sub
+        .push_recvmsg(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+
+    let received = done.received().expect("recv ok");
+    assert_eq!(received.bytes(), 2);
+    assert!(!received.truncated(), "the rest is queued, not discarded");
+}
+
+#[test]
+fn a_receive_reserving_no_peer_stages_no_address_for_the_kernel_to_write() {
+    let prepared = PreparedRecvmsg::new(
+        RawFd::from_raw(3),
+        [empty(8)],
+        msg_region::<1>(),
+        PeerWanted::No,
+        MsgFlags::default(),
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+
+    // A non-zero namelen with a null pointer is a write past the end of
+    // whatever `msg_name` holds, so both must be absent together.
+    let hdr = prepared.published_header();
+    assert!(hdr.msg_name.is_null());
+    assert_eq!(hdr.msg_namelen, 0);
+}
+
+#[test]
+fn a_receive_reserving_a_peer_points_the_header_past_its_own_descriptors() {
+    let region = msg_region::<2>();
+    let lo = region.stable_ptr().addr();
+    let hi = lo + region.stable_len();
+
+    let prepared = PreparedRecvmsg::new(
+        RawFd::from_raw(3),
+        [empty(4), empty(4)],
+        region,
+        PeerWanted::Yes,
+        MsgFlags::default(),
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+
+    let hdr = prepared.published_header();
+    assert_eq!(hdr.msg_namelen, core::mem::size_of::<SockAddrIn>() as u32);
+    assert_eq!(hdr.msg_iovlen, 2);
+
+    // The kernel writes an address here, so the slot must lie inside owned
+    // storage and must not overlap the header or the descriptor array it
+    // reads on the way — all three are in the same region, so bounds alone
+    // would be satisfied by a slot pointing at the header itself.
+    let name = hdr.msg_name.addr();
+    assert!(name >= lo && name < hi, "slot must be inside the region");
+    let array_end = hdr.msg_iov.addr() + core::mem::size_of::<crate::types::IoVec>() * 2;
+    assert!(name >= array_end, "the address slot must follow the array");
+    assert!(
+        hdr.msg_iov.addr() >= lo + core::mem::size_of::<crate::types::MsgHdr>(),
+        "the array must follow the header"
+    );
+}
+
+#[test]
+fn with_lens_caps_what_the_kernel_may_write_but_never_extends_a_buffer() {
+    let prepared = PreparedRecvmsg::new(
+        RawFd::from_raw(3),
+        [empty(8), empty(8)],
+        msg_region::<2>(),
+        PeerWanted::No,
+        MsgFlags::default(),
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"))
+    .with_lens([2, 999]);
+
+    assert_eq!(prepared.published_descriptor(0).len(), 2);
+    // Clamped: a descriptor longer than its buffer is a kernel write past
+    // the end, reported as a successful receive.
+    assert_eq!(prepared.published_descriptor(1).len(), 8);
+    assert_eq!(prepared.capacity(), 10);
+}
+
+#[test]
+fn a_receive_region_too_small_is_refused_with_everything_back() {
+    let needed = core::mem::size_of::<crate::types::MsgHdr>()
+        + core::mem::size_of::<crate::types::IoVec>() * 2
+        + core::mem::size_of::<SockAddrIn>();
+    let buf = empty(4);
+    let addr = buf.stable_ptr();
+
+    let Err((bufs, store, e)) = PreparedRecvmsg::new(
+        RawFd::from_raw(3),
+        [buf, empty(4)],
+        MmapBuffer::with_capacity(needed - 1).expect("map"),
+        PeerWanted::Yes,
+        MsgFlags::default(),
+    ) else {
+        panic!("a short staging region must be refused");
+    };
+    assert_eq!(
+        e,
+        MsgRegionError::RegionTooSmall {
+            needed,
+            got: needed - 1
+        }
+    );
+    assert_eq!(bufs[0].stable_ptr(), addr);
+    assert_eq!(store.stable_len(), needed - 1);
+}
+
+#[test]
+fn a_recvmsg_push_that_does_not_fit_hands_back_the_buffers_and_the_region() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut tickets = alloc_tickets(&mut sub);
+    let region = msg_region::<2>();
+    let region_addr = region.stable_ptr();
+
+    let prepared = PreparedRecvmsg::new(
+        RawFd::from_raw(1),
+        [empty(4), empty(4)],
+        region,
+        PeerWanted::Yes,
+        MsgFlags::default(),
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+
+    let Err((returned, e)) = sub.push_recvmsg(prepared) else {
+        panic!("a full queue must reject the push");
+    };
+    assert_eq!(e, Error::Submit(SubmitError::QueueFull));
+    // A retry must issue the same request, so the staged header has to
+    // still name the descriptors and the address slot.
+    assert_eq!(returned.published_header().msg_iovlen, 2);
+    assert_eq!(
+        returned.published_header().msg_namelen,
+        core::mem::size_of::<SockAddrIn>() as u32
+    );
+    assert_eq!(returned.capacity(), 8);
+    assert_eq!(returned.peer_wanted(), PeerWanted::Yes);
+    let (_, store) = returned.into_parts();
+    assert_eq!(store.stable_ptr(), region_addr);
+    tickets.clear();
+}
+
+#[test]
+fn a_recvmsg_receipt_for_another_request_is_rejected() {
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut make = || {
+        let prepared = PreparedRecvmsg::new(
+            RawFd::from_raw(1),
+            [empty(4)],
+            msg_region::<1>(),
+            PeerWanted::No,
+            MsgFlags::default(),
+        )
+        .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+        sub.push_recvmsg(prepared)
+            .unwrap_or_else(|(_, e)| panic!("{e}"))
+    };
+    let first = make();
+    let second = make();
+
+    let foreign = Receipt {
+        ring: second.ring(),
+        id: second.id(),
+        result: 0,
+        flags: crate::types::CqeFlags::default(),
+    };
+    assert!(!first.matches(&foreign));
+    let Err((first, _)) = first.redeem(foreign) else {
+        panic!("a foreign receipt must not redeem");
+    };
+    drop((first, second));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_recvmsg_ticket_survives_moving_to_another_thread_before_completion() {
+    let pair = DatagramPair::bound();
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    pair.send(b"crossing");
+
+    let prepared = PreparedRecvmsg::new(
+        pair.rx,
+        [empty(4), empty(4)],
+        msg_region::<2>(),
+        PeerWanted::Yes,
+        MsgFlags::default(),
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+    let ticket = sub
+        .push_recvmsg(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    // The kernel writes the header, the buffers it reaches through it, and
+    // the address slot on the submitting thread; the ticket owning all of
+    // it is redeemed on another.
+    let handle = std::thread::spawn(move || {
+        let receipt = comp.wait_one().expect("completion");
+        let done = ticket
+            .redeem(receipt)
+            .unwrap_or_else(|_| panic!("mismatch"));
+        let bytes = done.received().expect("recv ok").bytes();
+        let bufs = done.buffers();
+        let mut seen = std::vec::Vec::new();
+        seen.extend_from_slice(&bufs[0].as_slice()[..4]);
+        seen.extend_from_slice(&bufs[1].as_slice()[..4]);
+        (bytes, seen, done.peer())
+    });
+    let (bytes, seen, peer) = handle.join().expect("thread");
+    assert_eq!(bytes, 8);
+    assert_eq!(&seen[..], b"crossing");
+    assert_eq!(
+        peer.v4().expect("a bound peer").sin_port,
+        pair.tx_addr.sin_port
+    );
 }

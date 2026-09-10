@@ -1,0 +1,23 @@
+error[E0599]: no method named `published_header` found for struct `PendingRecvmsg<B, R, N>` in the current scope
+  --> tests/ui/an_in_flight_received_message_is_unreachable.rs:11:20
+   |
+11 |     let _ = ticket.published_header();
+   |                    ^^^^^^^^^^^^^^^^ method not found in `PendingRecvmsg<MmapBuffer, MmapBuffer, 2>`
+
+error[E0599]: no method named `peer` found for struct `PendingRecvmsg<B, R, N>` in the current scope
+  --> tests/ui/an_in_flight_received_message_is_unreachable.rs:17:20
+   |
+17 |     let _ = ticket.peer();
+   |                    ^^^^ method not found in `PendingRecvmsg<MmapBuffer, MmapBuffer, 2>`
+
+error[E0599]: no method named `buffers` found for struct `PendingRecvmsg<B, R, N>` in the current scope
+  --> tests/ui/an_in_flight_received_message_is_unreachable.rs:22:20
+   |
+22 |     let _ = ticket.buffers();
+   |                    ^^^^^^^ method not found in `PendingRecvmsg<MmapBuffer, MmapBuffer, 2>`
+
+error[E0599]: no method named `into_parts` found for struct `PendingRecvmsg<B, R, N>` in the current scope
+  --> tests/ui/an_in_flight_received_message_is_unreachable.rs:29:20
+   |
+29 |     let _ = ticket.into_parts();
+   |                    ^^^^^^^^^^ method not found in `PendingRecvmsg<MmapBuffer, MmapBuffer, 2>`

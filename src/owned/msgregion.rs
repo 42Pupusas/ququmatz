@@ -204,8 +204,26 @@ impl<R> MsgRegion<R> {
         unsafe { self.name.write(addr) }
     }
 
+    /// Read the address slot back.
+    ///
+    /// On a send this returns what was staged; after a `recvmsg` that
+    /// reserved room for a peer, it returns what the kernel wrote. Read
+    /// through this region's own pointer rather than the header's, because
+    /// the reservation is what bounds the slot — the length the kernel
+    /// writes back into `msg_namelen` can exceed it.
+    pub(crate) const fn staged_name(&self) -> SockAddrIn {
+        // SAFETY: the slot was sized and aligned for a `SockAddrIn` inside
+        // storage this value owns, and was written before submission.
+        unsafe { self.name.read() }
+    }
+
     /// Write the header the kernel will read, wiring it to the staged
     /// descriptor array and, when `named`, to the staged address.
+    ///
+    /// On a send `named` means an address is staged for the kernel to
+    /// read; on a receive it means room is reserved for the kernel to
+    /// write one. The bytes are identical, which is why one method serves
+    /// both.
     ///
     /// `flags` is deliberately not a parameter: `msg_flags` is an output
     /// field on `recvmsg` and ignored on `sendmsg`, so a caller value
