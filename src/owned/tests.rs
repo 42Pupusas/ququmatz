@@ -3,11 +3,11 @@
 extern crate std;
 
 use super::{
-    Arrival, Completed, Delivery, DirectOpenError, DirectSlot, Direction, Event, Incoming,
-    MmapBuffer, OwnedPath, PathError, Pending, PendingStatx, PendingZc, Prepared, PreparedAccept,
-    PreparedDirectOpen, PreparedMultishot, PreparedOpen, PreparedStatx, PreparedVectored,
-    PreparedZc, Receipt, RingId, SlotIndex, SlotTarget, StableBuffer, StatxError, VectoredError,
-    ZcCompleted,
+    Arrival, Completed, Delivery, DirectIncoming, DirectOpenError, DirectSlot, Direction, Event,
+    Incoming, MmapBuffer, OwnedPath, PathError, Pending, PendingStatx, PendingZc, Prepared,
+    PreparedAccept, PreparedDirectAccept, PreparedDirectOpen, PreparedMultishot, PreparedOpen,
+    PreparedStatx, PreparedVectored, PreparedZc, Receipt, RingId, SlotIndex, SlotTarget,
+    StableBuffer, StatxError, VectoredError, ZcCompleted,
 };
 use crate::error::{Error, SubmitError};
 use crate::net::Socket;
@@ -1019,6 +1019,320 @@ fn a_finished_accept_hands_back_the_connection_folded_into_its_last_cqe() {
     assert!(last.is_some(), "into_parts surrenders the connection");
     drop(last);
     let _ = crate::syscall::close(client);
+}
+
+#[test]
+fn a_real_direct_accept_installs_connections_into_the_table_not_the_process() {
+    let listener = Listener::bound();
+    let mut ring = crate::IoUring::new(16).expect("ring");
+    // A sparse table for the kernel to allocate out of. Without one every
+    // completion fails instead of installing anything.
+    ring.register_files(&[-1; 4]).expect("register table");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut ticket = sub
+        .push_direct_accept(PreparedDirectAccept::on(
+            listener.fd,
+            AcceptFlags::default(),
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit");
+
+    let mut clients = std::vec::Vec::new();
+    let mut slots = std::vec::Vec::new();
+    for _ in 0..3 {
+        clients.push(listener.connect());
+
+        loop {
+            comp.wait(1).expect("wait");
+            let Some(event) = comp.reap_event() else {
+                comp.sync();
+                continue;
+            };
+            match ticket.record(event).expect("our request") {
+                DirectIncoming::Installed(slot) => {
+                    slots.push(slot);
+                    break;
+                }
+                DirectIncoming::Empty(res) => panic!("empty direct accept: {res}"),
+                DirectIncoming::Done(fin) => panic!("accept ended: {:?}", fin.result()),
+            }
+        }
+        comp.sync();
+    }
+
+    assert_eq!(slots.len(), 3, "one armed accept filled three slots");
+    let indices: std::vec::Vec<u32> = slots.iter().map(|s| s.index().get()).collect();
+
+    // What comes back is a table index, not a descriptor. A fresh sparse
+    // table allocates densely from zero, so these are exactly 0, 1, 2 --
+    // values a process descriptor could not be, since 0, 1 and 2 are
+    // already stdin, stdout and stderr. A plain accept would report the
+    // installed fd here instead and this would be some larger, unrelated
+    // triple.
+    //
+    // An earlier version compared the process's next-free descriptor
+    // before and after each completion. That reads a process-global
+    // resource, so it raced every other test thread creating and closing
+    // descriptors in the same binary, and failed under parallelism for
+    // reasons unrelated to accept. This claim is local to the ring.
+    let mut sorted = indices.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        sorted,
+        std::vec![0, 1, 2],
+        "a direct accept reports table slots, not process descriptors"
+    );
+
+    // The slots hold live connections, reachable only through the table.
+    for (slot, client) in slots.iter().zip(&clients) {
+        sub.raw()
+            .push(
+                unsafe {
+                    crate::Sqe::write_ptr(
+                        RawFd::from_raw(slot.as_fixed_fd() as usize),
+                        b"hi".as_ptr(),
+                        2,
+                        0,
+                    )
+                }
+                .fixed_file()
+                .user_data(0xD1),
+            )
+            .expect("push write");
+        sub.submit_and_wait(1).expect("submit");
+        let cqe = comp.wait_one().expect("completion");
+        assert_eq!(cqe.raw_result(), 2, "write through the slot");
+
+        let mut seen = [0u8; 2];
+        let got = crate::syscall::read(*client, seen.as_mut_ptr(), seen.len()).expect("read");
+        assert_eq!(&seen[..got], b"hi");
+    }
+
+    for client in clients {
+        let _ = crate::syscall::close(client);
+    }
+}
+
+#[test]
+fn a_full_table_ends_the_direct_accept_rather_than_refusing_one_connection() {
+    // A registered table is far smaller than RLIMIT_NOFILE, so exhaustion
+    // is routine. The kernel gates its re-arm on a non-negative result, so
+    // -ENFILE is terminal: the listener stops. Treating it as a survivable
+    // hiccup would leave a caller waiting forever on a retired request.
+    let listener = Listener::bound();
+    let mut ring = crate::IoUring::new(16).expect("ring");
+    // Exactly one slot, so the second connection has nowhere to go.
+    ring.register_files(&[-1; 1]).expect("register table");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut ticket = sub
+        .push_direct_accept(PreparedDirectAccept::on(
+            listener.fd,
+            AcceptFlags::default(),
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit");
+
+    let mut clients = std::vec::Vec::new();
+    let mut outcomes = std::vec::Vec::new();
+    for _ in 0..2 {
+        clients.push(listener.connect());
+        loop {
+            comp.wait(1).expect("wait");
+            let Some(event) = comp.reap_event() else {
+                comp.sync();
+                continue;
+            };
+            outcomes.push(ticket.record(event).expect("our request"));
+            break;
+        }
+        comp.sync();
+    }
+
+    let first = &outcomes[0];
+    assert!(
+        matches!(first, DirectIncoming::Installed(_)),
+        "the first connection fits"
+    );
+    assert!(first.armed().is_armed(), "and leaves the listener armed");
+
+    let DirectIncoming::Done(finished) = &outcomes[1] else {
+        panic!(
+            "a full table ends the request: got {:?}",
+            outcomes[1].armed()
+        );
+    };
+    assert_eq!(finished.raw_result(), -23, "ENFILE when no slot is free");
+    assert!(finished.last().is_none(), "an errno installed no slot");
+    assert!(!outcomes[1].armed().is_armed(), "the listener has stopped");
+
+    for client in clients {
+        let _ = crate::syscall::close(client);
+    }
+}
+
+#[test]
+fn a_finished_direct_accept_hands_back_the_slot_folded_into_its_last_cqe() {
+    // The same fold as the descriptor-returning accept: when the kernel
+    // cannot post the extra CQE it finishes the request carrying the slot
+    // it already installed into. A Done that dropped it would strand a live
+    // connection in the table with nothing naming it.
+    let listener = Listener::bound();
+    let mut ring = crate::IoUring::new(8).expect("ring");
+    ring.register_files(&[-1; 4]).expect("register table");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut ticket = sub
+        .push_direct_accept(PreparedDirectAccept::on(
+            listener.fd,
+            AcceptFlags::default(),
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let terminal = Event::Complete(super::request::Receipt {
+        ring: ticket.ring(),
+        id: ticket.id(),
+        result: 2,
+        flags: crate::types::CqeFlags::default(),
+    });
+
+    let incoming = ticket.record(terminal).expect("our request");
+    assert!(!incoming.armed().is_armed(), "terminal means not armed");
+    let DirectIncoming::Done(finished) = incoming else {
+        panic!("a terminal CQE is a Done");
+    };
+    let slot = finished.last().expect("the folded slot");
+    assert_eq!(slot.index().get(), 2, "the result is the index");
+    assert!(slot.belongs_to(ticket.ring()));
+
+    let (_receipt, last) = finished.into_parts();
+    assert!(last.is_some(), "into_parts surrenders the slot");
+}
+
+#[test]
+fn slot_zero_is_a_real_install_not_an_absent_one() {
+    // Every armed completion resolves through SlotTarget::Auto, where the
+    // result *is* the index. Zero is the first slot a fresh table hands
+    // out, and it was measured as the first connection's result -- but on
+    // the submission side zero means "not a direct request". Confusing the
+    // two encodings would drop the very first connection of every run.
+    let listener = Listener::bound();
+    let mut ring = crate::IoUring::new(8).expect("ring");
+    ring.register_files(&[-1; 4]).expect("register table");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut ticket = sub
+        .push_direct_accept(PreparedDirectAccept::on(
+            listener.fd,
+            AcceptFlags::default(),
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let armed = Event::Partial(super::event::PartialReceipt {
+        ring: ticket.ring(),
+        id: ticket.id(),
+        result: 0,
+        flags: crate::types::CqeFlags::MORE,
+    });
+    let DirectIncoming::Installed(slot) = ticket.record(armed).expect("our request") else {
+        panic!("result 0 is slot 0, not an empty completion");
+    };
+    assert_eq!(slot.index().get(), 0);
+}
+
+#[test]
+fn a_failed_direct_accept_completion_names_no_slot() {
+    // A negative result is an errno. Reading it as an index would produce a
+    // DirectSlot pointing at a table entry nothing installed into.
+    let listener = Listener::bound();
+    let mut ring = crate::IoUring::new(8).expect("ring");
+    ring.register_files(&[-1; 4]).expect("register table");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut ticket = sub
+        .push_direct_accept(PreparedDirectAccept::on(
+            listener.fd,
+            AcceptFlags::default(),
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let failed = Event::Complete(super::request::Receipt {
+        ring: ticket.ring(),
+        id: ticket.id(),
+        result: -9,
+        flags: crate::types::CqeFlags::default(),
+    });
+    let DirectIncoming::Done(finished) = ticket.record(failed).expect("our request") else {
+        panic!("a terminal CQE is a Done");
+    };
+    assert!(finished.last().is_none(), "an errno is not a slot");
+    assert!(finished.result().is_err());
+
+    let armed_failure = Event::Partial(super::event::PartialReceipt {
+        ring: ticket.ring(),
+        id: ticket.id(),
+        result: -11,
+        flags: crate::types::CqeFlags::MORE,
+    });
+    let outcome = ticket.record(armed_failure).expect("our request");
+    assert!(
+        matches!(outcome, DirectIncoming::Empty(-11)),
+        "an armed failure names no slot but stays armed"
+    );
+    assert!(outcome.into_slot().is_none());
+}
+
+#[test]
+fn a_direct_accept_rejects_a_completion_belonging_to_another_request() {
+    let listener = Listener::bound();
+    let mut ring = crate::IoUring::new(8).expect("ring");
+    ring.register_files(&[-1; 4]).expect("register table");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut first = sub
+        .push_direct_accept(PreparedDirectAccept::on(
+            listener.fd,
+            AcceptFlags::default(),
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let second = sub
+        .push_direct_accept(PreparedDirectAccept::on(
+            listener.fd,
+            AcceptFlags::default(),
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    assert_ne!(first.id().raw(), second.id().raw());
+
+    let foreign = Event::Partial(super::event::PartialReceipt {
+        ring: second.ring(),
+        id: second.id(),
+        result: 1,
+        flags: crate::types::CqeFlags::MORE,
+    });
+    assert!(!first.matches(&foreign));
+    assert!(first.record(foreign).is_err());
+}
+
+#[test]
+fn a_direct_accept_push_that_does_not_fit_hands_the_request_back() {
+    let listener = Listener::bound();
+    let ring = crate::IoUring::new(1).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let request = PreparedDirectAccept::on(listener.fd, AcceptFlags::NONBLOCK);
+    sub.push_direct_accept(request)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let (returned, _e) = sub
+        .push_direct_accept(request)
+        .expect_err("a one-entry queue is full");
+    assert_eq!(returned.fd(), listener.fd);
+    assert_eq!(
+        returned.flags(),
+        AcceptFlags::NONBLOCK,
+        "a retry must not silently drop the flags"
+    );
 }
 
 #[test]

@@ -504,17 +504,70 @@ neither the path nor the destination is reachable in flight.
 which `OwnedPath` rejects by construction. That mode stays on the `unsafe`
 `Sqe::statx_ptr`.
 
+**Direct accept.** Covered by `PreparedDirectAccept` / `DirectAccept` /
+`DirectIncoming` in `src/owned/direct_accept.rs`. An earlier draft of this
+was discarded rather than committed because two real-kernel tests failed;
+both failures turned out to be **the tests being wrong about the kernel**,
+and the second one was wrong about the crate too.
+
+The rewrite began by measuring instead of reasoning. A throwaway probe
+against a two-slot table produced: first connection `res=0` with `MORE`
+set, second `res=1` with `MORE` set, third `res=-23` with **`MORE` clear**,
+and a fourth connection produced no completion at all — the probe hung,
+which is itself the proof that the request had already ended.
+
+That settles both defects. The old exhaustion test asserted `-ENFILE`
+"stays armed"; the kernel gates its re-arm on `ret >= 0`, so any negative
+result skips the extra CQE and falls through to `io_req_set_res`. A full
+table does not refuse one connection, it retires the listener — and since a
+registered table is far smaller than `RLIMIT_NOFILE`, that is the ordinary
+case. An API that reported it as a survivable hiccup would leave callers
+blocked forever on a dead request, so it is now a `Done`.
+
+The watermark test was measuring the wrong thing, and the fix took two
+attempts. It sampled the next free descriptor once before opening three
+client sockets and again at the end, so the delta it saw was the *clients* —
+process descriptors unrelated to the accept. Narrowing the bracket to span
+only each completion made it pass, and it survived every sabotage, but it
+failed as soon as the whole suite ran in parallel: the next-free descriptor
+is **process-global**, so every other test thread creating and closing
+files perturbed it, once making it move *down*. A test that reads a shared
+resource cannot make a claim about one request no matter how tightly it is
+bracketed.
+
+The assertion is now local to the ring: a fresh sparse table allocates
+densely from zero, so three connections yield exactly slots `0, 1, 2`.
+Those cannot be process descriptors, since 0, 1 and 2 are already stdin,
+stdout and stderr. Sabotaging the encoding produces `[4, 14, 16]` — plainly
+descriptors — which is a sharper diagnostic than a watermark delta, and it
+is deterministic under parallelism.
+
+The slot encoding needed care in the opposite direction from direct open.
+Submission-side, zero means "not a direct request", which is why
+`SlotIndex` encodes `index + 1`. Completion-side under `Auto`, zero is a
+real slot — measured as the *first* connection's result — so treating it as
+absent would drop the first connection of every run. That is pinned by its
+own test.
+
+Four sabotages, each caught: dropping the folded slot on the terminal CQE,
+writing `0` instead of `IORING_FILE_INDEX_ALLOC` into `splice_fd_in` (which
+reproduces the original bug exactly — process descriptors come back and the
+table never fills), and treating result `0` as no slot, which fails both
+the real-kernel test and its dedicated unit test. The encoding sabotage was
+re-run after the parallelism fix, since replacing an assertion invalidates
+the evidence gathered with the old one. Six unit tests plus an SQE
+encoding test that also pins the non-direct variant leaves `splice_fd_in`
+clear. The compile-fail fixture had to be split: an `E0599` earlier in the
+file aborted compilation before `unused_must_use` ran, so the lint
+guarantee was never being exercised — the same trap as the accept fixture.
+
 **Scope limits.** The owned layer now covers read/write, vectored I/O,
-zero-copy send, multishot recv and accept, `openat`, direct open, and
-`statx`. **Direct accept is not done**: a draft existed but its two
-real-kernel tests failed — the descriptor watermark moved, meaning
-connections *were* consuming process descriptors, and a full table returned
-`-ENFILE` as a terminal completion rather than staying armed. The draft was
-removed rather than committed, so `IORING_FILE_INDEX_ALLOC` on a multishot
-accept remains unmodelled and unverified. Direct socket, `renameat`,
-`unlinkat`, `mkdirat`, `openat2`, `epoll_ctl`, `files_update`, `timeout`,
-and the `msghdr`-based send/recv also still go through the `unsafe` `Sqe`
-surface, which remains for lock-free users.
+zero-copy send, multishot recv and accept, `openat`, direct open, direct
+accept, and `statx`. Direct socket, `renameat`, `unlinkat`, `mkdirat`,
+`openat2`, `epoll_ctl`, `files_update`, `timeout`, and the `msghdr`-based
+send/recv still go through the `unsafe` `Sqe` surface, which remains for
+lock-free users. Direct accept has no Miri coverage: it owns no userspace
+storage, so there is no pointer lifetime for Miri to model.
 
 **Status (original): confirmed.**
 

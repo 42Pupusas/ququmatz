@@ -176,6 +176,35 @@ impl Sqe {
         Self(sqe)
     }
 
+    /// Prepare a multishot accept that installs into the ring's file table.
+    ///
+    /// Each connection goes into a slot of the registered file table rather
+    /// than this process's descriptor table, and the CQE result is the slot
+    /// index rather than a descriptor.
+    ///
+    /// The slot is always kernel-chosen:
+    /// `io_uring_prep_multishot_accept_direct(3)` takes no `file_index`
+    /// argument, because one armed request accepts many connections and
+    /// they cannot all share a slot. Callers who also assign slots
+    /// explicitly can separate the ranges with
+    /// `IORING_REGISTER_FILE_ALLOC_RANGE`, which this crate does not wrap.
+    ///
+    /// Requires a registered file table — see
+    /// [`IoUring::register_files`](crate::IoUring::register_files). When the
+    /// table is full the CQE result is `-ENFILE` and the request *ends*,
+    /// since the kernel gates its re-arm on a non-negative result.
+    ///
+    /// `SOCK_CLOEXEC` is rejected by the kernel for direct accepts.
+    #[must_use]
+    pub fn accept_multishot_direct(fd: RawFd, flags: AcceptFlags) -> Self {
+        let mut sqe = Self::accept_multishot(fd, flags);
+        // `IORING_FILE_INDEX_ALLOC`: the kernel reads `file_index` (which
+        // aliases `splice_fd_in`) as ~0u32 and allocates a slot per
+        // connection.
+        sqe.0.splice_fd_in = -1;
+        sqe
+    }
+
     /// Prepare a send operation.
     ///
     /// # Safety

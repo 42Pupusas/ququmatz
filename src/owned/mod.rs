@@ -131,6 +131,22 @@
 //! not match what was asked for. The mask-gated accessors on `Statx` return
 //! `Option` for that reason and are the intended way to read one.
 //!
+//! # A direct accept can stop without failing
+//!
+//! [`DirectAccept`] installs each connection into a slot of the ring's file
+//! table rather than into this process, so what arrives is a
+//! [`DirectSlot`] and there is no descriptor to close. The slot is always
+//! kernel-chosen: one armed request accepts many connections and they
+//! cannot share a slot.
+//!
+//! The consequence worth knowing is that exhausting the table **ends the
+//! request**. The kernel gates its re-arm on a non-negative result, so a
+//! full table reports `-ENFILE` on a terminal CQE and the listener stops —
+//! and a registered table is far smaller than `RLIMIT_NOFILE`, so this is
+//! routine rather than exotic. Waiting for further completions after that
+//! blocks forever, which is why [`DirectIncoming::Done`] is a variant
+//! callers must name.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -160,6 +176,7 @@
 mod accept;
 mod buffer;
 mod direct;
+mod direct_accept;
 mod event;
 mod identity;
 mod multishot;
@@ -185,6 +202,7 @@ mod miri;
 pub use accept::{AcceptFinished, Incoming, MultishotAccept, PreparedAccept};
 pub use buffer::{MmapBuffer, StableBuffer, StableBufferMut};
 pub use direct::{DirectOpenError, DirectOpened, PendingDirectOpen, PreparedDirectOpen};
+pub use direct_accept::{DirectAccept, DirectAcceptFinished, DirectIncoming, PreparedDirectAccept};
 pub use event::{Event, PartialReceipt};
 pub use identity::{RequestId, RingId};
 pub use multishot::{Armed, Arrival, Delivery, Finished, MultishotRecv, PreparedMultishot};

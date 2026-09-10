@@ -1982,6 +1982,25 @@ fn sqe_builder_accept_multishot_places_fields_correctly() {
 }
 
 #[test]
+fn sqe_builder_accept_multishot_direct_sets_file_index_alloc() {
+    use crate::types::{AcceptFlags, IORING_ACCEPT_MULTISHOT, Opcode};
+    let sqe = Sqe::accept_multishot_direct(RawFd::from_raw(7), AcceptFlags::default()).user_data(5);
+    let inner = sqe.0;
+    assert_eq!(Opcode::Accept, inner.opcode);
+    assert_eq!(inner.fd, 7);
+    assert_eq!(inner.ioprio, IORING_ACCEPT_MULTISHOT);
+    // IORING_FILE_INDEX_ALLOC: the kernel reads `file_index` (aliasing
+    // `splice_fd_in`) as ~0u32 and allocates a slot per connection. Zero
+    // here means "not a direct request", which turns this back into an
+    // ordinary accept that installs process descriptors.
+    assert_eq!(inner.splice_fd_in, -1);
+
+    // The non-direct variant must leave it clear.
+    let plain = Sqe::accept_multishot(RawFd::from_raw(7), AcceptFlags::default());
+    assert_eq!(plain.0.splice_fd_in, 0);
+}
+
+#[test]
 fn sqe_builder_recv_multishot_places_fields_correctly() {
     use crate::types::{IORING_RECV_MULTISHOT, MsgFlags, Opcode};
     let sqe = Sqe::recv_multishot(RawFd::from_raw(4), MsgFlags::default()).user_data(6);

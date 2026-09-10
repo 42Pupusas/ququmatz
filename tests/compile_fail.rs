@@ -71,6 +71,18 @@ fn an_in_flight_path_cannot_be_read_or_rewritten() {
     t.compile_fail("tests/ui/an_in_flight_path_is_unreachable.rs");
 }
 
+/// A direct accept produces a table slot, not a connection this process
+/// owns, and an exhausted table *ends* the request rather than refusing one
+/// connection. Both facts have to be type errors rather than conventions:
+/// there is no `Socket` to extract, the terminal outcome cannot be reduced
+/// to a receipt without surrendering any folded slot, and an ignored
+/// completion is diagnosable.
+#[test]
+fn a_direct_accept_yields_slots_and_cannot_silently_stop() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/a_direct_accept_slot_is_not_a_connection.rs");
+}
+
 /// A `statx` is the only owned request where the kernel *writes* a
 /// fixed-size struct into caller storage, with no length anywhere in the
 /// SQE to bound it. Both regions it touches — the path it scans and the
