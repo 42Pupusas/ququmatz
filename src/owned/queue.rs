@@ -1,9 +1,10 @@
 //! Split submission/completion halves for owned requests.
 
 use super::buffer::StableBuffer;
+use super::event::{Event, PartialReceipt};
 use super::identity::{RequestIdSource, RingId};
 use super::request::{Pending, Prepared, Receipt};
-use super::zerocopy::{Event, PendingZc, PreparedZc, SendReceipt};
+use super::zerocopy::{PendingZc, PreparedZc};
 use crate::error::Error;
 use crate::ring::{Completer, IoUring, Submitter};
 use crate::types::CqeFlags;
@@ -133,48 +134,62 @@ pub struct OwnedCompleter {
 }
 
 impl OwnedCompleter {
-    /// Reap one completion as a receipt, if one is ready.
+    /// Reap one terminal completion as a receipt, if one is ready.
     ///
-    /// Non-blocking. Multishot CQEs (`IORING_CQE_F_MORE` set) are not
-    /// terminal — the kernel will keep using the buffer — so they are
-    /// skipped rather than turned into a receipt that would wrongly
-    /// release storage.
+    /// Non-blocking. Non-terminal CQEs (`IORING_CQE_F_MORE` set) cannot
+    /// release storage, so they are skipped rather than turned into a
+    /// receipt that would wrongly free it.
     ///
-    /// A zero-copy send's result CQE also carries `MORE` and is therefore
-    /// skipped here, discarding its byte count. Rings that submit
-    /// [`push_zc`](OwnedSubmitter::push_zc) work should use
-    /// [`reap_event`](Self::reap_event), which reports both kinds.
+    /// # Discards non-terminal completions
+    ///
+    /// Skipping is lossy, and for two kinds of request it loses something
+    /// that matters:
+    ///
+    /// - a zero-copy send's result CQE carries the byte count, so only the
+    ///   notification survives;
+    /// - a multishot arrival carries a **pool buffer id**, and dropping it
+    ///   means that buffer is never recycled — the pool drains and the
+    ///   multishot stalls on `ENOBUFS`.
+    ///
+    /// Rings that submit [`push_zc`](OwnedSubmitter::push_zc) or multishot
+    /// work must use [`reap_event`](Self::reap_event), which reports both
+    /// kinds. This method suits rings whose requests all finish in one CQE.
     #[must_use]
     pub fn reap(&mut self) -> Option<Receipt> {
         loop {
             match self.reap_event()? {
                 Event::Complete(receipt) => return Some(receipt),
-                Event::Sent(_) => {}
+                Event::Partial(_) => {}
             }
         }
     }
 
-    /// Reap one completion, reporting whether it releases a buffer.
+    /// Reap one completion, reporting whether it releases anything.
     ///
     /// Non-blocking. A CQE with `IORING_CQE_F_MORE` promises more
     /// completions for the same request, so it cannot release storage; it
-    /// becomes [`Event::Sent`], which no API accepts where a release is
+    /// becomes [`Event::Partial`], which no API accepts where a release is
     /// required. Everything else is terminal and becomes
     /// [`Event::Complete`].
     ///
-    /// This distinction is what makes `send_zc` safe to expose: the send
-    /// CQE and the notification are told apart by the kernel's own flag
-    /// rather than by counting completions, and a send that reports no
-    /// notification is correctly treated as terminal on the spot.
+    /// Reading the kernel's flag rather than counting completions is what
+    /// makes both `send_zc` and multishot safe to expose: a zero-copy send
+    /// that promises no notification is terminal on the spot, and a
+    /// multishot that has stopped re-arming is recognised as finished
+    /// rather than waited on forever.
+    ///
+    /// The CQE's flags are preserved on both variants, so a non-terminal
+    /// arrival's chosen buffer id survives to be recycled.
     #[must_use]
     pub fn reap_event(&mut self) -> Option<Event> {
         let cqe = self.inner.complete()?;
         let id = super::identity::RequestId::from_raw(cqe.user_data);
         if cqe.flags.contains(CqeFlags::MORE) {
-            return Some(Event::Sent(SendReceipt {
+            return Some(Event::Partial(PartialReceipt {
                 ring: self.ring,
                 id,
                 result: cqe.result,
+                flags: cqe.flags,
             }));
         }
         Some(Event::Complete(Receipt {

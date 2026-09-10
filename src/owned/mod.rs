@@ -39,6 +39,17 @@
 //! by counting. A send that promises no notification is terminal
 //! immediately, so nothing waits forever for a CQE that will not arrive.
 //!
+//! # `MORE` is the general question
+//!
+//! That flag is not really about zero-copy sends. It answers "will more
+//! completions follow?", which is exactly "may this CQE release anything?",
+//! so every request whose life spans several CQEs is classified the same
+//! way: non-terminal completions become [`PartialReceipt`], which nothing
+//! accepts where a release is required, and only a [`Receipt`] frees
+//! storage. What a CQE *carries* is a separate axis — a multishot arrival
+//! brings a pool buffer id along — so [`PartialReceipt`] keeps the kernel's
+//! flags rather than discarding them.
+//!
 //! # Abandonment leaks instead of corrupting
 //!
 //! Dropping or [`forget`](core::mem::forget)ting a [`Pending`] does not
@@ -75,6 +86,7 @@
 //! ```
 
 mod buffer;
+mod event;
 mod identity;
 mod queue;
 mod request;
@@ -85,10 +97,14 @@ mod zerocopy;
 mod tests;
 
 #[cfg(test)]
+mod event_tests;
+
+#[cfg(test)]
 mod miri;
 
 pub use buffer::{MmapBuffer, StableBuffer, StableBufferMut};
+pub use event::{Event, PartialReceipt};
 pub use identity::{RequestId, RingId};
 pub use queue::{OwnedCompleter, OwnedSubmitter};
 pub use request::{Completed, Direction, Pending, Prepared, Receipt};
-pub use zerocopy::{Event, PendingZc, PreparedZc, SendReceipt, ZcCompleted};
+pub use zerocopy::{PendingZc, PreparedZc, ZcCompleted};

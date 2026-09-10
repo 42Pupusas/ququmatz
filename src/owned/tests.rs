@@ -449,7 +449,7 @@ fn a_real_zero_copy_send_releases_its_buffer_only_on_the_terminal_cqe() {
         comp.wait(1).expect("wait");
         while let Some(event) = comp.reap_event() {
             match event {
-                Event::Sent(notice) => {
+                Event::Partial(notice) => {
                     ticket = ticket
                         .record_sent(notice)
                         .unwrap_or_else(|_| panic!("notice for our request"));

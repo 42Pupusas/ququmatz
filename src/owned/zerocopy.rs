@@ -23,6 +23,7 @@
 use core::mem::ManuallyDrop;
 
 use super::buffer::StableBuffer;
+use super::event::PartialReceipt;
 use super::identity::{RequestId, RingId};
 use super::request::Receipt;
 use crate::op::Sqe;
@@ -207,7 +208,7 @@ impl<B> PendingZc<B> {
 
     /// Whether `notice` authenticates this exact request.
     #[must_use]
-    pub const fn matches_sent(&self, notice: &SendReceipt) -> bool {
+    pub const fn matches_sent(&self, notice: &PartialReceipt) -> bool {
         notice.id.raw() == self.id.raw() && notice.ring.raw() == self.ring.raw()
     }
 
@@ -220,7 +221,10 @@ impl<B> PendingZc<B> {
     ///
     /// Returns the ticket and notice unchanged if the notice belongs to
     /// another request or another ring.
-    pub const fn record_sent(mut self, notice: SendReceipt) -> Result<Self, (Self, SendReceipt)> {
+    pub const fn record_sent(
+        mut self,
+        notice: PartialReceipt,
+    ) -> Result<Self, (Self, PartialReceipt)> {
         if !self.matches_sent(&notice) {
             return Err((self, notice));
         }
@@ -363,79 +367,5 @@ impl<B> ZcCompleted<B> {
     /// failed send.
     pub fn into_parts(self) -> (Result<u32, crate::Error>, B) {
         (self.result(), self.buf)
-    }
-}
-
-/// A zero-copy send's result CQE, which does **not** release the buffer.
-///
-/// Minted only from a CQE carrying `IORING_CQE_F_MORE`, meaning the kernel
-/// has promised a later notification. It is deliberately a distinct type
-/// from [`Receipt`]: nothing in the API accepts it where a release is
-/// required, so a non-terminal completion cannot free storage the NIC is
-/// still reading.
-#[derive(Debug)]
-pub struct SendReceipt {
-    pub(crate) ring: RingId,
-    pub(crate) id: RequestId,
-    pub(crate) result: i32,
-}
-
-impl SendReceipt {
-    /// Which request this reports.
-    #[must_use]
-    pub const fn id(&self) -> RequestId {
-        self.id
-    }
-
-    /// Which ring produced it.
-    #[must_use]
-    pub const fn ring(&self) -> RingId {
-        self.ring
-    }
-
-    /// Raw CQE result: bytes accepted when non-negative, `-errno` otherwise.
-    #[must_use]
-    pub const fn raw_result(&self) -> i32 {
-        self.result
-    }
-}
-
-/// What a reaped CQE authorizes.
-///
-/// Returned by [`OwnedCompleter::reap_event`](super::OwnedCompleter::reap_event)
-/// for rings that mix ordinary owned requests with zero-copy sends, where
-/// "is this completion terminal?" can no longer be answered by the
-/// completer alone.
-#[derive(Debug)]
-pub enum Event {
-    /// A terminal completion. Releases the buffer of the ticket it matches.
-    Complete(Receipt),
-    /// A zero-copy send's result, with a notification still to come.
-    Sent(SendReceipt),
-}
-
-impl Event {
-    /// The terminal receipt, if this event carries one.
-    #[must_use]
-    pub const fn into_receipt(self) -> Option<Receipt> {
-        match self {
-            Self::Complete(receipt) => Some(receipt),
-            Self::Sent(_) => None,
-        }
-    }
-
-    /// Which request this event belongs to.
-    #[must_use]
-    pub const fn id(&self) -> RequestId {
-        match self {
-            Self::Complete(receipt) => receipt.id,
-            Self::Sent(notice) => notice.id,
-        }
-    }
-
-    /// Whether this event releases a buffer.
-    #[must_use]
-    pub const fn is_terminal(&self) -> bool {
-        matches!(self, Self::Complete(_))
     }
 }

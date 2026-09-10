@@ -1,6 +1,6 @@
-use ququmatz::owned::{MmapBuffer, PendingZc, SendReceipt};
+use ququmatz::owned::{MmapBuffer, PartialReceipt, PendingZc};
 
-fn takes_ticket(ticket: PendingZc<MmapBuffer>, notice: SendReceipt) {
+fn takes_ticket(ticket: PendingZc<MmapBuffer>, notice: PartialReceipt) {
     // A zero-copy send's result CQE says how much was accepted, not that the
     // NIC has stopped reading. Redeeming with it would free live pages, so
     // the type system must refuse: `redeem` takes a `Receipt` only.

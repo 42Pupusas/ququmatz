@@ -175,17 +175,37 @@ notification; **without that flag no notification is ever posted** and the
 send CQE is itself terminal, which is what happens when the kernel falls
 back to copying. A design that waited unconditionally for a notification
 would leak every such request forever. `OwnedCompleter::reap_event` reads
-the flag and returns `Event::Sent` or `Event::Complete` accordingly, so
+the flag and returns `Event::Partial` or `Event::Complete` accordingly, so
 both paths terminate.
 
 The separation is a type error, not a convention. The non-terminal CQE
-becomes a `SendReceipt`, which `record_sent` accepts — handing the ticket
-back still holding its buffer — and which no releasing method will take;
-only a `Receipt` from a terminal CQE can redeem. `tests/ui/send_receipt_*`
-pins both halves: `E0308` for the substitution, `E0451` against forging
-one. Note that the pre-existing `reap` skips `MORE` CQEs, which silently
-discards a zero-copy send's byte count; rings that submit `push_zc` work
-must use `reap_event`, and its documentation says so.
+becomes a `PartialReceipt`, which `record_sent` accepts — handing the
+ticket back still holding its buffer — and which no releasing method will
+take; only a `Receipt` from a terminal CQE can redeem.
+`tests/ui/partial_receipt_*` pins both halves: `E0308` for the
+substitution, `E0451` against forging one. Note that the pre-existing
+`reap` skips `MORE` CQEs, which silently discards a zero-copy send's byte
+count; rings that submit `push_zc` work must use `reap_event`, and its
+documentation says so.
+
+**`MORE` is not a zero-copy concept.** The first version of this classified
+every `MORE` CQE as a zero-copy send result, in a type called
+`SendReceipt` that carried only `ring`/`id`/`result`. Reading the multishot
+path afterwards showed that to be wrong in a way the `send_zc` tests could
+not expose: a multishot arrival also sets `MORE`, but carries a **pool
+buffer id in the upper 16 bits of the CQE flags**, and a type with no
+`flags` field drops it. That buffer is then never recycled, so the pool
+drains and the multishot stalls on `ENOBUFS` — a leak rather than
+corruption, but a real one. `reap` was worse: it skips `MORE` CQEs
+entirely, taking every arrival and its buffer with them.
+
+The flag answers "will more completions follow?", which is exactly "may
+this CQE release anything?". What the CQE *carries* is an independent axis.
+So the type is now `PartialReceipt` in `src/owned/event.rs`, it preserves
+the kernel's flags, and it exposes `buffer_id()`. `src/owned/event_tests.rs`
+pins the decoding, including id `0` (a real id, not an absent one) and
+`u16::MAX` (survives the shift); those three tests were confirmed to fail
+when `buffer_id` is stubbed to return `None`.
 
 Five further Miri tests cover the NIC reading the buffer *after* the send
 CQE was recorded, the no-notification path, abandonment while a send is in

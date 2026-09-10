@@ -1,0 +1,23 @@
+warning: unreachable expression
+ --> tests/ui/partial_receipt_cannot_be_forged.rs:8:13
+  |
+7 |         ring: todo!(),
+  |               ------- any code following this expression is unreachable
+8 |         id: todo!(),
+  |             ^^^^^^^ unreachable expression
+  |
+  = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+error[E0451]: fields `ring`, `id`, `result` and `flags` of struct `PartialReceipt` are private
+  --> tests/ui/partial_receipt_cannot_be_forged.rs:7:9
+   |
+ 6 |     let _forged = PartialReceipt {
+   |                   -------------- in this type
+ 7 |         ring: todo!(),
+   |         ^^^^ private field
+ 8 |         id: todo!(),
+   |         ^^ private field
+ 9 |         result: 0,
+   |         ^^^^^^ private field
+10 |         flags: todo!(),
+   |         ^^^^^ private field

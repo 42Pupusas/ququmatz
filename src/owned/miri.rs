@@ -17,8 +17,9 @@ use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::boxed::Box;
 use std::vec::Vec;
 
+use super::event::PartialReceipt;
 use super::identity::{RequestId, RequestIdSource, RingId};
-use super::zerocopy::{PendingZc, PreparedZc, SendReceipt};
+use super::zerocopy::{PendingZc, PreparedZc};
 use super::{Direction, Pending, Prepared, Receipt, StableBuffer, StableBufferMut};
 use crate::op::Sqe;
 use crate::types::{CqeFlags, MsgFlags, RawFd};
@@ -187,11 +188,12 @@ impl FakeKernel {
     ///
     /// The real kernel sets `MORE` here to promise a notification; this
     /// carries no `Receipt`, so it cannot release the buffer.
-    fn post_send(&self, ring: RingId, result: i32) -> SendReceipt {
-        SendReceipt {
+    fn post_send(&self, ring: RingId, result: i32) -> PartialReceipt {
+        PartialReceipt {
             ring,
             id: RequestId::from_raw(self.user_data()),
             result,
+            flags: CqeFlags::MORE,
         }
     }
 
@@ -468,10 +470,11 @@ fn a_send_notice_for_another_request_is_rejected_without_disturbing_the_ticket()
     );
     let (kernel, pending) = cycle.submit_zc(prepared);
 
-    let wrong = SendReceipt {
+    let wrong = PartialReceipt {
         ring: cycle.ring,
         id: RequestId::from_raw(pending.id().raw().wrapping_add(1)),
         result: 8,
+        flags: CqeFlags::MORE,
     };
     let (pending, _) = pending
         .record_sent(wrong)

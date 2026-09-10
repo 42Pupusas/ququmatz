@@ -11,8 +11,10 @@
 //! unreachable and unextractable, and that a `Receipt` can be neither forged
 //! by safe code nor spent twice.
 //!
-//! **Zero-copy sends** — a `send_zc` buffer stays live past its send CQE, so
-//! the non-terminal `SendReceipt` must not be usable where a release is
+//! **Non-terminal completions** — a CQE carrying `IORING_CQE_F_MORE`
+//! promises more to come, so it cannot release anything: a `send_zc` buffer
+//! stays live past its send CQE, and a multishot keeps using its request.
+//! `PartialReceipt` must therefore not be usable where a release is
 //! required. That separation is the whole safety argument for the type, and
 //! it is a type error rather than a convention only if this keeps failing.
 
@@ -30,7 +32,7 @@ fn in_flight_buffers_and_receipts_are_compiler_enforced() {
 }
 
 #[test]
-fn a_send_receipt_cannot_stand_in_for_a_terminal_one() {
+fn a_partial_receipt_cannot_stand_in_for_a_terminal_one() {
     let t = trybuild::TestCases::new();
-    t.compile_fail("tests/ui/send_receipt_*.rs");
+    t.compile_fail("tests/ui/partial_receipt_*.rs");
 }
