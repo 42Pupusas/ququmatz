@@ -23,11 +23,15 @@ use super::event::PartialReceipt;
 use super::identity::{RequestId, RequestIdSource, RingId};
 use super::open::{PendingOpen, PreparedOpen};
 use super::path::OwnedPath;
+use super::pathop::{PendingPathOp, PreparedPathOp};
+use super::rename::{PendingRename, PreparedRename};
 use super::slot::SlotTarget;
 use super::statx::{PendingStatx, PreparedStatx};
 use super::vectored::{PendingVectored, PreparedVectored};
 use super::zerocopy::{PendingZc, PreparedZc};
-use super::{Direction, Pending, Prepared, Receipt, StableBuffer, StableBufferMut};
+use super::{
+    Direction, PathOpKind, Pending, Prepared, Receipt, RenameMode, StableBuffer, StableBufferMut,
+};
 use crate::op::Sqe;
 use crate::types::{
     CqeFlags, FileMode, IoVec, MsgFlags, OpenFlags, RawFd, Statx, StatxFlags, StatxMask,
@@ -302,6 +306,58 @@ impl Lifecycle {
     ) -> (FakeKernel, PendingStatx<S, D>) {
         let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
         (FakeKernel::holding(sqe), pending)
+    }
+
+    fn submit_path_op<S: StableBuffer>(
+        &self,
+        prepared: PreparedPathOp<S>,
+    ) -> (FakeKernel, PendingPathOp<S>) {
+        let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
+        (FakeKernel::holding(sqe), pending)
+    }
+
+    fn submit_rename<F: StableBuffer, T: StableBuffer>(
+        &self,
+        prepared: PreparedRename<F, T>,
+    ) -> (FakeKernel, PendingRename<F, T>) {
+        let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
+        (FakeKernel::holding(sqe), pending)
+    }
+}
+
+impl FakeKernel {
+    /// Resolve the *second* path a rename publishes, at `off`.
+    ///
+    /// A rename is the only owned request that has the kernel scan two
+    /// NUL-terminated strings, so the destination needs its own scan: a
+    /// check that only walked `addr` would miss a destination whose
+    /// storage had been freed.
+    fn resolve_second_path(&self) -> Vec<u8> {
+        let addr = usize::try_from(self.sqe.0.off).expect("address fits a pointer");
+        let base: *const u8 = core::ptr::with_exposed_provenance(addr);
+        let mut seen = Vec::new();
+        let mut i = 0;
+        loop {
+            // SAFETY: the live `PendingRename` owns storage holding a
+            // NUL-terminated path, verified by `OwnedPath` before the
+            // request could be built, so this scan stops inside it.
+            let byte = unsafe { base.add(i).read() };
+            if byte == 0 {
+                return seen;
+            }
+            seen.push(byte);
+            i += 1;
+        }
+    }
+
+    /// Mint the CQE of an operation that returns only success or failure.
+    fn post_status(&self, ring: RingId, result: i32) -> Receipt {
+        Receipt {
+            ring,
+            id: RequestId::from_raw(self.user_data()),
+            result,
+            flags: CqeFlags::from_raw(0),
+        }
     }
 }
 
@@ -957,6 +1013,181 @@ fn abandoning_an_open_ticket_leaks_rather_than_freeing_the_path() {
     // SAFETY: the abandoned ticket leaked this and the stand-in kernel has
     // finished, so nothing else can reach it.
     unsafe { HeapBuffer::reclaim_leaked(leaked.0, leaked.1) };
+}
+
+#[test]
+fn a_path_ops_path_is_scanned_within_the_storage_the_ticket_owns() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedPathOp::unlink_cwd(heap_path(b"/tmp/doomed"));
+    let (kernel, pending) = cycle.submit_path_op(prepared);
+
+    // The kernel scans for the NUL with no length to stop it, exactly as
+    // for an open: the ticket owns the storage for that whole window.
+    assert_eq!(kernel.resolve_path(), b"/tmp/doomed");
+
+    let done = pending
+        .redeem(kernel.post_status(cycle.ring, 0))
+        .ok()
+        .expect("receipt matches");
+    assert!(done.is_ok());
+    drop(done.into_path().into_storage());
+}
+
+#[test]
+fn a_path_op_keeps_its_path_readable_while_the_ticket_moves() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedPathOp::mkdir_cwd(heap_path(b"/tmp/fresh"), FileMode::OWNER_READ);
+    let (kernel, pending) = cycle.submit_path_op(prepared);
+
+    let pending = Box::new(pending);
+    let pending = core::hint::black_box(pending);
+    let pending = *pending;
+
+    assert_eq!(kernel.resolve_path(), b"/tmp/fresh");
+
+    let done = pending
+        .redeem(kernel.post_status(cycle.ring, 0))
+        .ok()
+        .expect("receipt matches");
+    assert_eq!(done.kind(), PathOpKind::Mkdir(FileMode::OWNER_READ));
+    drop(done.into_path().into_storage());
+}
+
+#[test]
+fn abandoning_a_path_op_leaks_rather_than_freeing_the_path() {
+    let cycle = Lifecycle::new();
+    let storage = HeapBuffer::with_capacity(64);
+    let leaked = (storage.ptr, storage.len);
+    let path = OwnedPath::copy_into(storage, b"/tmp/abandoned")
+        .ok()
+        .expect("storage fits");
+    let (kernel, pending) = cycle.submit_path_op(PreparedPathOp::rmdir_cwd(path));
+
+    // Dropping the ticket frees nothing: the kernel may still be resolving
+    // the path, so freeing here would be a use-after-free the moment it
+    // reads. Only Miri can see the difference, which is why this test
+    // exists rather than a behavioural one.
+    drop(pending);
+    assert_eq!(kernel.resolve_path(), b"/tmp/abandoned");
+
+    // SAFETY: the abandoned ticket leaked this and the stand-in kernel has
+    // finished, so nothing else can reach it.
+    unsafe { HeapBuffer::reclaim_leaked(leaked.0, leaked.1) };
+}
+
+#[test]
+fn reclaiming_an_unpublished_path_op_returns_the_path_and_its_kind() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedPathOp::rmdir_cwd(heap_path(b"/tmp/never_sent"));
+    let (_kernel, pending) = cycle.submit_path_op(prepared);
+
+    // SAFETY: this stands in for a rejected push — the SQE was built but
+    // never made visible to any kernel, so the storage is unreferenced.
+    let prepared = unsafe { pending.reclaim_unsubmitted() };
+    assert_eq!(prepared.kind(), PathOpKind::Rmdir);
+    assert_eq!(prepared.path().as_bytes(), b"/tmp/never_sent");
+    drop(prepared.into_path().into_storage());
+}
+
+#[test]
+fn a_rename_keeps_both_paths_readable_at_once() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedRename::cwd(
+        heap_path(b"/tmp/source"),
+        heap_path(b"/tmp/destination"),
+        RenameMode::NoReplace,
+    );
+    let (kernel, pending) = cycle.submit_rename(prepared);
+
+    // Two independent allocations, both scanned by the kernel, both owned
+    // by one ticket: this is the first request where losing either would
+    // be a use-after-free.
+    assert_eq!(kernel.resolve_path(), b"/tmp/source");
+    assert_eq!(kernel.resolve_second_path(), b"/tmp/destination");
+
+    let done = pending
+        .redeem(kernel.post_status(cycle.ring, 0))
+        .ok()
+        .expect("receipt matches");
+    let (from, to) = done.into_paths();
+    assert_eq!(from.as_bytes(), b"/tmp/source");
+    assert_eq!(to.as_bytes(), b"/tmp/destination");
+    drop((from.into_storage(), to.into_storage()));
+}
+
+#[test]
+fn a_renames_two_paths_survive_the_ticket_moving_between_owners() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedRename::cwd(
+        heap_path(b"/tmp/moving_from"),
+        heap_path(b"/tmp/moving_to"),
+        RenameMode::Exchange,
+    );
+    let (kernel, pending) = cycle.submit_rename(prepared);
+
+    let pending = Box::new(pending);
+    let pending = core::hint::black_box(pending);
+    let pending = *pending;
+
+    assert_eq!(kernel.resolve_path(), b"/tmp/moving_from");
+    assert_eq!(kernel.resolve_second_path(), b"/tmp/moving_to");
+
+    let done = pending
+        .redeem(kernel.post_status(cycle.ring, 0))
+        .ok()
+        .expect("receipt matches");
+    let (from, to) = done.into_paths();
+    drop((from.into_storage(), to.into_storage()));
+}
+
+#[test]
+fn abandoning_a_rename_leaks_both_paths_rather_than_freeing_them() {
+    let cycle = Lifecycle::new();
+    let from_storage = HeapBuffer::with_capacity(64);
+    let to_storage = HeapBuffer::with_capacity(64);
+    let leaked = [
+        (from_storage.ptr, from_storage.len),
+        (to_storage.ptr, to_storage.len),
+    ];
+    let from = OwnedPath::copy_into(from_storage, b"/tmp/left")
+        .ok()
+        .expect("storage fits");
+    let to = OwnedPath::copy_into(to_storage, b"/tmp/right")
+        .ok()
+        .expect("storage fits");
+    let (kernel, pending) = cycle.submit_rename(PreparedRename::cwd(from, to, RenameMode::Replace));
+
+    // Both leak, not just the first: a ticket that freed either one would
+    // hand the kernel a dangling scan.
+    drop(pending);
+    assert_eq!(kernel.resolve_path(), b"/tmp/left");
+    assert_eq!(kernel.resolve_second_path(), b"/tmp/right");
+
+    for (ptr, len) in leaked {
+        // SAFETY: the abandoned ticket leaked these and the stand-in kernel
+        // has finished, so nothing else can reach them.
+        unsafe { HeapBuffer::reclaim_leaked(ptr, len) };
+    }
+}
+
+#[test]
+fn reclaiming_an_unpublished_rename_returns_both_paths_and_its_mode() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedRename::cwd(
+        heap_path(b"/tmp/unsent_from"),
+        heap_path(b"/tmp/unsent_to"),
+        RenameMode::NoReplace,
+    );
+    let (_kernel, pending) = cycle.submit_rename(prepared);
+
+    // SAFETY: this stands in for a rejected push — the SQE was built but
+    // never made visible to any kernel, so neither storage is referenced.
+    let prepared = unsafe { pending.reclaim_unsubmitted() };
+    assert_eq!(prepared.mode(), RenameMode::NoReplace);
+    let (from, to) = prepared.into_paths();
+    assert_eq!(from.as_bytes(), b"/tmp/unsent_from");
+    assert_eq!(to.as_bytes(), b"/tmp/unsent_to");
+    drop((from.into_storage(), to.into_storage()));
 }
 
 /// Heap storage aligned for a `Statx`, sized exactly.

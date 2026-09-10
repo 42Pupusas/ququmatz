@@ -9,6 +9,8 @@ use super::event::{Event, PartialReceipt};
 use super::identity::{RequestIdSource, RingId};
 use super::multishot::{MultishotRecv, PreparedMultishot};
 use super::open::{PendingOpen, PreparedOpen};
+use super::pathop::{PendingPathOp, PreparedPathOp};
+use super::rename::{PendingRename, PreparedRename};
 use super::request::{Pending, Prepared, Receipt};
 use super::statx::{PendingStatx, PreparedStatx};
 use super::vectored::{PendingVectored, PreparedVectored};
@@ -242,6 +244,53 @@ impl OwnedSubmitter {
         }
     }
 
+    /// Queue an `unlinkat` or `mkdirat`, taking ownership of its path.
+    ///
+    /// The completion carries no resource — only whether it worked — so
+    /// an abandoned ticket leaks the path storage and nothing else.
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact,
+    /// still owning its path storage.
+    pub fn push_path_op<S: StableBuffer>(
+        &mut self,
+        request: PreparedPathOp<S>,
+    ) -> Result<PendingPathOp<S>, (PreparedPathOp<S>, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            // The SQE never became kernel-visible, so the kernel never saw
+            // the path pointer and reclaiming the storage is sound.
+            Err(e) => Err((Self::reclaim_path_op(pending), e)),
+        }
+    }
+
+    /// Queue a rename, taking ownership of both path storages.
+    ///
+    /// A [`RenameMode::Replace`](super::RenameMode::Replace) overwrites an
+    /// existing destination and reports the same success as a rename onto
+    /// a free name, so the mode is chosen explicitly.
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact,
+    /// still owning both path storages.
+    pub fn push_rename<F: StableBuffer, T: StableBuffer>(
+        &mut self,
+        request: PreparedRename<F, T>,
+    ) -> Result<PendingRename<F, T>, (PreparedRename<F, T>, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            // The SQE never became kernel-visible, so the kernel never saw
+            // either path pointer and reclaiming both storages is sound.
+            Err(e) => Err((Self::reclaim_rename(pending), e)),
+        }
+    }
+
     /// Queue a `statx`, taking ownership of its path and destination.
     ///
     /// The kernel writes a fixed-size struct into the destination after
@@ -272,6 +321,24 @@ impl OwnedSubmitter {
         // SAFETY: only reached when `Submitter::push` reported the queue was
         // full, which happens before the SQE is written or the tail is
         // advanced. No kernel-visible pointer to either storage exists.
+        unsafe { pending.reclaim_unsubmitted() }
+    }
+
+    /// Undo a single-path push that the kernel never observed.
+    fn reclaim_path_op<S: StableBuffer>(pending: PendingPathOp<S>) -> PreparedPathOp<S> {
+        // SAFETY: only reached when `Submitter::push` reported the queue was
+        // full, which happens before the SQE is written or the tail is
+        // advanced. No kernel-visible pointer to the path exists.
+        unsafe { pending.reclaim_unsubmitted() }
+    }
+
+    /// Undo a rename push that the kernel never observed.
+    fn reclaim_rename<F: StableBuffer, T: StableBuffer>(
+        pending: PendingRename<F, T>,
+    ) -> PreparedRename<F, T> {
+        // SAFETY: only reached when `Submitter::push` reported the queue was
+        // full, which happens before the SQE is written or the tail is
+        // advanced. No kernel-visible pointer to either path exists.
         unsafe { pending.reclaim_unsubmitted() }
     }
 

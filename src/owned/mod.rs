@@ -160,6 +160,26 @@
 //! says a live file was destroyed, so [`SlotTarget::Auto`] is the safer
 //! choice unless the caller knows the slot is free.
 //!
+//! # Directory-entry work produces nothing but can destroy something
+//!
+//! [`PreparedPathOp`] and [`PreparedRename`] own path storage like an
+//! open, but their completions carry no resource at all — only `0` or
+//! `-errno`. Abandoning a ticket therefore leaks just the storage the
+//! caller supplied, with no descriptor and no table slot going with it.
+//!
+//! What they can do is destroy data, so the destructive choices are named
+//! rather than defaulted. A [`RenameMode::Replace`] overwrites the
+//! destination and reports the same `0` as a rename onto a free name, and
+//! [`RenameMode::NoReplace`] is the atomic way to avoid that. The modes
+//! are an enum because the kernel rejects `NOREPLACE` and `EXCHANGE`
+//! together, so the broken combination cannot be written.
+//!
+//! [`PathOpKind`] splits removals the same way: `AT_REMOVEDIR` reads like
+//! an option but the kernel refuses both mismatches, failing `EISDIR`
+//! without it on a directory and `ENOTDIR` with it on a file. Separating
+//! [`PathOpKind::Unlink`] from [`PathOpKind::Rmdir`] makes the two working
+//! combinations the only two reachable ones.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -196,7 +216,9 @@ mod identity;
 mod multishot;
 mod open;
 mod path;
+mod pathop;
 mod queue;
+mod rename;
 mod request;
 mod slot;
 mod statx;
@@ -225,7 +247,9 @@ pub use identity::{RequestId, RingId};
 pub use multishot::{Armed, Arrival, Delivery, Finished, MultishotRecv, PreparedMultishot};
 pub use open::{Opened, PendingOpen, PreparedOpen};
 pub use path::{OwnedPath, PathError};
+pub use pathop::{PathOpCompleted, PathOpKind, PendingPathOp, PreparedPathOp};
 pub use queue::{OwnedCompleter, OwnedSubmitter};
+pub use rename::{PendingRename, PreparedRename, RenameCompleted, RenameMode};
 pub use request::{Completed, Direction, Pending, Prepared, Receipt};
 pub use slot::{DirectSlot, SlotIndex, SlotTarget};
 pub use statx::{PendingStatx, PreparedStatx, StatxCompleted, StatxError};

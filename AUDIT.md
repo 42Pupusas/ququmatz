@@ -595,9 +595,48 @@ result, so that guard is the *only* thing stopping a failed explicit
 request from naming a slot the kernel never filled. The ENXIO test checked
 the errno but not the slot; it now checks both.
 
+**Directory-entry operations.** Covered by `PreparedPathOp` /
+`PendingPathOp` / `PathOpCompleted` in `src/owned/pathop.rs` for `unlinkat`
+and `mkdirat`, and by `PreparedRename` / `PendingRename` /
+`RenameCompleted` in `src/owned/rename.rs` for `renameat2`. They own path
+storage the way an open does, but their completions carry no resource at
+all — only `0` or `-errno` — so an abandoned ticket leaks exactly the
+storage the caller supplied and nothing more. A rename is the first owned
+request that publishes **two** path addresses, and both must stay live for
+the kernel's two scans.
+
+Measured before designing, and the measurements changed the API twice.
+`AT_REMOVEDIR` reads like an optional flag but is determined by the target:
+`EISDIR` without it on a directory, `ENOTDIR` with it on a file. So the two
+working combinations are the only two reachable ones, as
+`PathOpKind::Unlink` and `PathOpKind::Rmdir`. And a default `renameat`
+**destroys an existing destination silently** — measured as `ov2` going
+from `"old"` to `"new"` with result `0`, indistinguishable from a rename
+onto a free name. `RenameMode` is therefore an enum with no default, and it
+is an enum rather than flags because `NOREPLACE|EXCHANGE` together is
+`-EINVAL`: the broken combination is not representable. `mkdirat`'s mode is
+masked by the umask (`0777` asked, `0755` got), which the docs now say.
+
+Four sabotages, and the fourth is the one worth recording. Swapping the
+removal flags was caught by three tests; collapsing `NoReplace` to the
+default and swapping the two directory descriptors were each caught. But
+**letting `PendingPathOp::drop` actually free its in-flight path storage —
+the core unsoundness this whole layer exists to prevent — passed all 150
+tests.** Behavioural tests cannot see it: the kernel has usually finished
+by then, so the freed read succeeds by luck. Both families had no Miri
+coverage, unlike every other path-owning request. Eight Miri tests were
+added, and the sabotage then failed with "dangling pointer". Freeing only
+the rename's *destination* is caught specifically by `resolve_second_path`,
+which is why the second scan exists rather than reusing the first.
+
+Two weak tests were also found by sabotage rather than by review, both the
+same degenerate-value mistake as the direct-socket slot `0`: the
+cross-directory rename used the basename `"item"` on **both** sides, so an
+implementation sending one path twice still passed. Distinct names now.
+
 **Scope limits.** The owned layer now covers read/write, vectored I/O,
 zero-copy send, multishot recv and accept, `openat`, direct open, direct
-accept, direct socket, and `statx`. `renameat`, `unlinkat`, `mkdirat`,
+accept, direct socket, `statx`, `renameat`, `unlinkat`, and `mkdirat`.
 `openat2`, `epoll_ctl`, `files_update`, `timeout`, and the `msghdr`-based
 send/recv still go through the `unsafe` `Sqe` surface, which remains for
 lock-free users. Neither direct accept nor direct socket has Miri coverage:

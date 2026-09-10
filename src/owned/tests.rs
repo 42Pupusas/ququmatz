@@ -2,12 +2,16 @@
 
 extern crate std;
 
+/// Only the kernel-backed tests name a path-op kind, and those are gated.
+#[cfg(not(miri))]
+use super::PathOpKind;
 use super::{
     Arrival, Completed, Delivery, DirectIncoming, DirectOpenError, DirectSlot, DirectSocketError,
     Direction, Event, Incoming, MmapBuffer, OwnedPath, PathError, Pending, PendingStatx, PendingZc,
     Prepared, PreparedAccept, PreparedDirectAccept, PreparedDirectOpen, PreparedDirectSocket,
-    PreparedMultishot, PreparedOpen, PreparedStatx, PreparedVectored, PreparedZc, Receipt, RingId,
-    SlotIndex, SlotTarget, StableBuffer, StatxError, VectoredError, ZcCompleted,
+    PreparedMultishot, PreparedOpen, PreparedPathOp, PreparedRename, PreparedStatx,
+    PreparedVectored, PreparedZc, Receipt, RenameMode, RingId, SlotIndex, SlotTarget, StableBuffer,
+    StatxError, VectoredError, ZcCompleted,
 };
 use crate::error::{Error, SubmitError};
 use crate::net::Socket;
@@ -2668,6 +2672,533 @@ fn every_accessor_agrees_with_the_mask_rather_than_the_request() {
     assert_eq!(stat.mtime().is_some(), stat.has(StatxMask::MTIME));
     assert_eq!(stat.uid().is_some(), stat.has(StatxMask::UID));
     assert_eq!(stat.blocks().is_some(), stat.has(StatxMask::BLOCKS));
+}
+
+/// A scratch directory that removes itself, so a failing test cannot leave
+/// entries behind that make the next run pass for the wrong reason.
+#[cfg(not(miri))]
+struct Scratch {
+    dir: std::string::String,
+}
+
+#[cfg(not(miri))]
+impl Scratch {
+    fn new(label: &str) -> Self {
+        static COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let nonce = COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        let dir = std::format!(
+            "/tmp/ququmatz_{label}_{}_{nonce}_{nanos}",
+            std::process::id()
+        );
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        Self { dir }
+    }
+
+    fn path(&self, name: &str) -> std::string::String {
+        std::format!("{}/{name}", self.dir)
+    }
+
+    fn owned_path(&self, name: &str) -> OwnedPath<MmapBuffer> {
+        path_of(self.path(name).as_bytes())
+    }
+
+    fn write(&self, name: &str, bytes: &[u8]) {
+        std::fs::write(self.path(name), bytes).expect("seed file");
+    }
+
+    fn mkdir(&self, name: &str) {
+        std::fs::create_dir(self.path(name)).expect("seed dir");
+    }
+
+    fn exists(&self, name: &str) -> bool {
+        std::path::Path::new(&self.path(name)).exists()
+    }
+
+    fn read(&self, name: &str) -> std::vec::Vec<u8> {
+        std::fs::read(self.path(name)).unwrap_or_default()
+    }
+
+    fn mode_of(&self, name: &str) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(self.path(name))
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+}
+
+#[cfg(not(miri))]
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Submit one owned request and redeem it, returning the raw CQE result.
+#[cfg(not(miri))]
+fn run_path_op(
+    sub: &mut super::OwnedSubmitter,
+    comp: &mut super::OwnedCompleter,
+    request: PreparedPathOp<MmapBuffer>,
+) -> i32 {
+    let ticket = sub
+        .push_path_op(request)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    done.raw_result()
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_mkdir_creates_a_directory_and_returns_its_path() {
+    let scratch = Scratch::new("mkdir");
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let path = scratch.owned_path("fresh");
+    let addr = path.as_bytes().as_ptr();
+    let ticket = sub
+        .push_path_op(PreparedPathOp::mkdir_cwd(
+            path,
+            FileMode::OWNER_READ | FileMode::OWNER_WRITE | FileMode::OWNER_EXEC,
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+
+    assert!(done.is_ok(), "mkdir failed: {}", done.raw_result());
+    // The directory is real, not merely a zero result.
+    assert!(scratch.exists("fresh"));
+    assert_eq!(scratch.mode_of("fresh"), 0o700);
+    assert_eq!(
+        done.kind(),
+        PathOpKind::Mkdir(FileMode::OWNER_READ | FileMode::OWNER_WRITE | FileMode::OWNER_EXEC)
+    );
+    // And the storage came back at the address it went in at.
+    assert_eq!(done.into_path().as_bytes().as_ptr(), addr);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_unlink_removes_the_file_it_names() {
+    let scratch = Scratch::new("unlink");
+    scratch.write("doomed", b"content");
+    scratch.write("bystander", b"safe");
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let result = run_path_op(
+        &mut sub,
+        &mut comp,
+        PreparedPathOp::unlink_cwd(scratch.owned_path("doomed")),
+    );
+
+    assert_eq!(result, 0);
+    assert!(!scratch.exists("doomed"));
+    // Only the named entry went: a test that checked nothing else would
+    // pass for an implementation that emptied the directory.
+    assert!(scratch.exists("bystander"));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn the_two_removals_each_refuse_the_other_kind_of_target() {
+    let scratch = Scratch::new("removals");
+    scratch.write("plainfile", b"x");
+    scratch.mkdir("plaindir");
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    // Unlink on a directory: EISDIR, and the directory survives.
+    assert_eq!(
+        run_path_op(
+            &mut sub,
+            &mut comp,
+            PreparedPathOp::unlink_cwd(scratch.owned_path("plaindir")),
+        ),
+        -21,
+    );
+    assert!(scratch.exists("plaindir"));
+
+    // Rmdir on a file: ENOTDIR, and the file survives.
+    assert_eq!(
+        run_path_op(
+            &mut sub,
+            &mut comp,
+            PreparedPathOp::rmdir_cwd(scratch.owned_path("plainfile")),
+        ),
+        -20,
+    );
+    assert!(scratch.exists("plainfile"));
+
+    // Each matched pairing works, which is what makes the split worth
+    // having rather than an arbitrary restriction.
+    assert_eq!(
+        run_path_op(
+            &mut sub,
+            &mut comp,
+            PreparedPathOp::rmdir_cwd(scratch.owned_path("plaindir")),
+        ),
+        0,
+    );
+    assert!(!scratch.exists("plaindir"));
+    assert_eq!(
+        run_path_op(
+            &mut sub,
+            &mut comp,
+            PreparedPathOp::unlink_cwd(scratch.owned_path("plainfile")),
+        ),
+        0,
+    );
+    assert!(!scratch.exists("plainfile"));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn an_rmdir_refuses_a_directory_that_still_has_entries() {
+    let scratch = Scratch::new("nonempty");
+    scratch.mkdir("full");
+    std::fs::write(scratch.path("full/inside"), b"x").expect("seed");
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    // ENOTEMPTY: this removes one directory, never a tree.
+    assert_eq!(
+        run_path_op(
+            &mut sub,
+            &mut comp,
+            PreparedPathOp::rmdir_cwd(scratch.owned_path("full")),
+        ),
+        -39,
+    );
+    assert!(scratch.exists("full"));
+    assert!(scratch.exists("full/inside"));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_failed_path_op_reports_the_errno_and_still_returns_the_path() {
+    let scratch = Scratch::new("missing");
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let ticket = sub
+        .push_path_op(PreparedPathOp::unlink_cwd(scratch.owned_path("absent")))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+
+    assert!(!done.is_ok());
+    assert!(done.result().is_err());
+    assert_eq!(done.raw_result(), -2);
+    // The storage comes back even on failure, as it must: the kernel is
+    // done reading it either way.
+    assert_eq!(
+        done.into_path().as_bytes(),
+        scratch.path("absent").as_bytes()
+    );
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_path_op_push_that_does_not_fit_hands_the_path_back() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let mut tickets = alloc_tickets(&mut sub);
+
+    let path = path_of(b"/tmp/never_submitted");
+    let addr = path.as_bytes().as_ptr();
+    let Err((returned, e)) = sub.push_path_op(PreparedPathOp::rmdir_cwd(path)) else {
+        panic!("a full queue must reject the push");
+    };
+    assert_eq!(e, Error::Submit(SubmitError::QueueFull));
+    // The kind survives too: a retry that lost it would unlink where the
+    // caller asked to rmdir.
+    assert_eq!(returned.kind(), PathOpKind::Rmdir);
+    assert_eq!(returned.into_path().as_bytes().as_ptr(), addr);
+    tickets.clear();
+}
+
+#[test]
+fn a_path_op_receipt_for_another_request_is_rejected() {
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let first = sub
+        .push_path_op(PreparedPathOp::unlink_cwd(path_of(b"/tmp/a")))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let second = sub
+        .push_path_op(PreparedPathOp::unlink_cwd(path_of(b"/tmp/b")))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let foreign = Receipt {
+        ring: second.ring(),
+        id: second.id(),
+        result: 0,
+        flags: crate::types::CqeFlags::default(),
+    };
+    assert!(!first.matches(&foreign));
+    let Err((first, _)) = first.redeem(foreign) else {
+        panic!("a foreign receipt must not redeem");
+    };
+    drop((first, second));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_rename_moves_the_file_and_returns_both_paths() {
+    let scratch = Scratch::new("rename");
+    scratch.write("source", b"payload");
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let from = scratch.owned_path("source");
+    let to = scratch.owned_path("destination");
+    let (from_addr, to_addr) = (from.as_bytes().as_ptr(), to.as_bytes().as_ptr());
+    let ticket = sub
+        .push_rename(PreparedRename::cwd(from, to, RenameMode::NoReplace))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+
+    assert!(done.is_ok(), "rename failed: {}", done.raw_result());
+    assert!(!scratch.exists("source"));
+    assert_eq!(scratch.read("destination"), b"payload");
+
+    // Both storages come back, at the addresses they went in at: this is
+    // the first request that owns two.
+    let (from, to) = done.into_paths();
+    assert_eq!(from.as_bytes().as_ptr(), from_addr);
+    assert_eq!(to.as_bytes().as_ptr(), to_addr);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn the_three_rename_modes_differ_on_an_occupied_destination() {
+    let scratch = Scratch::new("modes");
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut run = |from: &str, to: &str, mode| {
+        let ticket = sub
+            .push_rename(PreparedRename::cwd(
+                scratch.owned_path(from),
+                scratch.owned_path(to),
+                mode,
+            ))
+            .unwrap_or_else(|(_, e)| panic!("{e}"));
+        sub.submit_and_wait(1).expect("submit");
+        let receipt = comp.wait_one().expect("completion");
+        ticket
+            .redeem(receipt)
+            .unwrap_or_else(|_| panic!("mismatch"))
+            .raw_result()
+    };
+
+    // NoReplace refuses rather than destroying: EEXIST, target untouched.
+    scratch.write("n_from", b"new");
+    scratch.write("n_to", b"old");
+    assert_eq!(run("n_from", "n_to", RenameMode::NoReplace), -17);
+    assert_eq!(scratch.read("n_to"), b"old");
+    assert_eq!(scratch.read("n_from"), b"new");
+
+    // Replace destroys the target and says nothing about it: the result is
+    // 0, exactly as for a rename onto a free name.
+    scratch.write("r_from", b"new");
+    scratch.write("r_to", b"old");
+    assert_eq!(run("r_from", "r_to", RenameMode::Replace), 0);
+    assert_eq!(scratch.read("r_to"), b"new");
+    assert!(!scratch.exists("r_from"));
+
+    // Exchange swaps both ways and keeps both entries.
+    scratch.write("x_a", b"AAA");
+    scratch.write("x_b", b"BBB");
+    assert_eq!(run("x_a", "x_b", RenameMode::Exchange), 0);
+    assert_eq!(scratch.read("x_a"), b"BBB");
+    assert_eq!(scratch.read("x_b"), b"AAA");
+}
+
+#[cfg(not(miri))]
+#[test]
+fn an_exchange_needs_both_entries_to_exist() {
+    let scratch = Scratch::new("exchange");
+    scratch.write("present", b"x");
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let ticket = sub
+        .push_rename(PreparedRename::cwd(
+            scratch.owned_path("present"),
+            scratch.owned_path("absent"),
+            RenameMode::Exchange,
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+
+    // ENOENT: unlike the other two modes, an exchange cannot create the
+    // destination.
+    assert_eq!(done.raw_result(), -2);
+    assert!(scratch.exists("present"));
+    assert!(!scratch.exists("absent"));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_rename_crosses_directories_through_the_length_field() {
+    use std::os::fd::AsRawFd;
+    let scratch = Scratch::new("crossdir");
+    scratch.mkdir("left");
+    scratch.mkdir("right");
+    std::fs::write(scratch.path("left/departing"), b"travelling").expect("seed");
+
+    let left = std::fs::File::open(scratch.path("left")).expect("open left");
+    let right = std::fs::File::open(scratch.path("right")).expect("open right");
+    let left_fd = DirFd::Fd(RawFd::from_raw(
+        usize::try_from(left.as_raw_fd()).expect("non-negative fd"),
+    ));
+    let right_fd = DirFd::Fd(RawFd::from_raw(
+        usize::try_from(right.as_raw_fd()).expect("non-negative fd"),
+    ));
+
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_rename(PreparedRename::new(
+            left_fd,
+            // Distinct basenames on purpose: with the same name on both
+            // sides an implementation that sent one path twice would
+            // still pass.
+            path_of(b"departing"),
+            right_fd,
+            path_of(b"arrived"),
+            RenameMode::NoReplace,
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+
+    // The destination directory travels in the SQE's `len` field, which
+    // means "bytes" in every other request — so this is worth proving
+    // rather than assuming.
+    assert!(
+        done.is_ok(),
+        "cross-directory rename failed: {}",
+        done.raw_result()
+    );
+    assert!(!scratch.exists("left/departing"));
+    assert!(!scratch.exists("left/arrived"));
+    assert_eq!(scratch.read("right/arrived"), b"travelling");
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_rename_push_that_does_not_fit_hands_both_paths_back() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let mut tickets = alloc_tickets(&mut sub);
+
+    let from = path_of(b"/tmp/rename_from");
+    let to = path_of(b"/tmp/rename_to");
+    let (from_addr, to_addr) = (from.as_bytes().as_ptr(), to.as_bytes().as_ptr());
+    let Err((returned, e)) = sub.push_rename(PreparedRename::cwd(from, to, RenameMode::NoReplace))
+    else {
+        panic!("a full queue must reject the push");
+    };
+    assert_eq!(e, Error::Submit(SubmitError::QueueFull));
+    // The mode survives: a retry that lost it would overwrite where the
+    // caller asked to refuse.
+    assert_eq!(returned.mode(), RenameMode::NoReplace);
+    let (from, to) = returned.into_paths();
+    assert_eq!(from.as_bytes().as_ptr(), from_addr);
+    assert_eq!(to.as_bytes().as_ptr(), to_addr);
+    tickets.clear();
+}
+
+#[test]
+fn a_rename_receipt_for_another_request_is_rejected() {
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let make = || {
+        PreparedRename::cwd(
+            path_of(b"/tmp/from"),
+            path_of(b"/tmp/to"),
+            RenameMode::NoReplace,
+        )
+    };
+
+    let first = sub
+        .push_rename(make())
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let second = sub
+        .push_rename(make())
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let foreign = Receipt {
+        ring: second.ring(),
+        id: second.id(),
+        result: 0,
+        flags: crate::types::CqeFlags::default(),
+    };
+    assert!(!first.matches(&foreign));
+    let Err((first, _)) = first.redeem(foreign) else {
+        panic!("a foreign receipt must not redeem");
+    };
+    drop((first, second));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_rename_ticket_survives_moving_to_another_thread_before_completion() {
+    let scratch = Scratch::new("renamethread");
+    scratch.write("movable", b"payload");
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let ticket = sub
+        .push_rename(PreparedRename::cwd(
+            scratch.owned_path("movable"),
+            scratch.owned_path("moved"),
+            RenameMode::NoReplace,
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let handle = std::thread::spawn(move || {
+        let receipt = comp.wait_one().expect("completion");
+        let done = ticket
+            .redeem(receipt)
+            .unwrap_or_else(|_| panic!("mismatch"));
+        done.raw_result()
+    });
+    assert_eq!(handle.join().expect("thread"), 0);
+    assert_eq!(scratch.read("moved"), b"payload");
 }
 
 #[cfg(not(miri))]

@@ -117,6 +117,18 @@ fn a_direct_socket_slot_cannot_be_silently_discarded() {
     t.compile_fail("tests/ui/a_direct_socket_slot_must_be_recorded.rs");
 }
 
+/// A rename is the first owned request that publishes *two* path
+/// addresses, so there are two regions the kernel scans and two that must
+/// stay unreachable until a receipt proves it has stopped. Dropping either
+/// ticket leaks rather than corrupting, which is the safe failure — but it
+/// is silent, so it has to be diagnosed rather than merely permitted.
+#[test]
+fn in_flight_rename_paths_are_unreachable_and_not_silently_dropped() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/an_in_flight_rename_path_is_unreachable.rs");
+    t.compile_fail("tests/ui/a_rename_ticket_must_be_kept.rs");
+}
+
 /// An accepted connection is owned rather than borrowed, so the compiler
 /// cannot tie it to a pool the way it does an arrival. What it can do is
 /// refuse to let the result be thrown away unread, which is the failure
