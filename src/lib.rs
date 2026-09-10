@@ -8,6 +8,7 @@
 
 mod error;
 pub mod eventfd;
+pub mod fs;
 pub mod inotify;
 pub mod net;
 pub mod op;

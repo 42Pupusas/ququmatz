@@ -5,6 +5,7 @@ use super::buffer::{StableBuffer, StableBufferMut};
 use super::event::{Event, PartialReceipt};
 use super::identity::{RequestIdSource, RingId};
 use super::multishot::{MultishotRecv, PreparedMultishot};
+use super::open::{PendingOpen, PreparedOpen};
 use super::request::{Pending, Prepared, Receipt};
 use super::vectored::{PendingVectored, PreparedVectored};
 use super::zerocopy::{PendingZc, PreparedZc};
@@ -137,6 +138,38 @@ impl OwnedSubmitter {
             // buffers or to the descriptor array ever reached the kernel.
             Err(e) => Err((Self::reclaim_vectored(pending), e)),
         }
+    }
+
+    /// Queue an open, taking ownership of its path storage.
+    ///
+    /// The completion carries a descriptor as well as the storage, so
+    /// redeem the ticket even if the path is not wanted back: dropping it
+    /// unredeemed leaks an open file descriptor.
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact,
+    /// still owning its path storage.
+    pub fn push_open<S: StableBuffer>(
+        &mut self,
+        request: PreparedOpen<S>,
+    ) -> Result<PendingOpen<S>, (PreparedOpen<S>, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            // The SQE never became kernel-visible, so the kernel never saw
+            // the path pointer and reclaiming the storage is sound.
+            Err(e) => Err((Self::reclaim_open(pending), e)),
+        }
+    }
+
+    /// Undo an open push that the kernel never observed.
+    fn reclaim_open<S: StableBuffer>(pending: PendingOpen<S>) -> PreparedOpen<S> {
+        // SAFETY: only reached when `Submitter::push` reported the queue was
+        // full, which happens before the SQE is written or the tail is
+        // advanced. No kernel-visible pointer to the path exists.
+        unsafe { pending.reclaim_unsubmitted() }
     }
 
     /// Undo a vectored push that the kernel never observed.

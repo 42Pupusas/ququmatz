@@ -89,6 +89,23 @@
 //! [`Incoming::Connection`] carries a plain [`Socket`](crate::net::Socket)
 //! with no lifetime, and dropping it closes rather than recycles.
 //!
+//! # Opening produces a resource as well as returning one
+//!
+//! [`PreparedOpen`] is the first request whose *result* is itself a
+//! resource. The path storage goes in and comes back, but the completion
+//! also carries a descriptor the kernel created, so two independent things
+//! are reclaimable from one CQE — and they fail differently. Losing the
+//! storage leaks memory; losing the descriptor consumes a slot in a table
+//! bounded by `RLIMIT_NOFILE`, which runs out first. So
+//! [`Opened::into_parts`] hands back both, and the descriptor arrives as an
+//! owning [`File`](crate::fs::File) that closes if it is never used.
+//!
+//! The path is also the first buffer the kernel reads **without a length**.
+//! `openat` takes only an address and scans for a NUL, so the terminator is
+//! the entire bound: an unterminated path is not a short read but a walk off
+//! the end of the allocation. [`OwnedPath`] carries the proof that a NUL is
+//! present, and a request cannot be built without one.
+//!
 //! # Abandonment leaks instead of corrupting
 //!
 //! Dropping or [`forget`](core::mem::forget)ting a [`Pending`] does not
@@ -129,6 +146,8 @@ mod buffer;
 mod event;
 mod identity;
 mod multishot;
+mod open;
+mod path;
 mod queue;
 mod request;
 mod vectored;
@@ -149,6 +168,8 @@ pub use buffer::{MmapBuffer, StableBuffer, StableBufferMut};
 pub use event::{Event, PartialReceipt};
 pub use identity::{RequestId, RingId};
 pub use multishot::{Armed, Arrival, Delivery, Finished, MultishotRecv, PreparedMultishot};
+pub use open::{Opened, PendingOpen, PreparedOpen};
+pub use path::{OwnedPath, PathError};
 pub use queue::{OwnedCompleter, OwnedSubmitter};
 pub use request::{Completed, Direction, Pending, Prepared, Receipt};
 pub use vectored::{PendingVectored, PreparedVectored, VectoredCompleted, VectoredError};

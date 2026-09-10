@@ -373,12 +373,59 @@ not "prevented". An earlier draft asserted the stronger claim and passed
 for the wrong reason — a type mismatch I had introduced in the fixture
 itself, not the lint.
 
-**Scope limits.** Paths and `statx` still go through the `unsafe`
-constructors and need their own owned request types. The direct
-(registered-file-table) accept variants are also unmodelled: they yield
-table indices rather than descriptors, which is a third ownership story
-again. The `unsafe` `Sqe` surface remains for those and for lock-free
-users.
+**`openat`.** Covered by `PreparedOpen` / `PendingOpen` / `Opened` in
+`src/owned/open.rs`, with path storage in `src/owned/path.rs`. Two things
+are new here, and each changed the design.
+
+First, **the kernel reads without a length**. Every other operation is
+bounded by the SQE's `len` field, so an over-long read is impossible by
+construction. `openat` takes only an address and scans forward until it
+finds a NUL, which makes the terminator the entire bound. An unterminated
+path is therefore not a short read but a walk off the end of the
+allocation, and the caller cannot detect it afterwards from the result. So
+termination is checked once, up front, and `OwnedPath` exists to carry the
+proof: a request cannot be built from raw bytes at all, only from a value
+that has one. Interior NULs are rejected too, since the kernel stops at the
+first — `"/etc\0passwd"` would silently open `/etc`.
+
+That claim is machine-checked rather than asserted. The Miri stand-in
+kernel resolves the path the way `openat` does, scanning with nothing but
+the terminator to stop it, and the fixture fills its storage with `0xFF` so
+the written NUL is the only zero in the allocation. Removing that write
+makes Miri report **Undefined Behavior: dangling pointer** — the scan
+leaves the allocation — which is precisely the failure `OwnedPath`
+prevents. `OwnedPath` also exposes no mutable view of its bytes, because
+overwriting the NUL would invalidate the proof the value carries.
+
+Second, **the result is itself a resource**. Every earlier request handed
+storage to the kernel and got the same storage back; an open also produces
+a descriptor the kernel created. Two independent things are therefore
+reclaimable from one CQE, and they fail differently: losing the storage
+leaks memory, while losing the descriptor consumes a slot in a table
+bounded by `RLIMIT_NOFILE`, which runs out first. `Opened::into_parts`
+hands back both, and the descriptor arrives as an owning `File` — a new
+type in `src/fs.rs` — so ignoring it closes rather than leaks.
+
+`File` is deliberately not `Socket`. Both are owned descriptors, but a
+`Socket` answers `bind`, `listen`, `shutdown` and `getsockname`, none of
+which mean anything for a file. Returning one from an open would compile
+and would be a lie.
+
+Thirteen tests cover the module: three real-kernel (a working descriptor
+that is then written through, a failed open reporting `ENOENT` with no
+descriptor to leak, and a ticket redeemed on a second thread), six on the
+path rules, one on queue-full handback, and five under Miri. Both path
+checks were verified load-bearing by disabling them. The queue-full test
+asserts every field survives the round trip, not just the storage, since a
+retry that lost its flags would open the same path differently.
+`tests/ui/an_in_flight_path_is_unreachable.rs` pins that the path is
+unreachable in flight and that its bytes cannot be rewritten.
+
+**Scope limits.** `statx` still goes through the `unsafe` constructors and
+needs its own owned request type. The direct (registered-file-table)
+accept and open variants are also unmodelled: they yield table indices
+rather than descriptors, which is a third ownership story again. The
+`unsafe` `Sqe` surface remains for those and for lock-free users.
 
 **Status (original): confirmed.**
 

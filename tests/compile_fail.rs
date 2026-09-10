@@ -59,6 +59,18 @@ fn vectored_storage_is_unreachable_until_redeemed() {
     t.compile_fail("tests/ui/vectored_buffers_are_unreachable_in_flight.rs");
 }
 
+/// An open is bounded by a NUL rather than by a length, so the terminator
+/// is the only thing standing between the kernel and a walk off the end of
+/// the allocation. Two things follow: the path must be unreachable while
+/// the request is in flight, like any other in-flight buffer, and an
+/// `OwnedPath` must not hand out a mutable view of bytes whose NUL is the
+/// proof it carries.
+#[test]
+fn an_in_flight_path_cannot_be_read_or_rewritten() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/an_in_flight_path_is_unreachable.rs");
+}
+
 /// An accepted connection is owned rather than borrowed, so the compiler
 /// cannot tie it to a pool the way it does an arrival. What it can do is
 /// refuse to let the result be thrown away unread, which is the failure

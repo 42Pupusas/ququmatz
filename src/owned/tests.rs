@@ -3,13 +3,13 @@
 extern crate std;
 
 use super::{
-    Arrival, Completed, Delivery, Direction, Event, Incoming, MmapBuffer, Pending, PendingZc,
-    Prepared, PreparedAccept, PreparedMultishot, PreparedVectored, PreparedZc, Receipt, RingId,
-    StableBuffer, VectoredError, ZcCompleted,
+    Arrival, Completed, Delivery, Direction, Event, Incoming, MmapBuffer, OwnedPath, PathError,
+    Pending, PendingZc, Prepared, PreparedAccept, PreparedMultishot, PreparedOpen,
+    PreparedVectored, PreparedZc, Receipt, RingId, StableBuffer, VectoredError, ZcCompleted,
 };
 use crate::error::{Error, SubmitError};
 use crate::net::Socket;
-use crate::types::{AcceptFlags, MsgFlags, RawFd};
+use crate::types::{AcceptFlags, DirFd, FileMode, MsgFlags, OpenFlags, RawFd};
 
 /// Static proof that a ticket crosses a thread boundary. The whole design
 /// exists to make this true.
@@ -1369,4 +1369,237 @@ fn ring_id_is_copy_and_comparable() {
     let a = RingId::next();
     let b = a;
     assert_eq!(a, b);
+}
+
+/// Build a verified path in its own mapping.
+fn path_of(text: &[u8]) -> OwnedPath<MmapBuffer> {
+    let storage = MmapBuffer::with_capacity(256).expect("map");
+    OwnedPath::copy_into(storage, text).unwrap_or_else(|(_, e)| panic!("{e}"))
+}
+
+#[test]
+fn a_path_records_its_length_without_the_terminator() {
+    let path = path_of(b"/etc/hostname");
+    assert_eq!(path.len(), 13);
+    assert_eq!(path.as_bytes(), b"/etc/hostname");
+    assert!(!path.is_empty());
+}
+
+#[test]
+fn a_path_is_written_with_a_terminator_the_kernel_can_find() {
+    let path = path_of(b"/tmp");
+    let storage = path.into_storage();
+    // The NUL is what bounds the kernel's read; without it there is no
+    // length field anywhere in the SQE to stop it.
+    assert_eq!(&storage.as_slice()[..5], b"/tmp\0");
+}
+
+#[test]
+fn storage_too_small_for_the_path_and_its_nul_is_rejected() {
+    let storage = MmapBuffer::with_capacity(4).expect("map");
+    let addr = storage.stable_ptr();
+    // Four bytes hold "/tmp" but not its terminator, and the terminator is
+    // the only thing that stops the kernel reading past the end.
+    let Err((returned, e)) = OwnedPath::copy_into(storage, b"/tmp") else {
+        panic!("storage without room for the NUL must be rejected");
+    };
+    assert_eq!(e, PathError::TooLong { needed: 5, got: 4 });
+    assert_eq!(returned.stable_ptr(), addr);
+}
+
+#[test]
+fn an_interior_nul_is_rejected_rather_than_silently_truncating() {
+    let storage = MmapBuffer::with_capacity(64).expect("map");
+    // The kernel stops at the first NUL, so this would open "/etc" while
+    // the caller believes they asked for "/etc/passwd".
+    let Err((_, e)) = OwnedPath::copy_into(storage, b"/etc\0passwd") else {
+        panic!("an interior NUL must be rejected");
+    };
+    assert_eq!(e, PathError::NotTerminated);
+}
+
+#[test]
+fn an_empty_path_is_rejected_before_it_reaches_the_kernel() {
+    let storage = MmapBuffer::with_capacity(64).expect("map");
+    let Err((_, e)) = OwnedPath::copy_into(storage, b"") else {
+        panic!("an empty path must be rejected");
+    };
+    assert_eq!(e, PathError::Empty);
+}
+
+#[test]
+fn adopting_unterminated_storage_is_refused() {
+    let mut storage = MmapBuffer::with_capacity(8).expect("map");
+    storage.as_mut_slice().fill(b'x');
+    let addr = storage.stable_ptr();
+    let Err((returned, e)) = OwnedPath::adopt(storage) else {
+        panic!("storage with no NUL must be refused");
+    };
+    assert_eq!(e, PathError::NotTerminated);
+    assert_eq!(returned.stable_ptr(), addr);
+}
+
+#[test]
+fn adopting_storage_that_already_holds_a_path_finds_its_length() {
+    let mut storage = MmapBuffer::with_capacity(64).expect("map");
+    storage.as_mut_slice()[..5].copy_from_slice(b"/tmp\0");
+    let path = OwnedPath::adopt(storage).unwrap_or_else(|(_, e)| panic!("{e}"));
+    assert_eq!(path.as_bytes(), b"/tmp");
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_open_yields_a_working_descriptor_and_returns_the_path() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let path = path_of(b"/tmp");
+    let addr = path.as_bytes().as_ptr();
+    let ticket = sub
+        .push_open(PreparedOpen::cwd(
+            path,
+            OpenFlags::TMPFILE | OpenFlags::RDWR,
+            FileMode::OWNER_READ | FileMode::OWNER_WRITE,
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let opened = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert!(opened.is_ok(), "open failed: {}", opened.raw_result());
+
+    let (file, path) = opened.into_parts();
+    let file = file.expect("a successful open must carry a descriptor");
+    // The descriptor is real: write through it and get the byte count back.
+    let mut ring = crate::IoUring::new(4).expect("ring");
+    ring.push(unsafe { crate::Sqe::write(file.fd(), b"proof", 0) }.user_data(1))
+        .expect("push");
+    ring.submit_and_wait(1).expect("submit");
+    assert_eq!(ring.complete().expect("cqe").result, 5);
+
+    // And the path storage came back at the same address it went in at.
+    assert_eq!(path.as_bytes().as_ptr(), addr);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_failed_open_reports_the_errno_and_still_returns_the_path() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let ticket = sub
+        .push_open(PreparedOpen::cwd(
+            path_of(b"/nonexistent/definitely/not/here"),
+            OpenFlags::default(),
+            FileMode::default(),
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let opened = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+
+    assert!(!opened.is_ok());
+    assert!(opened.result().is_err());
+    // ENOENT, not a descriptor that would leak if ignored.
+    assert_eq!(opened.raw_result(), -2);
+    let (file, path) = opened.into_parts();
+    assert!(file.is_none(), "a failed open must not carry a descriptor");
+    assert_eq!(path.as_bytes(), b"/nonexistent/definitely/not/here");
+}
+
+#[cfg(not(miri))]
+#[test]
+fn an_open_ticket_survives_moving_to_another_thread_before_completion() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let ticket = sub
+        .push_open(PreparedOpen::at(
+            DirFd::Cwd,
+            path_of(b"/tmp"),
+            OpenFlags::TMPFILE | OpenFlags::RDWR,
+            FileMode::OWNER_READ | FileMode::OWNER_WRITE,
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+    let receipt = comp.wait_one().expect("completion");
+
+    // The kernel read the path from the submitting thread; the ticket that
+    // owns those bytes is redeemed on another one.
+    let opened = std::thread::spawn(move || {
+        ticket
+            .redeem(receipt)
+            .unwrap_or_else(|_| panic!("mismatch"))
+    })
+    .join()
+    .expect("join");
+    assert!(opened.is_ok(), "open failed: {}", opened.raw_result());
+    assert!(opened.into_file().is_some());
+}
+
+#[test]
+fn an_open_push_that_does_not_fit_hands_the_path_back() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut tickets = alloc_tickets(&mut sub);
+    let path = path_of(b"/tmp/wherever");
+    let addr = path.as_bytes().as_ptr();
+
+    let Err((returned, e)) = sub.push_open(PreparedOpen::cwd(
+        path,
+        OpenFlags::CREAT,
+        FileMode::OWNER_READ,
+    )) else {
+        panic!("a full queue must reject the push");
+    };
+    assert_eq!(e, Error::Submit(SubmitError::QueueFull));
+    // Every field survived the round trip, not just the storage: a retry
+    // must open the same path with the same flags.
+    assert_eq!(returned.path().as_bytes().as_ptr(), addr);
+    assert_eq!(returned.path().as_bytes(), b"/tmp/wherever");
+    assert_eq!(returned.flags(), OpenFlags::CREAT);
+    assert_eq!(returned.mode(), FileMode::OWNER_READ);
+    assert!(matches!(returned.dir(), DirFd::Cwd));
+    tickets.clear();
+}
+
+#[test]
+fn an_open_receipt_for_another_request_is_rejected() {
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let first = sub
+        .push_open(PreparedOpen::cwd(
+            path_of(b"/tmp"),
+            OpenFlags::default(),
+            FileMode::default(),
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let second = sub
+        .push_open(PreparedOpen::cwd(
+            path_of(b"/tmp"),
+            OpenFlags::default(),
+            FileMode::default(),
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let foreign = Receipt {
+        ring: second.ring(),
+        id: second.id(),
+        result: 7,
+        flags: crate::types::CqeFlags::default(),
+    };
+    assert!(!first.matches(&foreign));
+    let Err((first, _)) = first.redeem(foreign) else {
+        panic!("a foreign receipt must not redeem");
+    };
+    // Neither ticket is redeemed, so both leak their path storage rather
+    // than freeing bytes the kernel may still be reading.
+    drop((first, second));
 }

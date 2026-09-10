@@ -1,0 +1,17 @@
+error[E0599]: no method named `path` found for reference `&PendingOpen<MmapBuffer>` in the current scope
+ --> tests/ui/an_in_flight_path_is_unreachable.rs:6:20
+  |
+6 |     let _ = ticket.path();
+  |                    ^^^^ private field, not a method
+
+error[E0599]: no method named `into_path` found for struct `PendingOpen<S>` in the current scope
+  --> tests/ui/an_in_flight_path_is_unreachable.rs:13:20
+   |
+13 |     let _ = ticket.into_path();
+   |                    ^^^^^^^^^ method not found in `PendingOpen<MmapBuffer>`
+
+error[E0599]: no method named `as_mut_slice` found for mutable reference `&mut OwnedPath<MmapBuffer>` in the current scope
+  --> tests/ui/an_in_flight_path_is_unreachable.rs:20:18
+   |
+20 |     let _ = path.as_mut_slice();
+   |                  ^^^^^^^^^^^^ method not found in `&mut OwnedPath<MmapBuffer>`

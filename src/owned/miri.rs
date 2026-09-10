@@ -20,11 +20,13 @@ use std::vec::Vec;
 
 use super::event::PartialReceipt;
 use super::identity::{RequestId, RequestIdSource, RingId};
+use super::open::{PendingOpen, PreparedOpen};
+use super::path::OwnedPath;
 use super::vectored::{PendingVectored, PreparedVectored};
 use super::zerocopy::{PendingZc, PreparedZc};
 use super::{Direction, Pending, Prepared, Receipt, StableBuffer, StableBufferMut};
 use crate::op::Sqe;
-use crate::types::{CqeFlags, IoVec, MsgFlags, RawFd};
+use crate::types::{CqeFlags, FileMode, IoVec, MsgFlags, OpenFlags, RawFd};
 
 /// Heap storage standing in for an `MmapBuffer`.
 ///
@@ -271,6 +273,51 @@ impl Lifecycle {
     ) -> (FakeKernel, PendingVectored<B, V, N>) {
         let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
         (FakeKernel::holding(sqe), pending)
+    }
+
+    fn submit_open<S: StableBuffer>(
+        &self,
+        prepared: PreparedOpen<S>,
+    ) -> (FakeKernel, PendingOpen<S>) {
+        let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
+        (FakeKernel::holding(sqe), pending)
+    }
+}
+
+impl FakeKernel {
+    /// Resolve the published path the way `openat` does: read forward from
+    /// the address until a NUL, with no length to stop at.
+    ///
+    /// The scan is the point. Every other operation is bounded by the SQE's
+    /// length field, so an over-long read is impossible by construction;
+    /// here the terminator is the only bound, and if it is missing this
+    /// walks off the end of the allocation — which is exactly what Miri
+    /// reports and what `OwnedPath` exists to prevent.
+    fn resolve_path(&self) -> Vec<u8> {
+        let base = self.published_ptr().cast_const();
+        let mut seen = Vec::new();
+        let mut i = 0;
+        loop {
+            // SAFETY: the live `PendingOpen` owns storage holding a
+            // NUL-terminated path, verified by `OwnedPath` before the
+            // request could be built, so this scan stops inside it.
+            let byte = unsafe { base.add(i).read() };
+            if byte == 0 {
+                return seen;
+            }
+            seen.push(byte);
+            i += 1;
+        }
+    }
+
+    /// Mint the CQE of a successful open, carrying a descriptor number.
+    fn post_open(&self, ring: RingId, fd: i32) -> Receipt {
+        Receipt {
+            ring,
+            id: RequestId::from_raw(self.user_data()),
+            result: fd,
+            flags: CqeFlags::from_raw(0),
+        }
     }
 }
 
@@ -737,6 +784,142 @@ fn reclaiming_an_unpublished_zero_copy_send_returns_usable_storage() {
     let buf = recovered.into_buffer();
     assert_eq!(buf.as_slice()[0], 0xFF);
     // `buf` drops normally here: reclaiming revived the destructor.
+}
+
+/// Build a verified path in heap storage.
+fn heap_path(text: &[u8]) -> OwnedPath<HeapBuffer> {
+    let mut storage = HeapBuffer::with_capacity(64);
+    // Filled with non-zero bytes so the terminator written by `copy_into`
+    // is the *only* zero in the allocation. If it were ever missing, the
+    // kernel's scan would run past the end and Miri would report an
+    // out-of-bounds read rather than quietly stopping on zeroed tail bytes.
+    storage.as_mut_slice().fill(0xFF);
+    OwnedPath::copy_into(storage, text)
+        .ok()
+        .expect("storage fits")
+}
+
+#[test]
+fn the_kernel_scan_stops_inside_the_storage_the_ticket_owns() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedOpen::cwd(
+        heap_path(b"/etc/hostname"),
+        OpenFlags::default(),
+        FileMode::default(),
+    );
+    let (kernel, pending) = cycle.submit_open(prepared);
+
+    // The unbounded scan is the access worth checking: nothing but the NUL
+    // stops it, and Miri reports it if it leaves the allocation.
+    assert_eq!(kernel.resolve_path(), b"/etc/hostname");
+
+    let opened = pending
+        .redeem(kernel.post_open(cycle.ring, 5))
+        .ok()
+        .expect("receipt matches");
+    assert!(opened.is_ok());
+    let (file, path) = opened.into_parts();
+    assert_eq!(path.as_bytes(), b"/etc/hostname");
+    // The descriptor is a fiction here, so release it without closing fd 5.
+    let _ = file
+        .expect("a successful open carries a descriptor")
+        .into_fd();
+}
+
+#[test]
+fn a_path_stays_readable_while_the_ticket_moves_between_owners() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedOpen::cwd(
+        heap_path(b"/tmp/moved"),
+        OpenFlags::CREAT,
+        FileMode::OWNER_READ,
+    );
+    let (kernel, pending) = cycle.submit_open(prepared);
+
+    // The hazard this design exists for: the ticket is meant to cross to a
+    // completion thread, so the bytes the kernel is scanning must survive
+    // the owner being boxed, moved and passed through an opaque call.
+    let pending = Box::new(pending);
+    let pending = core::hint::black_box(pending);
+    let pending = *pending;
+
+    assert_eq!(kernel.resolve_path(), b"/tmp/moved");
+
+    let opened = pending
+        .redeem(kernel.post_open(cycle.ring, 9))
+        .ok()
+        .expect("receipt matches");
+    let _ = opened.into_file().expect("descriptor").into_fd();
+}
+
+#[test]
+fn a_failed_open_leaves_no_descriptor_to_leak() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedOpen::cwd(
+        heap_path(b"/nope"),
+        OpenFlags::default(),
+        FileMode::default(),
+    );
+    let (kernel, pending) = cycle.submit_open(prepared);
+
+    // -ENOENT. A negative result is an errno, never a descriptor, so
+    // nothing may be adopted from it.
+    let opened = pending
+        .redeem(kernel.post_open(cycle.ring, -2))
+        .ok()
+        .expect("receipt matches");
+    assert!(!opened.is_ok());
+    let (file, path) = opened.into_parts();
+    assert!(file.is_none());
+    // The storage still came back, so a failed open costs nothing.
+    assert_eq!(path.as_bytes(), b"/nope");
+    drop(path.into_storage());
+}
+
+#[test]
+fn abandoning_an_open_ticket_leaks_rather_than_freeing_the_path() {
+    let cycle = Lifecycle::new();
+    // Taken from the allocation itself, not from `as_bytes()`: that borrow
+    // is read-only and covers only the path, so freeing through it is a
+    // different pointer than the one `alloc_zeroed` handed out.
+    let storage = HeapBuffer::with_capacity(64);
+    let leaked = (storage.ptr, storage.len);
+    let path = OwnedPath::copy_into(storage, b"/tmp/abandoned")
+        .ok()
+        .expect("storage fits");
+    let prepared = PreparedOpen::cwd(path, OpenFlags::default(), FileMode::default());
+    let (kernel, pending) = cycle.submit_open(prepared);
+
+    // Dropping the ticket frees nothing: the kernel may still be resolving
+    // the path, so the storage leaks on purpose.
+    drop(pending);
+    assert_eq!(kernel.resolve_path(), b"/tmp/abandoned");
+
+    // SAFETY: the abandoned ticket leaked this and the stand-in kernel has
+    // finished, so nothing else can reach it.
+    unsafe { HeapBuffer::reclaim_leaked(leaked.0, leaked.1) };
+}
+
+#[test]
+fn reclaiming_an_unpublished_open_returns_the_path_and_its_target() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedOpen::cwd(
+        heap_path(b"/tmp/retry"),
+        OpenFlags::CREAT | OpenFlags::RDWR,
+        FileMode::OWNER_WRITE,
+    );
+    let (_kernel, pending) = cycle.submit_open(prepared);
+
+    // SAFETY: this SQE was never published, so the kernel holds no pointer
+    // into the path storage.
+    let recovered = unsafe { pending.reclaim_unsubmitted() };
+
+    // Every field survived, not just the storage: a retry must open the
+    // same path with the same flags and mode.
+    assert_eq!(recovered.path().as_bytes(), b"/tmp/retry");
+    assert_eq!(recovered.flags(), OpenFlags::CREAT | OpenFlags::RDWR);
+    assert_eq!(recovered.mode(), FileMode::OWNER_WRITE);
+    drop(recovered.into_path().into_storage());
 }
 
 #[test]
