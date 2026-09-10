@@ -161,11 +161,45 @@ pass weaker evidence than the Stacked Borrows one. Both accept the crate
 code itself — the remaining cast lives in the test's stand-in kernel, where
 the real kernel would be.
 
-**Scope limits.** This covers ordinary `read`/`write` only. Vectored I/O,
-paths, `statx`, multishot, and zero-copy still go through the `unsafe`
-constructors and need their own owned request types — `send_zc` in
-particular must not release its buffer on the send CQE alone. The
-`unsafe` `Sqe` surface remains for those and for lock-free users.
+**Zero-copy sends.** `send_zc` is now covered too, by `PreparedZc` /
+`PendingZc` / `ZcCompleted` in `src/owned/zerocopy.rs`. It needed separate
+types rather than a flag on `Prepared` because its buffer outlives its
+first completion: an ordinary `write` copies into the kernel, so one CQE
+means the bytes are free, while a zero-copy send maps the pages to the NIC
+and the send CQE reports only how much was accepted. Releasing the buffer
+there is a use-after-free that a plain `Pending` would perform happily.
+
+The kernel signals which case applies rather than leaving it to be
+inferred. A send CQE carrying `IORING_CQE_F_MORE` promises a later
+notification; **without that flag no notification is ever posted** and the
+send CQE is itself terminal, which is what happens when the kernel falls
+back to copying. A design that waited unconditionally for a notification
+would leak every such request forever. `OwnedCompleter::reap_event` reads
+the flag and returns `Event::Sent` or `Event::Complete` accordingly, so
+both paths terminate.
+
+The separation is a type error, not a convention. The non-terminal CQE
+becomes a `SendReceipt`, which `record_sent` accepts — handing the ticket
+back still holding its buffer — and which no releasing method will take;
+only a `Receipt` from a terminal CQE can redeem. `tests/ui/send_receipt_*`
+pins both halves: `E0308` for the substitution, `E0451` against forging
+one. Note that the pre-existing `reap` skips `MORE` CQEs, which silently
+discards a zero-copy send's byte count; rings that submit `push_zc` work
+must use `reap_event`, and its documentation says so.
+
+Five further Miri tests cover the NIC reading the buffer *after* the send
+CQE was recorded, the no-notification path, abandonment while a send is in
+flight, a mismatched send notice, and reclaiming an unpublished send. The
+two kernel behaviours are pinned deterministically there because a live
+ring cannot be made to choose one; the real-ring test in
+`src/owned/tests.rs` drives an actual loopback socket and accepts either.
+It was checked once with a temporary assertion that a notification really
+did arrive, confirming the two-CQE path is genuinely exercised rather than
+passing through the trivial branch, but does not assert it permanently.
+
+**Scope limits.** Vectored I/O, paths, `statx`, and multishot still go
+through the `unsafe` constructors and need their own owned request types.
+The `unsafe` `Sqe` surface remains for those and for lock-free users.
 
 **Status (original): confirmed.**
 

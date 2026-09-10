@@ -18,9 +18,10 @@ use std::boxed::Box;
 use std::vec::Vec;
 
 use super::identity::{RequestId, RequestIdSource, RingId};
+use super::zerocopy::{PendingZc, PreparedZc, SendReceipt};
 use super::{Direction, Pending, Prepared, Receipt, StableBuffer, StableBufferMut};
 use crate::op::Sqe;
-use crate::types::{CqeFlags, RawFd};
+use crate::types::{CqeFlags, MsgFlags, RawFd};
 
 /// Heap storage standing in for an `MmapBuffer`.
 ///
@@ -181,6 +182,28 @@ impl FakeKernel {
             flags: CqeFlags::from_raw(0),
         }
     }
+
+    /// Mint the non-terminal send CQE of a zero-copy send.
+    ///
+    /// The real kernel sets `MORE` here to promise a notification; this
+    /// carries no `Receipt`, so it cannot release the buffer.
+    fn post_send(&self, ring: RingId, result: i32) -> SendReceipt {
+        SendReceipt {
+            ring,
+            id: RequestId::from_raw(self.user_data()),
+            result,
+        }
+    }
+
+    /// Mint the notification CQE that finally releases the pages.
+    fn post_notification(&self, ring: RingId) -> Receipt {
+        Receipt {
+            ring,
+            id: RequestId::from_raw(self.user_data()),
+            result: 0,
+            flags: CqeFlags::NOTIF,
+        }
+    }
 }
 
 /// Drives a request through its whole lifecycle without a real ring.
@@ -198,6 +221,11 @@ impl Lifecycle {
     }
 
     fn submit<B: StableBuffer>(&self, prepared: Prepared<B>) -> (FakeKernel, Pending<B>) {
+        let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
+        (FakeKernel::holding(sqe), pending)
+    }
+
+    fn submit_zc<B: StableBuffer>(&self, prepared: PreparedZc<B>) -> (FakeKernel, PendingZc<B>) {
         let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
         (FakeKernel::holding(sqe), pending)
     }
@@ -347,6 +375,138 @@ fn transfer_length_bounds_what_the_kernel_may_touch() {
     let receipt = kernel.post_completion(cycle.ring, 5);
     let completed = pending.redeem(receipt).ok().expect("receipt matches");
     assert_eq!(completed.result().expect("ok"), 5);
+}
+
+#[test]
+fn the_nic_may_still_read_a_zero_copy_buffer_after_the_send_cqe() {
+    let cycle = Lifecycle::new();
+    let mut prepared = PreparedZc::send(
+        RawFd::from_raw(9),
+        HeapBuffer::with_capacity(8),
+        MsgFlags::default(),
+    );
+    prepared
+        .buffer_mut()
+        .as_mut_slice()
+        .copy_from_slice(b"ququmatz");
+    let (kernel, pending) = cycle.submit_zc(prepared);
+
+    // The send CQE says 8 bytes were accepted. This is the moment a design
+    // that treated the first completion as terminal would hand the buffer
+    // back and let it drop.
+    let pending = pending
+        .record_sent(kernel.post_send(cycle.ring, 8))
+        .ok()
+        .expect("notice matches");
+    assert_eq!(pending.send_result(), Some(8));
+
+    // The NIC reads the pages *after* that. Under Miri this is the
+    // use-after-free check for the whole zero-copy design: it passes only
+    // because `record_sent` released nothing.
+    assert_eq!(kernel.observe_write(), b"ququmatz");
+
+    let completed = pending
+        .redeem(kernel.post_notification(cycle.ring))
+        .ok()
+        .expect("notification matches");
+    assert_eq!(completed.result().expect("ok"), 8);
+    assert_eq!(completed.buffer().as_slice(), b"ququmatz");
+}
+
+#[test]
+fn a_zero_copy_send_that_promises_no_notification_is_terminal_at_once() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedZc::send(
+        RawFd::from_raw(9),
+        HeapBuffer::with_capacity(4),
+        MsgFlags::default(),
+    );
+    let (kernel, pending) = cycle.submit_zc(prepared);
+
+    // The kernel copied instead of mapping, so it clears `MORE` and never
+    // posts a notification. The completer classifies that CQE as terminal,
+    // and the buffer comes straight back rather than leaking forever.
+    let completed = pending
+        .redeem(kernel.post_completion(cycle.ring, 4))
+        .ok()
+        .expect("send cqe is terminal");
+    assert_eq!(completed.raw_send_result(), None);
+    assert_eq!(completed.result().expect("ok"), 4);
+}
+
+#[test]
+fn abandoning_a_zero_copy_send_leaks_rather_than_freeing_live_pages() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedZc::send(
+        RawFd::from_raw(9),
+        HeapBuffer::with_capacity(16),
+        MsgFlags::default(),
+    );
+    let (kernel, pending) = cycle.submit_zc(prepared);
+
+    let pending = pending
+        .record_sent(kernel.post_send(cycle.ring, 16))
+        .ok()
+        .expect("notice matches");
+    drop(pending);
+
+    // A late NIC read still lands in valid storage.
+    assert_eq!(kernel.observe_write().len(), 16);
+
+    // SAFETY: the ticket leaked this allocation and the stand-in kernel is
+    // done with it, so nothing else can reach these bytes.
+    unsafe { HeapBuffer::reclaim_leaked(kernel.published_ptr(), 16) };
+}
+
+#[test]
+fn a_send_notice_for_another_request_is_rejected_without_disturbing_the_ticket() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedZc::send(
+        RawFd::from_raw(9),
+        HeapBuffer::with_capacity(8),
+        MsgFlags::default(),
+    );
+    let (kernel, pending) = cycle.submit_zc(prepared);
+
+    let wrong = SendReceipt {
+        ring: cycle.ring,
+        id: RequestId::from_raw(pending.id().raw().wrapping_add(1)),
+        result: 8,
+    };
+    let (pending, _) = pending
+        .record_sent(wrong)
+        .err()
+        .expect("mismatch is rejected");
+    assert_eq!(pending.send_result(), None);
+
+    assert_eq!(kernel.observe_write().len(), 8);
+    let completed = pending
+        .redeem(kernel.post_notification(cycle.ring))
+        .ok()
+        .expect("notification matches");
+    drop(completed);
+}
+
+#[test]
+fn reclaiming_an_unpublished_zero_copy_send_returns_usable_storage() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedZc::send(
+        RawFd::from_raw(9),
+        HeapBuffer::with_capacity(12),
+        MsgFlags::default(),
+    );
+    let (kernel, pending) = cycle.submit_zc(prepared);
+    let addr = kernel.addr();
+
+    // SAFETY: this SQE was never published to a ring, so no kernel-visible
+    // pointer to the buffer exists.
+    let mut recovered = unsafe { pending.reclaim_unsubmitted() };
+
+    assert_eq!(recovered.buffer().stable_ptr() as u64, addr);
+    recovered.buffer_mut().as_mut_slice()[0] = 0xFF;
+    let buf = recovered.into_buffer();
+    assert_eq!(buf.as_slice()[0], 0xFF);
+    // `buf` drops normally here: reclaiming revived the destructor.
 }
 
 #[test]

@@ -10,6 +10,11 @@
 //! the compiler enforces them. These pin that an in-flight buffer is
 //! unreachable and unextractable, and that a `Receipt` can be neither forged
 //! by safe code nor spent twice.
+//!
+//! **Zero-copy sends** — a `send_zc` buffer stays live past its send CQE, so
+//! the non-terminal `SendReceipt` must not be usable where a release is
+//! required. That separation is the whole safety argument for the type, and
+//! it is a type error rather than a convention only if this keeps failing.
 
 #[test]
 fn pointer_bearing_constructors_require_unsafe() {
@@ -22,4 +27,10 @@ fn in_flight_buffers_and_receipts_are_compiler_enforced() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/ui/pending_*.rs");
     t.compile_fail("tests/ui/receipt_*.rs");
+}
+
+#[test]
+fn a_send_receipt_cannot_stand_in_for_a_terminal_one() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/send_receipt_*.rs");
 }

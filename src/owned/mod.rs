@@ -28,6 +28,17 @@
 //! [`Pending::redeem`] rejects a receipt from another request or another
 //! ring, so a forged or stale value cannot release a live buffer.
 //!
+//! # Zero-copy sends hold their buffer longer
+//!
+//! [`Prepared`] covers `read` and `write`, where one CQE means the kernel
+//! is done. A zero-copy send is different: the send CQE reports only how
+//! much was accepted, while the NIC may still be reading the pages, so the
+//! buffer is released by a later notification. [`PreparedZc`] and
+//! [`PendingZc`] model that second step, and [`OwnedCompleter::reap_event`]
+//! tells the two completions apart by the kernel's `MORE` flag rather than
+//! by counting. A send that promises no notification is terminal
+//! immediately, so nothing waits forever for a CQE that will not arrive.
+//!
 //! # Abandonment leaks instead of corrupting
 //!
 //! Dropping or [`forget`](core::mem::forget)ting a [`Pending`] does not
@@ -67,6 +78,7 @@ mod buffer;
 mod identity;
 mod queue;
 mod request;
+mod zerocopy;
 
 #[cfg(test)]
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
@@ -79,3 +91,4 @@ pub use buffer::{MmapBuffer, StableBuffer, StableBufferMut};
 pub use identity::{RequestId, RingId};
 pub use queue::{OwnedCompleter, OwnedSubmitter};
 pub use request::{Completed, Direction, Pending, Prepared, Receipt};
+pub use zerocopy::{Event, PendingZc, PreparedZc, SendReceipt, ZcCompleted};

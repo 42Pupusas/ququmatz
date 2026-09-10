@@ -3,6 +3,7 @@
 use super::buffer::StableBuffer;
 use super::identity::{RequestIdSource, RingId};
 use super::request::{Pending, Prepared, Receipt};
+use super::zerocopy::{Event, PendingZc, PreparedZc, SendReceipt};
 use crate::error::Error;
 use crate::ring::{Completer, IoUring, Submitter};
 use crate::types::CqeFlags;
@@ -43,6 +44,28 @@ impl OwnedSubmitter {
         }
     }
 
+    /// Queue a zero-copy send, taking ownership of its buffer.
+    ///
+    /// The returned ticket holds the buffer until the *terminal*
+    /// completion, which for `send_zc` is normally the notification rather
+    /// than the send result — see [`PendingZc`].
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact,
+    /// still owning its buffer.
+    pub fn push_zc<B: StableBuffer>(
+        &mut self,
+        request: PreparedZc<B>,
+    ) -> Result<PendingZc<B>, (PreparedZc<B>, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            Err(e) => Err((Self::reclaim_zc(pending), e)),
+        }
+    }
+
     /// Undo a push that the kernel never observed.
     fn reclaim<B: StableBuffer>(pending: Pending<B>) -> Prepared<B> {
         // SAFETY: only reached when `Submitter::push` reported the queue was
@@ -50,6 +73,14 @@ impl OwnedSubmitter {
         // advanced. No kernel-visible pointer to the buffer exists, so
         // taking ownership back cannot leave the kernel holding a dangling
         // address.
+        unsafe { pending.reclaim_unsubmitted() }
+    }
+
+    /// Undo a zero-copy push that the kernel never observed.
+    fn reclaim_zc<B: StableBuffer>(pending: PendingZc<B>) -> PreparedZc<B> {
+        // SAFETY: only reached when `Submitter::push` reported the queue was
+        // full, which happens before the SQE is written or the tail is
+        // advanced. No kernel-visible pointer to the buffer exists.
         unsafe { pending.reclaim_unsubmitted() }
     }
 
@@ -108,20 +139,50 @@ impl OwnedCompleter {
     /// terminal — the kernel will keep using the buffer — so they are
     /// skipped rather than turned into a receipt that would wrongly
     /// release storage.
+    ///
+    /// A zero-copy send's result CQE also carries `MORE` and is therefore
+    /// skipped here, discarding its byte count. Rings that submit
+    /// [`push_zc`](OwnedSubmitter::push_zc) work should use
+    /// [`reap_event`](Self::reap_event), which reports both kinds.
     #[must_use]
     pub fn reap(&mut self) -> Option<Receipt> {
         loop {
-            let cqe = self.inner.complete()?;
-            if cqe.flags.contains(CqeFlags::MORE) {
-                continue;
+            match self.reap_event()? {
+                Event::Complete(receipt) => return Some(receipt),
+                Event::Sent(_) => {}
             }
-            return Some(Receipt {
-                ring: self.ring,
-                id: super::identity::RequestId::from_raw(cqe.user_data),
-                result: cqe.result,
-                flags: cqe.flags,
-            });
         }
+    }
+
+    /// Reap one completion, reporting whether it releases a buffer.
+    ///
+    /// Non-blocking. A CQE with `IORING_CQE_F_MORE` promises more
+    /// completions for the same request, so it cannot release storage; it
+    /// becomes [`Event::Sent`], which no API accepts where a release is
+    /// required. Everything else is terminal and becomes
+    /// [`Event::Complete`].
+    ///
+    /// This distinction is what makes `send_zc` safe to expose: the send
+    /// CQE and the notification are told apart by the kernel's own flag
+    /// rather than by counting completions, and a send that reports no
+    /// notification is correctly treated as terminal on the spot.
+    #[must_use]
+    pub fn reap_event(&mut self) -> Option<Event> {
+        let cqe = self.inner.complete()?;
+        let id = super::identity::RequestId::from_raw(cqe.user_data);
+        if cqe.flags.contains(CqeFlags::MORE) {
+            return Some(Event::Sent(SendReceipt {
+                ring: self.ring,
+                id,
+                result: cqe.result,
+            }));
+        }
+        Some(Event::Complete(Receipt {
+            ring: self.ring,
+            id,
+            result: cqe.result,
+            flags: cqe.flags,
+        }))
     }
 
     /// Block until at least `min_complete` completions are ready.

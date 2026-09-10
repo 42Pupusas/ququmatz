@@ -2,9 +2,12 @@
 
 extern crate std;
 
-use super::{Completed, Direction, MmapBuffer, Pending, Prepared, Receipt, RingId, StableBuffer};
+use super::{
+    Completed, Direction, Event, MmapBuffer, Pending, PendingZc, Prepared, PreparedZc, Receipt,
+    RingId, StableBuffer, ZcCompleted,
+};
 use crate::error::{Error, SubmitError};
-use crate::types::RawFd;
+use crate::types::{MsgFlags, RawFd};
 
 /// Static proof that a ticket crosses a thread boundary. The whole design
 /// exists to make this true.
@@ -14,6 +17,9 @@ const _: () = assert_send::<Completed<MmapBuffer>>();
 const _: () = assert_send::<Prepared<MmapBuffer>>();
 const _: () = assert_send::<Receipt>();
 const _: () = assert_send::<MmapBuffer>();
+const _: () = assert_send::<PendingZc<MmapBuffer>>();
+const _: () = assert_send::<PreparedZc<MmapBuffer>>();
+const _: () = assert_send::<ZcCompleted<MmapBuffer>>();
 
 #[test]
 fn prepared_reports_direction_and_length() {
@@ -344,6 +350,158 @@ fn tickets_survive_being_moved_to_another_thread() {
     let (result, buf) = handle.join().expect("completion thread");
     assert_eq!(result.expect("write ok"), 4);
     assert_eq!(&buf.as_slice()[..4], b"nyaa");
+}
+
+/// A connected TCP pair on loopback, for exercising a real `send_zc`.
+struct SocketPair {
+    client: RawFd,
+    server: RawFd,
+    listener: RawFd,
+}
+
+impl SocketPair {
+    fn connected() -> Self {
+        use crate::syscall;
+        use crate::types::{self, SockAddrIn};
+
+        let listener = syscall::socket(types::AF_INET, types::SOCK_STREAM, 0).expect("listener");
+        let one: i32 = 1;
+        syscall::setsockopt(
+            listener,
+            1,
+            2,
+            (&raw const one).cast(),
+            core::mem::size_of::<i32>() as u32,
+        )
+        .expect("setsockopt");
+
+        let addr = SockAddrIn {
+            sin_family: types::AF_INET as u16,
+            sin_port: 0u16.to_be(),
+            sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+            sin_zero: [0; 8],
+        };
+        syscall::bind(
+            listener,
+            (&raw const addr).cast(),
+            core::mem::size_of::<SockAddrIn>() as u32,
+        )
+        .expect("bind");
+        syscall::listen(listener, 1).expect("listen");
+
+        let mut bound = SockAddrIn::default();
+        let mut len = core::mem::size_of::<SockAddrIn>() as u32;
+        syscall::getsockname(listener, (&raw mut bound).cast(), &raw mut len).expect("getsockname");
+
+        let client = syscall::socket(types::AF_INET, types::SOCK_STREAM, 0).expect("client");
+        syscall::connect(
+            client,
+            (&raw const bound).cast(),
+            core::mem::size_of::<SockAddrIn>() as u32,
+        )
+        .expect("connect");
+
+        let mut peer = SockAddrIn::default();
+        let mut peer_len = core::mem::size_of::<SockAddrIn>() as u32;
+        let server = syscall::accept4(listener, (&raw mut peer).cast(), &raw mut peer_len, 0)
+            .expect("accept");
+
+        Self {
+            client,
+            server,
+            listener,
+        }
+    }
+
+    fn read_server(&self, out: &mut [u8]) -> usize {
+        crate::syscall::read(self.server, out.as_mut_ptr(), out.len()).expect("read")
+    }
+}
+
+impl Drop for SocketPair {
+    fn drop(&mut self) {
+        let _ = crate::syscall::close(self.client);
+        let _ = crate::syscall::close(self.server);
+        let _ = crate::syscall::close(self.listener);
+    }
+}
+
+#[test]
+fn a_real_zero_copy_send_releases_its_buffer_only_on_the_terminal_cqe() {
+    let pair = SocketPair::connected();
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let msg = b"zero copy through the owned api";
+    let mut buf = MmapBuffer::with_capacity(msg.len()).expect("map");
+    buf.as_mut_slice().copy_from_slice(msg);
+    let addr = buf.stable_ptr();
+
+    let mut ticket = sub
+        .push_zc(PreparedZc::send(pair.client, buf, MsgFlags::NOSIGNAL))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit");
+
+    // Drive completions until a terminal one arrives. Whether the kernel
+    // posts one CQE or two is its choice, not ours: `reap_event` reports
+    // what actually happened and the loop ends either way.
+    let done: ZcCompleted<MmapBuffer> = 'outer: loop {
+        comp.wait(1).expect("wait");
+        while let Some(event) = comp.reap_event() {
+            match event {
+                Event::Sent(notice) => {
+                    ticket = ticket
+                        .record_sent(notice)
+                        .unwrap_or_else(|_| panic!("notice for our request"));
+                }
+                Event::Complete(receipt) => {
+                    break 'outer ticket
+                        .redeem(receipt)
+                        .unwrap_or_else(|_| panic!("matching receipt"));
+                }
+            }
+        }
+        comp.sync();
+    };
+    comp.sync();
+
+    // Deliberately not asserting that a notification arrived: whether the
+    // kernel maps or falls back to copying is its decision, and both are
+    // correct. The Miri tests pin each path deterministically.
+    let (result, buf) = done.into_parts();
+    assert_eq!(result.expect("send ok") as usize, msg.len());
+    // The storage came back, at the address the kernel was given.
+    assert_eq!(buf.stable_ptr(), addr);
+
+    let mut seen = [0u8; 64];
+    let n = pair.read_server(&mut seen[..msg.len()]);
+    assert_eq!(&seen[..n], msg, "the peer received the bytes");
+}
+
+#[test]
+fn a_zero_copy_push_that_does_not_fit_hands_the_buffer_back() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut held = std::vec::Vec::new();
+    loop {
+        let buf = MmapBuffer::with_capacity(8).expect("map");
+        let addr = buf.stable_ptr();
+        match sub.push_zc(PreparedZc::send(
+            RawFd::from_raw(1),
+            buf,
+            MsgFlags::default(),
+        )) {
+            Ok(ticket) => held.push(ticket),
+            Err((returned, e)) => {
+                assert!(matches!(e, Error::Submit(SubmitError::QueueFull)));
+                // The rejected request still owns its buffer, unmoved.
+                assert_eq!(returned.buffer().stable_ptr(), addr);
+                break;
+            }
+        }
+    }
+    core::mem::forget(held);
 }
 
 #[test]

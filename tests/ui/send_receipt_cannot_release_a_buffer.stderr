@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/ui/send_receipt_cannot_release_a_buffer.rs:7:36
+  |
+7 |     let _completed = ticket.redeem(notice);
+  |                             ------ ^^^^^^ expected `Receipt`, found `SendReceipt`
+  |                             |
+  |                             arguments to this method are incorrect
+  |
+note: method defined here
+ --> src/owned/zerocopy.rs
+  |
+  |     pub fn redeem(self, receipt: Receipt) -> Result<ZcCompleted<B>, (Self, Receipt)> {
+  |            ^^^^^^
