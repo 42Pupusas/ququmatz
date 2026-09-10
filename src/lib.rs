@@ -11,6 +11,7 @@ pub mod eventfd;
 pub mod inotify;
 pub mod net;
 pub mod op;
+pub mod owned;
 pub mod syscall;
 pub mod types;
 
@@ -21,6 +22,7 @@ pub use eventfd::EventFd;
 pub use inotify::Inotify;
 pub use net::Socket;
 pub use op::Sqe;
+pub use owned::{MmapBuffer, OwnedCompleter, OwnedSubmitter, Pending, Prepared};
 pub use ring::{
     BufferConsumer, Completer, Completion, Completions, IoUring, IoUringBuilder,
     ProvidedBufferRing, SplitCompletions, Submitter,

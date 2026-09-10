@@ -1,0 +1,23 @@
+warning: unreachable expression
+ --> tests/ui/receipt_cannot_be_forged.rs:7:13
+  |
+6 |         ring: todo!(),
+  |               ------- any code following this expression is unreachable
+7 |         id: todo!(),
+  |             ^^^^^^^ unreachable expression
+  |
+  = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+error[E0451]: fields `ring`, `id`, `result` and `flags` of struct `Receipt` are private
+ --> tests/ui/receipt_cannot_be_forged.rs:6:9
+  |
+5 |     let _forged = Receipt {
+  |                   ------- in this type
+6 |         ring: todo!(),
+  |         ^^^^ private field
+7 |         id: todo!(),
+  |         ^^ private field
+8 |         result: 0,
+  |         ^^^^^^ private field
+9 |         flags: todo!(),
+  |         ^^^^^ private field

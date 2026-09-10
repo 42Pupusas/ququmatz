@@ -97,6 +97,52 @@ completion-correlation caveat below. The full Phase 2 fix — owned in-flight
 requests whose lifetime the type system ties to the operation's terminal
 completion — remains open.
 
+**Update — a safe alternative now exists (`src/owned/`).** Rather than only
+restricting the borrowed-pointer API, the crate now offers a safe one
+alongside it. `owned` replaces borrowing with ownership transfer: a buffer
+moves into `Prepared`, then into a `Pending` ticket that owns the storage
+and exposes no way to read, write, or extract it while the kernel may be
+using it, and comes back only via `Completed`. Because the ticket owns
+rather than borrows, it is `Send` when its buffer is, so submission and
+completion run on independent OS threads with no scoped join and no
+crate-owned slab — the application decides where tickets live. This is the
+intended use of the crate expressed without `unsafe` at the call site; see
+`examples/split_owned_threads.rs`.
+
+Redemption is authenticated, which matters because `Completion` is a public
+struct any safe code can build, so a raw `user_data` match proves nothing.
+A `Receipt` is minted only by `OwnedCompleter::reap` from a CQE it actually
+reaped, carries both request and ring identity, and is neither `Copy` nor
+`Clone`. `Pending::redeem` rejects a receipt from another request or
+another ring and hands both values back intact. `RequestId`s are monotonic
+and never reused, so a stale receipt cannot authenticate a later request.
+Multishot CQEs (`IORING_CQE_F_MORE`) are deliberately not turned into
+receipts, since they are not terminal.
+
+Abandonment degrades safely: dropping *or* `mem::forget`ing a `Pending`
+leaks its buffer instead of freeing storage the kernel may still write to.
+This is the property a forgettable borrow-guard cannot have, and it is why
+this design is sound where `thread::scoped` was not. The cost is explicit —
+without a registry the crate cannot reclaim abandoned requests, so an
+optional reaper is possible future work.
+
+Four further compile-fail tests (`tests/ui/pending_*.rs`,
+`tests/ui/receipt_*.rs`) pin that an in-flight buffer is unreachable and
+unextractable, that a `Receipt` cannot be constructed by safe code, and
+that one receipt cannot be spent twice. 28 unit tests cover the lifecycle,
+including cross-ring rejection, same-ring wrong-request rejection,
+queue-full returning the buffer intact, kernel errors not stranding
+storage, and a ticket redeemed on a second thread.
+
+**Scope limits.** This covers ordinary `read`/`write` only. Vectored I/O,
+paths, `statx`, multishot, and zero-copy still go through the `unsafe`
+constructors and need their own owned request types — `send_zc` in
+particular must not release its buffer on the send CQE alone. The
+`unsafe` `Sqe` surface remains for those and for lock-free users. Miri is
+not installed on this toolchain, so the `ManuallyDrop` and provenance
+reasoning in `src/owned/request.rs` has not been machine-checked; that is
+the most valuable next verification step.
+
 **Status (original): confirmed.**
 
 **Evidence:** `src/op/mod.rs:21–69` defines `Sqe` without a lifetime, derives `Copy`/`Clone`, acknowledges that constructors only borrow during construction, and exposes safe `from_raw`. `src/op/file.rs:57–98` converts slices into pointers. `IoUring::push` and `Submitter::push` in `src/ring/mod.rs` accept those entries safely; subsequent publication/submission is also safe. Related pointer-bearing constructors exist in the network/control/buffer operation modules. `src/ring/register.rs::register_buffers` accepts `IoVec` descriptions without owning the backing storage.

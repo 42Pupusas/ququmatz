@@ -16,6 +16,12 @@ impl Errno {
     /// `EINVAL` — invalid argument.
     pub const EINVAL: Self = Self(22);
 
+    /// Wrap a raw positive errno value.
+    #[must_use]
+    pub(crate) const fn new(raw: i32) -> Self {
+        Self(raw)
+    }
+
     /// Returns the raw errno value.
     #[must_use]
     pub const fn raw(self) -> i32 {

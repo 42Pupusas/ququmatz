@@ -1,0 +1,5 @@
+error[E0599]: no method named `buffer` found for struct `ququmatz::Pending<B>` in the current scope
+  --> tests/ui/pending_buffer_is_unreachable.rs:14:24
+   |
+14 |     let _peek = ticket.buffer();
+   |                        ^^^^^^ method not found in `ququmatz::Pending<MmapBuffer>`

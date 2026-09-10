@@ -1,0 +1,5 @@
+error[E0599]: no method named `into_buffer` found for struct `ququmatz::Pending<B>` in the current scope
+  --> tests/ui/pending_buffer_cannot_be_extracted.rs:14:23
+   |
+14 |     let _buf = ticket.into_buffer();
+   |                       ^^^^^^^^^^^ method not found in `ququmatz::Pending<MmapBuffer>`

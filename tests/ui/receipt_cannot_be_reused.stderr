@@ -1,0 +1,10 @@
+error[E0382]: use of moved value: `receipt`
+  --> tests/ui/receipt_cannot_be_reused.rs:29:28
+   |
+26 |     let receipt = comp.wait_one().expect("completion");
+   |         ------- move occurs because `receipt` has type `Receipt`, which does not implement the `Copy` trait
+27 |     let _a = first.redeem(receipt);
+   |                           ------- value moved here
+28 |     // One receipt authorizes exactly one redemption.
+29 |     let _b = second.redeem(receipt);
+   |                            ^^^^^^^ value used here after move
