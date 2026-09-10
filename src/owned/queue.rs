@@ -4,6 +4,7 @@ use super::accept::{MultishotAccept, PreparedAccept};
 use super::buffer::{StableBuffer, StableBufferMut};
 use super::direct::{PendingDirectOpen, PreparedDirectOpen};
 use super::direct_accept::{DirectAccept, PreparedDirectAccept};
+use super::direct_socket::{PendingDirectSocket, PreparedDirectSocket};
 use super::event::{Event, PartialReceipt};
 use super::identity::{RequestIdSource, RingId};
 use super::multishot::{MultishotRecv, PreparedMultishot};
@@ -135,6 +136,32 @@ impl OwnedSubmitter {
         &mut self,
         request: PreparedDirectAccept,
     ) -> Result<DirectAccept, (PreparedDirectAccept, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            // The request owns nothing, so handing back the copy taken
+            // before submission returns it exactly as it arrived.
+            Err(e) => Err((request, e)),
+        }
+    }
+
+    /// Queue a socket creation that installs into the ring's file table.
+    ///
+    /// The completion yields a [`DirectSlot`](super::DirectSlot) rather
+    /// than a descriptor, so a file table must be registered first.
+    ///
+    /// An explicit [`SlotTarget::Exact`](super::SlotTarget::Exact) closes
+    /// whatever file already occupies the slot, reporting the same success
+    /// as an install into a free one.
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact.
+    pub fn push_direct_socket(
+        &mut self,
+        request: PreparedDirectSocket,
+    ) -> Result<PendingDirectSocket, (PreparedDirectSocket, Error)> {
         let id = self.ids.next();
         let (sqe, pending) = request.into_pending(self.ring, id);
         match self.inner.push(sqe) {

@@ -3,16 +3,17 @@
 extern crate std;
 
 use super::{
-    Arrival, Completed, Delivery, DirectIncoming, DirectOpenError, DirectSlot, Direction, Event,
-    Incoming, MmapBuffer, OwnedPath, PathError, Pending, PendingStatx, PendingZc, Prepared,
-    PreparedAccept, PreparedDirectAccept, PreparedDirectOpen, PreparedMultishot, PreparedOpen,
-    PreparedStatx, PreparedVectored, PreparedZc, Receipt, RingId, SlotIndex, SlotTarget,
-    StableBuffer, StatxError, VectoredError, ZcCompleted,
+    Arrival, Completed, Delivery, DirectIncoming, DirectOpenError, DirectSlot, DirectSocketError,
+    Direction, Event, Incoming, MmapBuffer, OwnedPath, PathError, Pending, PendingStatx, PendingZc,
+    Prepared, PreparedAccept, PreparedDirectAccept, PreparedDirectOpen, PreparedDirectSocket,
+    PreparedMultishot, PreparedOpen, PreparedStatx, PreparedVectored, PreparedZc, Receipt, RingId,
+    SlotIndex, SlotTarget, StableBuffer, StatxError, VectoredError, ZcCompleted,
 };
 use crate::error::{Error, SubmitError};
 use crate::net::Socket;
 use crate::types::{
-    AcceptFlags, DirFd, FileMode, MsgFlags, OpenFlags, RawFd, Statx, StatxFlags, StatxMask,
+    AcceptFlags, AddressFamily, DirFd, FileMode, MsgFlags, OpenFlags, RawFd, SocketFlags,
+    SocketType, Statx, StatxFlags, StatxMask,
 };
 
 /// Static proof that a ticket crosses a thread boundary. The whole design
@@ -400,6 +401,18 @@ impl Listener {
         syscall::getsockname(fd, (&raw mut addr).cast(), &raw mut len).expect("getsockname");
 
         Self { fd, addr }
+    }
+
+    /// The bound address, in the wire form `connect` expects.
+    ///
+    /// Gated to match its only caller, which needs a real kernel.
+    #[cfg(not(miri))]
+    fn addr_bytes(&self) -> [u8; core::mem::size_of::<crate::types::SockAddrIn>()] {
+        // Not `SockAddrIn::to_bytes`, which drops sin_zero: connect needs
+        // the whole struct, padding included.
+        // SAFETY: SockAddrIn is repr(C) and all-integer, so every byte of
+        // it is initialised and readable as bytes.
+        unsafe { core::mem::transmute(self.addr) }
     }
 
     /// Connect a client, returning it so the caller controls its lifetime.
@@ -2069,6 +2082,292 @@ fn a_slot_outside_the_table_is_refused_by_the_kernel() {
     // EINVAL: the slot is past the end of a two-entry table.
     assert_eq!(opened.raw_result(), -22);
     assert!(opened.slot().is_none());
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_direct_socket_lands_in_the_table_and_is_usable_through_its_slot() {
+    let ring = ring_with_table(8, 4);
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let request = PreparedDirectSocket::auto(
+        AddressFamily::Inet,
+        SocketType::Stream,
+        0,
+        SocketFlags::default(),
+    )
+    .expect("preparable");
+    let ticket = sub
+        .push_direct_socket(request)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let created = ticket
+        .redeem(comp.wait_one().expect("completion"))
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert!(created.is_ok(), "result was {}", created.raw_result());
+    let slot = created.slot().expect("a slot");
+    // A fresh table allocates from zero, so this is index 0 -- which as a
+    // descriptor would be stdin. Nothing entered the process's table.
+    assert_eq!(slot.index().get(), 0);
+
+    // It is a real socket, not just a recorded number: connecting through
+    // the slot to a listener proves the kernel installed a working file.
+    let listener = Listener::bound();
+    let addr = listener.addr_bytes();
+    sub.raw()
+        .push(
+            unsafe { crate::Sqe::connect(RawFd::from_raw(0), &addr) }
+                .fixed_file()
+                .user_data(7),
+        )
+        .expect("push connect");
+    sub.submit_and_wait(1).expect("submit");
+    let connected = comp.wait_one().expect("completion");
+    assert_eq!(connected.raw_result(), 0, "connect through the slot");
+}
+
+#[cfg(not(miri))]
+#[test]
+fn an_explicit_slot_closes_the_file_it_replaces() {
+    // The man page says an occupied entry "will first be removed from the
+    // table and closed". That is invisible in the CQE -- a replacement
+    // reports the same 0 as an install into a free slot -- so the only way
+    // to see it is through the file that was evicted.
+    // Slot 2, deliberately not slot 0: for slot 0 the index the caller
+    // named and the index Auto would read out of a successful result are
+    // both zero, so the two rules agree and the test cannot tell them
+    // apart. A non-zero slot separates them -- the CQE still says 0.
+    const SEEDED: u32 = 2;
+    let mut ring = crate::IoUring::new(8).expect("ring");
+    let seed = crate::eventfd::EventFd::new(0).expect("eventfd");
+    ring.register_files(&[-1, -1, seed.fd().as_i32(), -1])
+        .expect("register table");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let counter = 1u64.to_ne_bytes();
+    let write_through = |sub: &mut super::OwnedSubmitter, comp: &mut super::OwnedCompleter| {
+        sub.raw()
+            .push(
+                unsafe {
+                    crate::Sqe::write_ptr(RawFd::from_raw(SEEDED as usize), counter.as_ptr(), 8, 0)
+                }
+                .fixed_file()
+                .user_data(3),
+            )
+            .expect("push");
+        sub.submit_and_wait(1).expect("submit");
+        comp.wait_one().expect("completion").raw_result()
+    };
+    assert_eq!(
+        write_through(&mut sub, &mut comp),
+        8,
+        "the seeded eventfd accepts an 8-byte counter"
+    );
+
+    let request = PreparedDirectSocket::new(
+        AddressFamily::Inet,
+        SocketType::Stream,
+        0,
+        SocketFlags::default(),
+        SlotTarget::exact(SEEDED).expect("representable"),
+    )
+    .expect("preparable");
+    let ticket = sub
+        .push_direct_socket(request)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+    let created = ticket
+        .redeem(comp.wait_one().expect("completion"))
+        .unwrap_or_else(|_| panic!("mismatch"));
+
+    assert_eq!(
+        created.raw_result(),
+        0,
+        "an explicit install reports 0, indistinguishable from a free slot"
+    );
+    assert_eq!(
+        created.index().expect("a slot").get(),
+        SEEDED,
+        "the index is the one asked for; believing the result would say 0"
+    );
+    // The eventfd is gone: the same write now hits an unconnected socket.
+    assert_eq!(
+        write_through(&mut sub, &mut comp),
+        -32,
+        "EPIPE proves the replaced file was closed, not merely shadowed"
+    );
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_full_table_and_an_absent_one_are_told_apart_by_their_errno() {
+    // Both refuse, but for different reasons, and only the explicit-slot
+    // form distinguishes them: ENFILE means "no free entry", which an
+    // absent table also satisfies, while ENXIO means "no table at all".
+    let ring = ring_with_table(8, 1);
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let auto = || {
+        PreparedDirectSocket::auto(
+            AddressFamily::Inet,
+            SocketType::Stream,
+            0,
+            SocketFlags::default(),
+        )
+        .expect("preparable")
+    };
+
+    let first = sub
+        .push_direct_socket(auto())
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+    let created = first
+        .redeem(comp.wait_one().expect("completion"))
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert!(created.is_ok(), "the only slot is free");
+
+    let second = sub
+        .push_direct_socket(auto())
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+    let full = second
+        .redeem(comp.wait_one().expect("completion"))
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(full.raw_result(), -23, "ENFILE: the table is full");
+    assert!(full.slot().is_none(), "a failure names no slot");
+
+    // No table at all. Auto still says ENFILE, so it cannot tell the two
+    // situations apart; an explicit slot says ENXIO and can.
+    let bare = crate::IoUring::new(8).expect("ring");
+    let (mut sub, mut comp) = bare.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_direct_socket(auto())
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+    let missing = ticket
+        .redeem(comp.wait_one().expect("completion"))
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(
+        missing.raw_result(),
+        -23,
+        "ENFILE again: an absent table has no free entry either"
+    );
+
+    let exact = PreparedDirectSocket::new(
+        AddressFamily::Inet,
+        SocketType::Stream,
+        0,
+        SocketFlags::default(),
+        SlotTarget::exact(1).expect("representable"),
+    )
+    .expect("preparable");
+    let ticket = sub
+        .push_direct_socket(exact)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+    let named = ticket
+        .redeem(comp.wait_one().expect("completion"))
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(
+        named.raw_result(),
+        -6,
+        "ENXIO: a named slot reports the missing table as such"
+    );
+    // An explicit target knows its index without reading the result, so
+    // nothing but the failure itself stops it from reporting a slot the
+    // kernel never filled. Naming one here would invent an installed
+    // socket out of an ENXIO.
+    assert!(
+        named.slot().is_none(),
+        "a failed install names no slot, however well the caller knew the index"
+    );
+    assert!(named.index().is_none());
+}
+
+#[test]
+fn close_on_exec_is_refused_for_a_direct_socket_before_submission() {
+    // The same asymmetry as a direct open, and worth pinning because it is
+    // not a property of the flag but of the request: CLOEXEC is perfectly
+    // valid on a NON-direct socket, and only meaningless once the result
+    // is a table slot rather than a descriptor.
+    let refused = PreparedDirectSocket::auto(
+        AddressFamily::Inet,
+        SocketType::Stream,
+        0,
+        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+    );
+    assert_eq!(refused.unwrap_err(), DirectSocketError::CloseOnExec);
+
+    // NONBLOCK alone is fine; only CLOEXEC is refused.
+    PreparedDirectSocket::auto(
+        AddressFamily::Inet,
+        SocketType::Stream,
+        0,
+        SocketFlags::NONBLOCK,
+    )
+    .expect("NONBLOCK is valid for a direct socket");
+}
+
+#[test]
+fn a_direct_socket_push_that_does_not_fit_hands_the_request_back() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let mut tickets = alloc_tickets(&mut sub);
+
+    let target = SlotTarget::exact(3).expect("representable");
+    let request = PreparedDirectSocket::new(
+        AddressFamily::Inet,
+        SocketType::Dgram,
+        17,
+        SocketFlags::NONBLOCK,
+        target,
+    )
+    .expect("preparable");
+    let Err((returned, e)) = sub.push_direct_socket(request) else {
+        panic!("a full queue must reject the push");
+    };
+    assert_eq!(e, Error::Submit(SubmitError::QueueFull));
+    // Every field survives, the target especially: a retry that lost it
+    // would install into a different slot and close whatever lived there.
+    assert_eq!(returned.domain(), AddressFamily::Inet);
+    assert_eq!(returned.protocol(), 17);
+    assert_eq!(returned.flags(), SocketFlags::NONBLOCK);
+    assert_eq!(returned.target(), target);
+    tickets.clear();
+}
+
+#[test]
+fn a_direct_socket_receipt_for_another_request_is_rejected() {
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let make = || {
+        PreparedDirectSocket::auto(
+            AddressFamily::Inet,
+            SocketType::Stream,
+            0,
+            SocketFlags::default(),
+        )
+        .expect("preparable")
+    };
+
+    let first = sub
+        .push_direct_socket(make())
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let second = sub
+        .push_direct_socket(make())
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let foreign = Receipt {
+        ring: second.ring(),
+        id: second.id(),
+        result: 0,
+        flags: crate::types::CqeFlags::default(),
+    };
+    assert!(!first.matches(&foreign));
+    let Err((first, _)) = first.redeem(foreign) else {
+        panic!("a foreign receipt must not redeem");
+    };
+    drop((first, second));
 }
 
 #[test]

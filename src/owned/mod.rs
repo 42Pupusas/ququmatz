@@ -147,6 +147,19 @@
 //! blocks forever, which is why [`DirectIncoming::Done`] is a variant
 //! callers must name.
 //!
+//! # A direct socket can quietly destroy what it replaces
+//!
+//! [`PreparedDirectSocket`] creates a socket straight into the ring's file
+//! table, so it owns no memory and nothing leaks if the ticket is dropped
+//! — but the slot it fills does need recording, since an unnamed slot
+//! stays occupied until the ring dies.
+//!
+//! The sharp edge is an explicit [`SlotTarget::Exact`]: the kernel removes
+//! and closes whatever file already occupies that slot, and reports the
+//! same `0` it reports for any other success. Nothing in the completion
+//! says a live file was destroyed, so [`SlotTarget::Auto`] is the safer
+//! choice unless the caller knows the slot is free.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -177,6 +190,7 @@ mod accept;
 mod buffer;
 mod direct;
 mod direct_accept;
+mod direct_socket;
 mod event;
 mod identity;
 mod multishot;
@@ -203,6 +217,9 @@ pub use accept::{AcceptFinished, Incoming, MultishotAccept, PreparedAccept};
 pub use buffer::{MmapBuffer, StableBuffer, StableBufferMut};
 pub use direct::{DirectOpenError, DirectOpened, PendingDirectOpen, PreparedDirectOpen};
 pub use direct_accept::{DirectAccept, DirectAcceptFinished, DirectIncoming, PreparedDirectAccept};
+pub use direct_socket::{
+    DirectSocketCreated, DirectSocketError, PendingDirectSocket, PreparedDirectSocket,
+};
 pub use event::{Event, PartialReceipt};
 pub use identity::{RequestId, RingId};
 pub use multishot::{Armed, Arrival, Delivery, Finished, MultishotRecv, PreparedMultishot};

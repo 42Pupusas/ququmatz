@@ -105,6 +105,18 @@ fn a_table_slot_cannot_be_mistaken_for_a_descriptor() {
     t.compile_fail("tests/ui/a_direct_slot_is_not_a_descriptor.rs");
 }
 
+/// A direct socket owns no memory at all, so unlike every other ticket
+/// there is nothing for the compiler to protect from the kernel. What is
+/// still at stake is the record of the slot: the ticket and the completion
+/// are the only things that name it, and an explicit target closes
+/// whatever file it replaces, so discarding either loses a live socket in
+/// the ring's table.
+#[test]
+fn a_direct_socket_slot_cannot_be_silently_discarded() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/a_direct_socket_slot_must_be_recorded.rs");
+}
+
 /// An accepted connection is owned rather than borrowed, so the compiler
 /// cannot tie it to a pool the way it does an arrival. What it can do is
 /// refuse to let the result be thrown away unread, which is the failure

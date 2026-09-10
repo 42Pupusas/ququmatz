@@ -561,13 +561,47 @@ clear. The compile-fail fixture had to be split: an `E0599` earlier in the
 file aborted compilation before `unused_must_use` ran, so the lint
 guarantee was never being exercised — the same trap as the accept fixture.
 
+**Direct socket.** Covered by `PreparedDirectSocket` /
+`PendingDirectSocket` / `DirectSocketCreated` in
+`src/owned/direct_socket.rs`. It is the first owned request that owns *no*
+memory — a socket is three integers — so there is no in-flight storage to
+protect, no `ManuallyDrop`, and no reason to leak on drop. What still needs
+keeping is the *record* of the slot, which is why the ticket and the
+completion are both `must_use`.
+
+Measured before designing, as with direct accept. Six facts came out of the
+probe, three of them load-bearing. An explicit slot **replaces and closes**
+whatever file occupies it, matching the man page's "the file will first be
+removed from the table and closed", and it reports the same `0` as an
+install into a free slot — so nothing in the completion reveals that a live
+file was destroyed. Exhaustion gives `-ENFILE`, but unlike direct accept
+this is a one-shot, so there is no armed request to retire. And an absent
+table is reported *differently depending on the target*: `Auto` says
+`-ENFILE` (a table that does not exist has no free entry), while an
+explicit slot says `-ENXIO`.
+
+Four sabotages. Two were caught immediately: dropping the `CLOEXEC` guard,
+and ignoring the caller's target so every request became `Auto` — which
+failed the replacement test (the eventfd survived) and the errno test
+(`-23` where `-6` was expected).
+
+The other two exposed weak tests rather than weak code, which is the point
+of running them. Making an explicit target believe the CQE result instead
+of its own index **passed**, because the test had seeded slot `0` — the one
+index where `Auto.resolve(0)` and `Exact(0)` agree. Re-seeding at slot `2`
+made the sabotage fail as it should. Then removing the `result < 0` guard
+also passed: `SlotTarget::Exact::resolve` returns `Some` regardless of the
+result, so that guard is the *only* thing stopping a failed explicit
+request from naming a slot the kernel never filled. The ENXIO test checked
+the errno but not the slot; it now checks both.
+
 **Scope limits.** The owned layer now covers read/write, vectored I/O,
 zero-copy send, multishot recv and accept, `openat`, direct open, direct
-accept, and `statx`. Direct socket, `renameat`, `unlinkat`, `mkdirat`,
+accept, direct socket, and `statx`. `renameat`, `unlinkat`, `mkdirat`,
 `openat2`, `epoll_ctl`, `files_update`, `timeout`, and the `msghdr`-based
 send/recv still go through the `unsafe` `Sqe` surface, which remains for
-lock-free users. Direct accept has no Miri coverage: it owns no userspace
-storage, so there is no pointer lifetime for Miri to model.
+lock-free users. Neither direct accept nor direct socket has Miri coverage:
+neither owns userspace storage, so there is no pointer lifetime to model.
 
 **Status (original): confirmed.**
 
