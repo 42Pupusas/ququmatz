@@ -50,6 +50,18 @@
 //! brings a pool buffer id along — so [`PartialReceipt`] keeps the kernel's
 //! flags rather than discarding them.
 //!
+//! # Multishot borrows instead of owning
+//!
+//! [`PreparedMultishot`] is the exception to the ownership rule above: one
+//! SQE stays armed across many arrivals, and the kernel draws a buffer from
+//! a registered pool for each one. The resource is therefore not an
+//! allocation but a borrow of a pool slot that must be recycled exactly
+//! once, so [`Arrival`] is a guard that returns its slot on drop rather
+//! than a value that owns storage. A terminal CQE means the request is
+//! over and must be re-submitted — [`Delivery::Done`] says so, and the
+//! enum is exhaustive so callers cannot quietly ignore it and leave a
+//! socket deaf.
+//!
 //! # Abandonment leaks instead of corrupting
 //!
 //! Dropping or [`forget`](core::mem::forget)ting a [`Pending`] does not
@@ -88,6 +100,7 @@
 mod buffer;
 mod event;
 mod identity;
+mod multishot;
 mod queue;
 mod request;
 mod zerocopy;
@@ -105,6 +118,7 @@ mod miri;
 pub use buffer::{MmapBuffer, StableBuffer, StableBufferMut};
 pub use event::{Event, PartialReceipt};
 pub use identity::{RequestId, RingId};
+pub use multishot::{Armed, Arrival, Delivery, Finished, MultishotRecv, PreparedMultishot};
 pub use queue::{OwnedCompleter, OwnedSubmitter};
 pub use request::{Completed, Direction, Pending, Prepared, Receipt};
 pub use zerocopy::{PendingZc, PreparedZc, ZcCompleted};

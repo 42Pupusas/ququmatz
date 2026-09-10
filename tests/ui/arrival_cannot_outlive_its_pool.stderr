@@ -1,0 +1,10 @@
+error[E0621]: explicit lifetime required in the type of `pool`
+  --> tests/ui/arrival_cannot_outlive_its_pool.rs:14:40
+   |
+14 |         Ok(Delivery::Data(arrival)) => Some(arrival),
+   |                                        ^^^^^^^^^^^^^ lifetime `'a` required
+   |
+help: add explicit lifetime `'a` to the type of `pool`
+   |
+ 7 |     pool: &'a mut BufferConsumer,
+   |            ++

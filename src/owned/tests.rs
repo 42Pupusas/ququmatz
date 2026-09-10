@@ -3,8 +3,8 @@
 extern crate std;
 
 use super::{
-    Completed, Direction, Event, MmapBuffer, Pending, PendingZc, Prepared, PreparedZc, Receipt,
-    RingId, StableBuffer, ZcCompleted,
+    Completed, Delivery, Direction, Event, MmapBuffer, Pending, PendingZc, Prepared,
+    PreparedMultishot, PreparedZc, Receipt, RingId, StableBuffer, ZcCompleted,
 };
 use crate::error::{Error, SubmitError};
 use crate::types::{MsgFlags, RawFd};
@@ -352,9 +352,12 @@ fn tickets_survive_being_moved_to_another_thread() {
     assert_eq!(&buf.as_slice()[..4], b"nyaa");
 }
 
-/// A connected TCP pair on loopback, for exercising a real `send_zc`.
+/// A connected TCP pair on loopback, for exercising real socket ops.
+///
+/// The client is an `Option` so a test can close it early to signal EOF
+/// without the destructor closing the same fd twice.
 struct SocketPair {
-    client: RawFd,
+    client: Option<RawFd>,
     server: RawFd,
     listener: RawFd,
 }
@@ -407,20 +410,36 @@ impl SocketPair {
             .expect("accept");
 
         Self {
-            client,
+            client: Some(client),
             server,
             listener,
         }
     }
 
+    /// The client fd, which is open unless a test closed it early.
+    fn client(&self) -> RawFd {
+        self.client.expect("client still open")
+    }
+
     fn read_server(&self, out: &mut [u8]) -> usize {
         crate::syscall::read(self.server, out.as_mut_ptr(), out.len()).expect("read")
+    }
+
+    fn write_client(&self, bytes: &[u8]) -> usize {
+        crate::syscall::write(self.client(), bytes.as_ptr(), bytes.len()).expect("write")
+    }
+
+    /// Close the client so the server sees EOF, ending a multishot.
+    fn close_client(&mut self) {
+        if let Some(fd) = self.client.take() {
+            let _ = crate::syscall::close(fd);
+        }
     }
 }
 
 impl Drop for SocketPair {
     fn drop(&mut self) {
-        let _ = crate::syscall::close(self.client);
+        self.close_client();
         let _ = crate::syscall::close(self.server);
         let _ = crate::syscall::close(self.listener);
     }
@@ -438,7 +457,7 @@ fn a_real_zero_copy_send_releases_its_buffer_only_on_the_terminal_cqe() {
     let addr = buf.stable_ptr();
 
     let mut ticket = sub
-        .push_zc(PreparedZc::send(pair.client, buf, MsgFlags::NOSIGNAL))
+        .push_zc(PreparedZc::send(pair.client(), buf, MsgFlags::NOSIGNAL))
         .unwrap_or_else(|(_, e)| panic!("{e}"));
     sub.submit().expect("submit");
 
@@ -476,6 +495,181 @@ fn a_real_zero_copy_send_releases_its_buffer_only_on_the_terminal_cqe() {
     let mut seen = [0u8; 64];
     let n = pair.read_server(&mut seen[..msg.len()]);
     assert_eq!(&seen[..n], msg, "the peer received the bytes");
+}
+
+#[test]
+fn a_real_multishot_recv_delivers_many_arrivals_from_one_submission() {
+    let mut pair = SocketPair::connected();
+    let mut ring = crate::IoUring::new(16).expect("ring");
+    let pool = ring
+        .register_provided_buffers(7, 8, 64)
+        .expect("register pool");
+    let mut pool = pool.split();
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let ticket = sub
+        .push_multishot(PreparedMultishot::recv(
+            pair.server,
+            pool.bgid(),
+            MsgFlags::default(),
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit");
+
+    // Three separate writes, so one armed request must yield three CQEs.
+    let sent: [&[u8]; 3] = [b"first", b"second", b"third"];
+    for msg in sent {
+        assert_eq!(pair.write_client(msg), msg.len());
+    }
+
+    let mut received: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
+    let mut ids_seen: std::vec::Vec<u16> = std::vec::Vec::new();
+    while received.len() < sent.len() {
+        comp.wait(1).expect("wait");
+        while let Some(event) = comp.reap_event() {
+            match ticket.record(event, &mut pool).expect("our request") {
+                Delivery::Data(arrival) => {
+                    ids_seen.push(arrival.buffer_id());
+                    received.push(arrival.bytes().to_vec());
+                    // `arrival` drops here, recycling its slot.
+                }
+                Delivery::Empty(res) => panic!("unexpected empty delivery: {res}"),
+                Delivery::Done(fin) => panic!("ended early: {:?}", fin.result()),
+            }
+        }
+        comp.sync();
+    }
+
+    let joined: std::vec::Vec<u8> = received.concat();
+    let expected: std::vec::Vec<u8> = sent.concat();
+    assert_eq!(
+        joined, expected,
+        "one armed request delivered every write in order"
+    );
+    assert_eq!(
+        ids_seen.len(),
+        sent.len(),
+        "each arrival carried a pool buffer id"
+    );
+
+    // Closing the peer ends the multishot; the terminal CQE must be
+    // reported as such rather than looking like another arrival.
+    pair.close_client();
+    let finished = 'outer: loop {
+        comp.wait(1).expect("wait");
+        while let Some(event) = comp.reap_event() {
+            match ticket.record(event, &mut pool).expect("our request") {
+                Delivery::Done(fin) => break 'outer fin,
+                Delivery::Data(arrival) => {
+                    // EOF may arrive as a zero-length arrival first.
+                    assert!(arrival.is_empty(), "unexpected data after close");
+                }
+                Delivery::Empty(_) => {}
+            }
+        }
+        comp.sync();
+    };
+    comp.sync();
+    assert!(
+        !Delivery::Done(finished).armed().is_armed(),
+        "a finished multishot is not armed"
+    );
+}
+
+#[test]
+fn recycling_returns_slots_so_a_small_pool_outlasts_more_arrivals_than_it_holds() {
+    // Two buffers, six messages: this can only pass if each `Arrival`
+    // returned its slot on drop. Verified by `mem::forget`ing the arrival,
+    // which ends the multishot at round 2 with ENOBUFS (errno 105).
+    let pair = SocketPair::connected();
+    let mut ring = crate::IoUring::new(16).expect("ring");
+    let pool = ring
+        .register_provided_buffers(11, 2, 64)
+        .expect("register pool");
+    let mut pool = pool.split();
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let ticket = sub
+        .push_multishot(PreparedMultishot::recv(
+            pair.server,
+            pool.bgid(),
+            MsgFlags::default(),
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit");
+
+    let mut total = 0usize;
+    for round in 0..6u8 {
+        let msg = [b'a' + round; 4];
+        pair.write_client(&msg);
+
+        loop {
+            comp.wait(1).expect("wait");
+            let Some(event) = comp.reap_event() else {
+                comp.sync();
+                continue;
+            };
+            match ticket.record(event, &mut pool).expect("our request") {
+                Delivery::Data(arrival) => {
+                    assert_eq!(arrival.bytes(), &msg[..]);
+                    total += arrival.bytes().len();
+                    // `arrival` drops here, returning its slot to the pool.
+                    break;
+                }
+                Delivery::Empty(res) => panic!("empty delivery: {res}"),
+                Delivery::Done(fin) => {
+                    panic!("multishot ended at round {round}: {:?}", fin.result())
+                }
+            }
+        }
+        comp.sync();
+    }
+
+    assert_eq!(
+        total, 24,
+        "a two-buffer pool carried six four-byte messages"
+    );
+}
+
+#[test]
+fn a_multishot_rejects_a_completion_belonging_to_another_request() {
+    let pair = SocketPair::connected();
+    let mut ring = crate::IoUring::new(8).expect("ring");
+    let pool = ring
+        .register_provided_buffers(13, 4, 32)
+        .expect("register pool");
+    let mut pool = pool.split();
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let first = sub
+        .push_multishot(PreparedMultishot::recv(
+            pair.server,
+            pool.bgid(),
+            MsgFlags::default(),
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let second = sub
+        .push_multishot(PreparedMultishot::recv(
+            pair.server,
+            pool.bgid(),
+            MsgFlags::default(),
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    assert_ne!(first.id().raw(), second.id().raw());
+
+    // A completion naming the second request must not be accepted by the
+    // first, or one stream's bytes would be read as another's.
+    // Built from the private fields, which only in-crate code can reach —
+    // `tests/ui/partial_receipt_cannot_be_forged.rs` pins that safe callers
+    // outside the crate cannot do this.
+    let foreign = Event::Partial(super::event::PartialReceipt {
+        ring: second.ring(),
+        id: second.id(),
+        result: 4,
+        flags: crate::types::CqeFlags::MORE,
+    });
+    assert!(!first.matches(&foreign));
+    assert!(first.record(foreign, &mut pool).is_err());
 }
 
 #[test]

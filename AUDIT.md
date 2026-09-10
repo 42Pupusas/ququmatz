@@ -217,9 +217,50 @@ It was checked once with a temporary assertion that a notification really
 did arrive, confirming the two-CQE path is genuinely exercised rather than
 passing through the trivial branch, but does not assert it permanently.
 
-**Scope limits.** Vectored I/O, paths, `statx`, and multishot still go
-through the `unsafe` constructors and need their own owned request types.
-The `unsafe` `Sqe` surface remains for those and for lock-free users.
+**Multishot receive.** Covered by `PreparedMultishot` / `MultishotRecv` /
+`Arrival` in `src/owned/multishot.rs`. This one does not fit the ticket
+model at all, and forcing it to would have been the mistake. Every other
+owned request holds a buffer for its whole life; a multishot owns nothing.
+One SQE stays armed across many arrivals and the kernel picks a *pool*
+buffer per arrival, so the resource is a borrow of a pool slot that must be
+recycled exactly once — not an allocation. Never recycling drains the pool;
+recycling twice hands the kernel a buffer that is already queued.
+
+`Arrival` is therefore an RAII guard holding `&'pool mut BufferConsumer`,
+and it recycles on drop, including on unwind. The exclusive borrow does
+real work beyond the recycle: two arrivals cannot be live at once, so
+recycling order follows the caller rather than drop order, and slot ids
+cannot be confused. `tests/ui/arrival_cannot_outlive_its_pool.rs` (`E0621`)
+and `two_arrivals_cannot_be_held_at_once.rs` (`E0499`) pin both. An earlier
+draft of those fixtures passed for the wrong reason — they imported
+`BufferConsumer` through the private `ring` module and failed with `E0603`,
+which would have held even if `Arrival` were unsound. Fixed to import the
+crate-root re-export, and the errors are now the intended ones.
+
+The second hazard is that finishing is not failure. Per
+`io_uring_prep_recv_multishot(3)`, a CQE **without** `MORE` means the
+multishot is done and the application must submit a new request to keep
+receiving. `ENOBUFS` from a drained pool is a common cause, so it can
+happen at any time; treating it as ordinary end-of-stream leaves a socket
+permanently deaf. `Delivery` reports it as `Done` and is deliberately
+*not* `#[non_exhaustive]`, so callers cannot skip the case with a `_` arm,
+and `Finished` cannot be re-armed — receiving again means a new request,
+which is what the kernel requires.
+
+Three real-kernel tests cover it: three writes delivered from one armed
+submission, a foreign completion rejected, and — the load-bearing one — a
+**two-buffer pool carrying six messages**, which can only pass if each
+arrival returned its slot. That one was verified by `mem::forget`ing the
+arrival, which ends the multishot at round 2 with `ENOBUFS` (errno 105);
+the check was repeated after the loop was restructured for clippy, to
+confirm it had not gone slack.
+
+**Scope limits.** Vectored I/O, paths, `statx`, and multishot *accept* still
+go through the `unsafe` constructors and need their own owned request
+types. Multishot accept shares the `MORE`/re-arm state machine with recv
+but yields file descriptors rather than pool buffers, so it needs a
+different guard rather than a generic parameter on this one. The `unsafe`
+`Sqe` surface remains for those and for lock-free users.
 
 **Status (original): confirmed.**
 

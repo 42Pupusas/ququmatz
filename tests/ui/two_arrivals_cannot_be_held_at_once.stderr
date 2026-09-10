@@ -1,0 +1,10 @@
+error[E0499]: cannot borrow `*pool` as mutable more than once at a time
+  --> tests/ui/two_arrivals_cannot_be_held_at_once.rs:15:46
+   |
+10 |     let first = ticket.record(first_event, pool);
+   |                                            ---- first mutable borrow occurs here
+...
+15 |     let second = ticket.record(second_event, pool);
+   |                                              ^^^^ second mutable borrow occurs here
+16 |     drop(first);
+   |          ----- first borrow later used here

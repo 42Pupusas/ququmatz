@@ -36,3 +36,15 @@ fn a_partial_receipt_cannot_stand_in_for_a_terminal_one() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/ui/partial_receipt_*.rs");
 }
+
+/// A multishot arrival borrows a pool slot rather than owning storage, and
+/// recycles it on drop. Both halves of that have to be enforced: it must
+/// not outlive the pool it will recycle into, and two must not be live at
+/// once, or which slot goes back when would follow drop order instead of
+/// the caller's intent.
+#[test]
+fn a_multishot_arrival_cannot_escape_or_alias_its_pool() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/arrival_cannot_outlive_its_pool.rs");
+    t.compile_fail("tests/ui/two_arrivals_cannot_be_held_at_once.rs");
+}

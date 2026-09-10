@@ -3,6 +3,7 @@
 use super::buffer::StableBuffer;
 use super::event::{Event, PartialReceipt};
 use super::identity::{RequestIdSource, RingId};
+use super::multishot::{MultishotRecv, PreparedMultishot};
 use super::request::{Pending, Prepared, Receipt};
 use super::zerocopy::{PendingZc, PreparedZc};
 use crate::error::Error;
@@ -64,6 +65,31 @@ impl OwnedSubmitter {
         match self.inner.push(sqe) {
             Ok(()) => Ok(pending),
             Err(e) => Err((Self::reclaim_zc(pending), e)),
+        }
+    }
+
+    /// Arm a multishot receive against a registered buffer pool.
+    ///
+    /// Unlike [`push`](Self::push) this transfers no buffer: the kernel
+    /// draws one from the pool per arrival, and the completion thread
+    /// recycles them. The returned ticket stays valid across many
+    /// completions until one reports
+    /// [`Armed::Finished`](super::Armed::Finished).
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact.
+    pub fn push_multishot(
+        &mut self,
+        request: PreparedMultishot,
+    ) -> Result<MultishotRecv, (PreparedMultishot, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            // The request owns no buffer, so handing back the copy taken
+            // before submission returns it exactly as it arrived.
+            Err(e) => Err((request, e)),
         }
     }
 
