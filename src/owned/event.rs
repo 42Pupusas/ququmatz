@@ -68,12 +68,7 @@ impl PartialReceipt {
     /// of the pool until it is recycled.
     #[must_use]
     pub const fn buffer_id(&self) -> Option<u16> {
-        if self.flags.contains(CqeFlags::BUFFER) {
-            #[allow(clippy::cast_possible_truncation)]
-            Some((self.flags.bits() >> 16) as u16)
-        } else {
-            None
-        }
+        self.flags.buffer_id()
     }
 }
 

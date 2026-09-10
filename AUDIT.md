@@ -247,13 +247,40 @@ permanently deaf. `Delivery` reports it as `Done` and is deliberately
 and `Finished` cannot be re-armed — receiving again means a new request,
 which is what the kernel requires.
 
-Three real-kernel tests cover it: three writes delivered from one armed
-submission, a foreign completion rejected, and — the load-bearing one — a
-**two-buffer pool carrying six messages**, which can only pass if each
-arrival returned its slot. That one was verified by `mem::forget`ing the
-arrival, which ends the multishot at round 2 with `ENOBUFS` (errno 105);
-the check was repeated after the loop was restructured for clippy, to
-confirm it had not gone slack.
+The third hazard was found by reading `io_uring/net.c` rather than the man
+page, and it invalidated the first version of this code. Terminal and
+*empty* are also independent axes. `io_recv_finish()` computes the buffer
+flags **before** deciding whether the request continues:
+
+```c
+cflags |= io_put_kbuf(req, sel->val, sel->buf_list);
+if (... && io_req_post_cqe(req, sel->val, cflags | IORING_CQE_F_MORE))
+        return true;                             /* stayed armed */
+finish:
+        io_req_set_res(req, sel->val, cflags);   /* terminal, same cflags */
+```
+
+When the extra CQE cannot be posted — a full completion queue — the buffer
+id rides out on the *terminal* CQE instead. A `Done` that carried no
+payload would leak a pool slot exactly when the pool is already under
+pressure, which is the same defect as the `PartialReceipt` bug one commit
+earlier, in the branch that looked too simple to check. `Finished` now
+carries the final `Arrival`, and `into_receipt` was replaced by
+`into_parts` returning both, because a method that quietly discarded
+received bytes should not be the convenient one. `CqeFlags::buffer_id()`
+owns the decode, since three copies of a bit-shift is how the two paths
+drift apart.
+
+Six real-kernel tests cover the module: three writes delivered from one
+armed submission, a foreign completion rejected, a CQ-overflow flood, a
+terminal CQE with no buffer, and two load-bearing ones. A **two-buffer
+pool carrying six messages** can only pass if each arrival returned its
+slot — verified by `mem::forget`ing the arrival, which ends the multishot
+at round 2 with `ENOBUFS` (errno 105), and re-verified after the loop was
+restructured for clippy, to confirm it had not gone slack. A **synthesised
+terminal CQE carrying a buffer id** pins the fold, since CQ overflow cannot
+be forced deterministically from userspace; it was verified by making
+`Done` drop its payload again, which fails on the missing arrival.
 
 **Scope limits.** Vectored I/O, paths, `statx`, and multishot *accept* still
 go through the `unsafe` constructors and need their own owned request

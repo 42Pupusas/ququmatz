@@ -72,4 +72,21 @@ impl CqeFlags {
     pub const fn from_raw(raw: u32) -> Self {
         Self(raw)
     }
+
+    /// The provided-buffer id packed into the upper 16 bits.
+    ///
+    /// `Some` only when [`BUFFER`](Self::BUFFER) is set, which is what
+    /// distinguishes "the kernel chose slot 0" from "the kernel chose no
+    /// slot" — both leave those bits zero. The id names a pool buffer that
+    /// is out of circulation until it is recycled, so losing it drains the
+    /// pool.
+    #[must_use]
+    pub const fn buffer_id(self) -> Option<u16> {
+        if self.contains(Self::BUFFER) {
+            #[allow(clippy::cast_possible_truncation)]
+            Some((self.bits() >> 16) as u16)
+        } else {
+            None
+        }
+    }
 }

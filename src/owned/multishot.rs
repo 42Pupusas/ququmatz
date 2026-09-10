@@ -29,8 +29,28 @@
 //! [`MultishotRecv::record`] therefore reports [`Armed::Finished`] rather
 //! than returning quietly, and the ticket cannot be reused: re-arming means
 //! submitting a new request, which is what the kernel actually requires.
+//!
+//! # The last CQE can still carry data
+//!
+//! "Terminal" and "empty" are also independent. In `io_recv_finish()` the
+//! kernel computes the buffer flags *before* deciding whether the request
+//! continues:
+//!
+//! ```text
+//! cflags |= io_put_kbuf(req, sel->val, sel->buf_list);
+//! if (... && io_req_post_cqe(req, sel->val, cflags | IORING_CQE_F_MORE))
+//!         return true;                    /* stayed armed */
+//! finish:
+//!         io_req_set_res(req, sel->val, cflags);  /* terminal, same cflags */
+//! ```
+//!
+//! When posting the extra CQE fails — a full completion queue — the same
+//! `cflags`, buffer id and all, ride out on the *terminal* CQE instead. So
+//! a `Done` that dropped its payload would lose a pool slot in exactly the
+//! situation where the pool is already under pressure. [`Finished`] carries
+//! that last [`Arrival`] when there is one.
 
-use super::event::{Event, PartialReceipt};
+use super::event::Event;
 use super::identity::{RequestId, RingId};
 use super::request::Receipt;
 use crate::op::Sqe;
@@ -184,21 +204,31 @@ impl MultishotRecv {
             return Err(event);
         }
         match event {
-            Event::Partial(partial) => Ok(Self::deliver(&partial, pool)),
-            Event::Complete(receipt) => Ok(Delivery::Done(Finished { receipt })),
+            Event::Partial(partial) => {
+                let result = partial.raw_result();
+                Ok(Self::claim(partial.buffer_id(), result, pool)
+                    .map_or(Delivery::Empty(result), Delivery::Data))
+            }
+            Event::Complete(receipt) => {
+                let last = Self::claim(receipt.flags().buffer_id(), receipt.raw_result(), pool);
+                Ok(Delivery::Done(Finished { receipt, last }))
+            }
         }
     }
 
-    fn deliver<'pool>(
-        partial: &PartialReceipt,
-        pool: &'pool mut BufferConsumer,
-    ) -> Delivery<'pool> {
-        match (partial.buffer_id(), u32::try_from(partial.raw_result())) {
-            (Some(buf_id), Ok(len)) => Delivery::Data(Arrival { pool, buf_id, len }),
-            // An armed CQE with no buffer or a negative result carries no
-            // slot to recycle; reporting it as an empty arrival would invent
-            // a borrow that does not exist.
-            _ => Delivery::Empty(partial.raw_result()),
+    /// The slot a completion consumed, if it consumed one.
+    ///
+    /// A CQE with no buffer flag or a negative result carries no slot to
+    /// recycle; borrowing the pool for it would invent a borrow that does
+    /// not exist.
+    fn claim(
+        buffer_id: Option<u16>,
+        result: i32,
+        pool: &mut BufferConsumer,
+    ) -> Option<Arrival<'_>> {
+        match (buffer_id, u32::try_from(result)) {
+            (Some(buf_id), Ok(len)) => Some(Arrival { pool, buf_id, len }),
+            _ => None,
         }
     }
 }
@@ -217,7 +247,8 @@ pub enum Delivery<'pool> {
     /// CQE result — a kernel-reported error on an otherwise live request.
     Empty(i32),
     /// The request is over and must be re-submitted to receive again.
-    Done(Finished),
+    /// May still carry a final arrival — see [`Finished::last`].
+    Done(Finished<'pool>),
 }
 
 impl Delivery<'_> {
@@ -231,11 +262,15 @@ impl Delivery<'_> {
     }
 
     /// The arrival's bytes, if this delivery carried any.
+    ///
+    /// A [`Done`](Self::Done) can carry bytes too, when the kernel had to
+    /// fold the last arrival into the terminal CQE.
     #[must_use]
     pub fn bytes(&self) -> Option<&[u8]> {
         match self {
             Self::Data(arrival) => Some(arrival.bytes()),
-            Self::Empty(_) | Self::Done(_) => None,
+            Self::Done(finished) => finished.last().map(Arrival::bytes),
+            Self::Empty(_) => None,
         }
     }
 }
@@ -307,11 +342,30 @@ impl Drop for Arrival<'_> {
 /// [`PreparedMultishot`]; this is deliberately not reusable, because the
 /// kernel requires a fresh request rather than a re-arm of the old one.
 #[derive(Debug)]
-pub struct Finished {
+pub struct Finished<'pool> {
     receipt: Receipt,
+    last: Option<Arrival<'pool>>,
 }
 
-impl Finished {
+impl<'pool> Finished<'pool> {
+    /// The arrival folded into this terminal CQE, if the kernel had to put
+    /// one there.
+    ///
+    /// Normally `None`: an arrival and the end of the request are usually
+    /// separate CQEs. It is `Some` when the kernel could not post the extra
+    /// completion — a full CQ — and finished the request carrying the
+    /// buffer it had already picked. Those bytes are real data, and the
+    /// slot is recycled when the arrival drops.
+    #[must_use]
+    pub const fn last(&self) -> Option<&Arrival<'pool>> {
+        self.last.as_ref()
+    }
+
+    /// Take the final arrival, leaving the reason for finishing behind.
+    #[must_use]
+    pub const fn take_last(&mut self) -> Option<Arrival<'pool>> {
+        self.last.take()
+    }
     /// Raw result of the terminal CQE.
     #[must_use]
     pub const fn raw_result(&self) -> i32 {
@@ -340,9 +394,13 @@ impl Finished {
         }
     }
 
-    /// The terminal receipt, for callers tracking identity themselves.
+    /// Split into the terminal receipt and any final arrival.
+    ///
+    /// Returns both rather than just the receipt: discarding the arrival
+    /// here would drop received bytes on the floor, and the type should not
+    /// make that the quiet default.
     #[must_use]
-    pub const fn into_receipt(self) -> Receipt {
-        self.receipt
+    pub fn into_parts(self) -> (Receipt, Option<Arrival<'pool>>) {
+        (self.receipt, self.last)
     }
 }

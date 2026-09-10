@@ -60,7 +60,10 @@
 //! than a value that owns storage. A terminal CQE means the request is
 //! over and must be re-submitted — [`Delivery::Done`] says so, and the
 //! enum is exhaustive so callers cannot quietly ignore it and leave a
-//! socket deaf.
+//! socket deaf. "Terminal" and "carries a buffer" are independent too: the
+//! kernel folds the last arrival into the terminal CQE when it cannot post
+//! a separate one, so [`Finished`] hands that slot back rather than
+//! dropping it.
 //!
 //! # Abandonment leaks instead of corrupting
 //!

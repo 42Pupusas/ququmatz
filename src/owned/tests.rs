@@ -3,7 +3,7 @@
 extern crate std;
 
 use super::{
-    Completed, Delivery, Direction, Event, MmapBuffer, Pending, PendingZc, Prepared,
+    Arrival, Completed, Delivery, Direction, Event, MmapBuffer, Pending, PendingZc, Prepared,
     PreparedMultishot, PreparedZc, Receipt, RingId, StableBuffer, ZcCompleted,
 };
 use crate::error::{Error, SubmitError};
@@ -628,6 +628,174 @@ fn recycling_returns_slots_so_a_small_pool_outlasts_more_arrivals_than_it_holds(
     assert_eq!(
         total, 24,
         "a two-buffer pool carried six four-byte messages"
+    );
+}
+
+#[test]
+fn a_terminal_completion_can_still_carry_a_buffer_that_must_come_back() {
+    // The kernel computes a recv's buffer flags before it decides whether
+    // the request stays armed (io_recv_finish), so when it cannot post the
+    // extra CQE -- a full completion queue -- the buffer id it already
+    // picked rides out on the *terminal* CQE instead. A `Done` that
+    // dropped its payload would leak that slot precisely when the pool is
+    // under pressure.
+    //
+    // Reproduced by flooding a deliberately tiny CQ: submit many messages
+    // without reaping, so the ring overflows while arrivals are pending.
+    let mut pair = SocketPair::connected();
+    let mut ring = crate::IoUring::new(4).expect("ring");
+    let pool = ring
+        .register_provided_buffers(17, 8, 64)
+        .expect("register pool");
+    let mut pool = pool.split();
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let ticket = sub
+        .push_multishot(PreparedMultishot::recv(
+            pair.server,
+            pool.bgid(),
+            MsgFlags::default(),
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit");
+
+    for _ in 0..32 {
+        pair.write_client(b"flood");
+    }
+    pair.close_client();
+    std::thread::sleep(core::time::Duration::from_millis(50));
+
+    let mut carried = 0usize;
+    let mut bytes = 0usize;
+    let mut ended = false;
+    while !ended {
+        comp.wait(1).expect("wait");
+        while let Some(event) = comp.reap_event() {
+            match ticket.record(event, &mut pool).expect("our request") {
+                Delivery::Data(arrival) => bytes += arrival.bytes().len(),
+                Delivery::Empty(_) => {}
+                Delivery::Done(finished) => {
+                    if let Some(last) = finished.last() {
+                        carried += 1;
+                        bytes += last.bytes().len();
+                    }
+                    ended = true;
+                    break;
+                }
+            }
+        }
+        comp.sync();
+    }
+    comp.sync();
+
+    assert!(bytes > 0, "the flood delivered data");
+    // Whether the kernel actually had to fold is its decision and depends
+    // on timing, so this asserts the accounting stays sane either way --
+    // `Finished::last` is checked deterministically by the unit test below.
+    assert!(
+        carried <= 1,
+        "at most one terminal CQE, so at most one fold"
+    );
+}
+
+#[test]
+fn a_finished_multishot_hands_back_the_slot_folded_into_its_last_cqe() {
+    // The kernel-driven test above cannot force CQ overflow deterministically,
+    // so the recycling contract is pinned here from a synthesised terminal
+    // CQE that carries a buffer id, which is exactly what the kernel emits
+    // when io_req_post_cqe fails.
+    let pair = SocketPair::connected();
+    let mut ring = crate::IoUring::new(8).expect("ring");
+    let pool = ring
+        .register_provided_buffers(19, 2, 32)
+        .expect("register pool");
+    let mut pool = pool.split();
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let ticket = sub
+        .push_multishot(PreparedMultishot::recv(
+            pair.server,
+            pool.bgid(),
+            MsgFlags::default(),
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let buf_id = 1u16;
+    let terminal = Event::Complete(super::request::Receipt {
+        ring: ticket.ring(),
+        id: ticket.id(),
+        result: 5,
+        flags: crate::types::CqeFlags::from_raw(
+            crate::types::CqeFlags::BUFFER.bits() | (u32::from(buf_id) << 16),
+        ),
+    });
+
+    // Scoped so the first borrow of the pool ends before the second
+    // delivery asks for it -- the same exclusivity the compile-fail
+    // fixture pins.
+    {
+        let delivery = ticket.record(terminal, &mut pool).expect("our request");
+        assert!(!delivery.armed().is_armed(), "terminal means not armed");
+        let Delivery::Done(mut finished) = delivery else {
+            panic!("a terminal CQE is a Done");
+        };
+        let last = finished.take_last().expect("the folded arrival");
+        assert_eq!(last.buffer_id(), buf_id, "the id the kernel chose");
+        assert_eq!(last.len(), 5, "the bytes it wrote");
+    }
+
+    // The slot is back: a second delivery can claim it again.
+    let again = Event::Complete(super::request::Receipt {
+        ring: ticket.ring(),
+        id: ticket.id(),
+        result: 5,
+        flags: crate::types::CqeFlags::from_raw(
+            crate::types::CqeFlags::BUFFER.bits() | (u32::from(buf_id) << 16),
+        ),
+    });
+    let Delivery::Done(second) = ticket.record(again, &mut pool).expect("our request") else {
+        panic!("a terminal CQE is a Done");
+    };
+    assert_eq!(
+        second.last().map(Arrival::buffer_id),
+        Some(buf_id),
+        "the recycled slot is usable again"
+    );
+}
+
+#[test]
+fn a_terminal_completion_without_a_buffer_carries_no_arrival() {
+    // The ordinary case: ENOBUFS or EOF ends the request with no slot to
+    // return, and inventing one would be a borrow that does not exist.
+    let pair = SocketPair::connected();
+    let mut ring = crate::IoUring::new(8).expect("ring");
+    let pool = ring
+        .register_provided_buffers(23, 2, 32)
+        .expect("register pool");
+    let mut pool = pool.split();
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let ticket = sub
+        .push_multishot(PreparedMultishot::recv(
+            pair.server,
+            pool.bgid(),
+            MsgFlags::default(),
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let enobufs = Event::Complete(super::request::Receipt {
+        ring: ticket.ring(),
+        id: ticket.id(),
+        result: -105,
+        flags: crate::types::CqeFlags::default(),
+    });
+    let Delivery::Done(finished) = ticket.record(enobufs, &mut pool).expect("our request") else {
+        panic!("a terminal CQE is a Done");
+    };
+    assert!(finished.last().is_none(), "no buffer flag, no arrival");
+    assert!(
+        finished.result().is_err(),
+        "ENOBUFS is reported as an error"
     );
 }
 
