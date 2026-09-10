@@ -18,10 +18,12 @@ use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::boxed::Box;
 use std::vec::Vec;
 
+use super::direct::{PendingDirectOpen, PreparedDirectOpen};
 use super::event::PartialReceipt;
 use super::identity::{RequestId, RequestIdSource, RingId};
 use super::open::{PendingOpen, PreparedOpen};
 use super::path::OwnedPath;
+use super::slot::SlotTarget;
 use super::vectored::{PendingVectored, PreparedVectored};
 use super::zerocopy::{PendingZc, PreparedZc};
 use super::{Direction, Pending, Prepared, Receipt, StableBuffer, StableBufferMut};
@@ -279,6 +281,14 @@ impl Lifecycle {
         &self,
         prepared: PreparedOpen<S>,
     ) -> (FakeKernel, PendingOpen<S>) {
+        let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
+        (FakeKernel::holding(sqe), pending)
+    }
+
+    fn submit_direct_open<S: StableBuffer>(
+        &self,
+        prepared: PreparedDirectOpen<S>,
+    ) -> (FakeKernel, PendingDirectOpen<S>) {
         let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
         (FakeKernel::holding(sqe), pending)
     }
@@ -919,6 +929,111 @@ fn reclaiming_an_unpublished_open_returns_the_path_and_its_target() {
     assert_eq!(recovered.path().as_bytes(), b"/tmp/retry");
     assert_eq!(recovered.flags(), OpenFlags::CREAT | OpenFlags::RDWR);
     assert_eq!(recovered.mode(), FileMode::OWNER_WRITE);
+    drop(recovered.into_path().into_storage());
+}
+
+/// Prepare a direct open, unwrapping the `O_CLOEXEC` refusal.
+fn direct_open(text: &[u8], target: SlotTarget) -> PreparedDirectOpen<HeapBuffer> {
+    PreparedDirectOpen::cwd(
+        heap_path(text),
+        OpenFlags::default(),
+        FileMode::default(),
+        target,
+    )
+    .ok()
+    .expect("no O_CLOEXEC")
+}
+
+#[test]
+fn a_direct_opens_path_is_scanned_within_the_storage_the_ticket_owns() {
+    let cycle = Lifecycle::new();
+    let (kernel, pending) = cycle.submit_direct_open(direct_open(b"/etc/hosts", SlotTarget::Auto));
+
+    // The path is read exactly as for an ordinary open — unbounded, stopped
+    // only by the NUL — so the same scan is worth checking on this path.
+    assert_eq!(kernel.resolve_path(), b"/etc/hosts");
+
+    let opened = pending
+        .redeem(kernel.post_open(cycle.ring, 3))
+        .ok()
+        .expect("receipt matches");
+    assert!(opened.is_ok());
+    let (slot, path) = opened.into_parts();
+    // An auto target reads its index out of the result.
+    assert_eq!(slot.expect("slot").index().get(), 3);
+    assert_eq!(path.as_bytes(), b"/etc/hosts");
+    drop(path.into_storage());
+}
+
+#[test]
+fn a_direct_slot_needs_no_descriptor_to_be_released() {
+    let cycle = Lifecycle::new();
+    let (kernel, pending) =
+        cycle.submit_direct_open(direct_open(b"/tmp/slotted", SlotTarget::Auto));
+
+    let opened = pending
+        .redeem(kernel.post_open(cycle.ring, 2))
+        .ok()
+        .expect("receipt matches");
+    let (slot, path) = opened.into_parts();
+
+    // The contrast with `PendingOpen` is the point: a `File` must be
+    // consumed with `into_fd` here or its destructor would close a
+    // descriptor this fake kernel never opened. A slot has no destructor
+    // at all, because releasing one means asking the ring — so simply
+    // dropping it is well-defined, and Miri's leak checker stays quiet.
+    //
+    // `drop_non_drop` firing here is the assertion: clippy is confirming
+    // that `DirectSlot` has nothing to run.
+    #[allow(clippy::drop_non_drop)]
+    drop(slot);
+    drop(path.into_storage());
+}
+
+#[test]
+fn an_abandoned_direct_open_leaks_its_path_like_any_other_ticket() {
+    let cycle = Lifecycle::new();
+    // From the allocation itself, not through the narrower `as_bytes()`
+    // borrow, which cannot be used to free the whole block.
+    let mut storage = HeapBuffer::with_capacity(64);
+    storage.as_mut_slice().fill(0xFF);
+    let leaked = (storage.ptr, storage.len);
+    let path = OwnedPath::copy_into(storage, b"/tmp/dropped")
+        .ok()
+        .expect("storage fits");
+    let prepared = PreparedDirectOpen::cwd(
+        path,
+        OpenFlags::default(),
+        FileMode::default(),
+        SlotTarget::exact(1).expect("representable"),
+    )
+    .ok()
+    .expect("no O_CLOEXEC");
+    let (kernel, pending) = cycle.submit_direct_open(prepared);
+
+    drop(pending);
+    // The kernel is still resolving the path the abandoned ticket owned.
+    assert_eq!(kernel.resolve_path(), b"/tmp/dropped");
+
+    // SAFETY: the abandoned ticket leaked this and the stand-in kernel has
+    // finished, so nothing else can reach it.
+    unsafe { HeapBuffer::reclaim_leaked(leaked.0, leaked.1) };
+}
+
+#[test]
+fn reclaiming_an_unpublished_direct_open_keeps_its_target() {
+    let cycle = Lifecycle::new();
+    let target = SlotTarget::exact(4).expect("representable");
+    let (_kernel, pending) = cycle.submit_direct_open(direct_open(b"/tmp/again", target));
+
+    // SAFETY: this SQE was never published, so the kernel holds no pointer
+    // into the path storage.
+    let recovered = unsafe { pending.reclaim_unsubmitted() };
+
+    // The target has to survive: a retry that lost it would install the
+    // file into a different slot, or ask the kernel to choose one.
+    assert_eq!(recovered.target(), target);
+    assert_eq!(recovered.path().as_bytes(), b"/tmp/again");
     drop(recovered.into_path().into_storage());
 }
 

@@ -421,11 +421,54 @@ retry that lost its flags would open the same path differently.
 `tests/ui/an_in_flight_path_is_unreachable.rs` pins that the path is
 unreachable in flight and that its bytes cannot be rewritten.
 
+**Direct open.** Covered by `PreparedDirectOpen` / `PendingDirectOpen` /
+`DirectOpened` in `src/owned/direct.rs`, with the slot vocabulary in
+`src/owned/slot.rs`. This is the third ownership story: the result is
+neither borrowed storage nor an owned descriptor, but an **index into one
+ring's registered-file table**. `io_openat` with a `file_index` calls
+`io_install_fixed_file`, which puts the file in the ring's table and never
+calls `fd_install`, so no descriptor enters the process at all.
+
+That changes what release means. A `DirectSlot` has no `Drop` and cannot
+have one: freeing a slot means submitting to the ring, which the value does
+not hold. Dropping one leaves the file installed until the slot is
+overwritten or the ring is torn down. That is a milder leak than an
+abandoned `File` and the difference is worth stating precisely — a leaked
+descriptor lives as long as the *process*, a leaked slot dies with the
+*ring*. `#[must_use]` says so at the call site, and a compile-fail fixture
+pins that a slot cannot be converted into a `File` or a `Socket`.
+
+The encoding is where a guess would have been wrong, so it came from
+`io_uring/openclose.c` rather than memory. `sqe->file_index` is a three-way
+overload: `0` means "not a direct operation", `IORING_FILE_INDEX_ALLOC`
+(`u32::MAX`) means "kernel picks a slot", and anything else is
+`slot + 1`. `SlotIndex` therefore refuses `u32::MAX` and `u32::MAX - 1`,
+the two values whose successors are unrepresentable, so a nameable index
+can never collide with the sentinel.
+
+Resolving the index has a matching trap. `io_install_fixed_file` returns
+`0` on success for an explicit slot, so believing the CQE result would
+report every explicitly-placed file as landing in slot 0. Only
+`SlotTarget::Auto` reads its index from the result; `Exact` keeps the index
+the caller named.
+
+The test for that was initially too weak to catch it. It asserted the
+reported index matched the target, which holds even with the `+1` encoding
+removed — it was checking my arithmetic against itself. The version that
+fails on sabotage writes through the slot the caller was *told* about, and
+gets `EBADF` when the file actually landed one slot lower.
+
+Fourteen tests: four real-kernel (installation into an explicit slot then a
+write through it, an out-of-range slot refused, a direct open without a
+registered table failing rather than leaking a descriptor, and a foreign
+receipt rejected), nine on the encoding and resolution rules, and four
+under Miri including the abandonment path.
+
 **Scope limits.** `statx` still goes through the `unsafe` constructors and
-needs its own owned request type. The direct (registered-file-table)
-accept and open variants are also unmodelled: they yield table indices
-rather than descriptors, which is a third ownership story again. The
-`unsafe` `Sqe` surface remains for those and for lock-free users.
+needs its own owned request type. Direct **accept** and **socket** are also
+still unmodelled — they share the slot vocabulary now in place, so they are
+a smaller step than direct open was, but they are not done. The `unsafe`
+`Sqe` surface remains for those and for lock-free users.
 
 **Status (original): confirmed.**
 

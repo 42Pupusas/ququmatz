@@ -143,6 +143,7 @@
 
 mod accept;
 mod buffer;
+mod direct;
 mod event;
 mod identity;
 mod multishot;
@@ -150,6 +151,7 @@ mod open;
 mod path;
 mod queue;
 mod request;
+mod slot;
 mod vectored;
 mod zerocopy;
 
@@ -165,6 +167,7 @@ mod miri;
 
 pub use accept::{AcceptFinished, Incoming, MultishotAccept, PreparedAccept};
 pub use buffer::{MmapBuffer, StableBuffer, StableBufferMut};
+pub use direct::{DirectOpenError, DirectOpened, PendingDirectOpen, PreparedDirectOpen};
 pub use event::{Event, PartialReceipt};
 pub use identity::{RequestId, RingId};
 pub use multishot::{Armed, Arrival, Delivery, Finished, MultishotRecv, PreparedMultishot};
@@ -172,5 +175,6 @@ pub use open::{Opened, PendingOpen, PreparedOpen};
 pub use path::{OwnedPath, PathError};
 pub use queue::{OwnedCompleter, OwnedSubmitter};
 pub use request::{Completed, Direction, Pending, Prepared, Receipt};
+pub use slot::{DirectSlot, SlotIndex, SlotTarget};
 pub use vectored::{PendingVectored, PreparedVectored, VectoredCompleted, VectoredError};
 pub use zerocopy::{PendingZc, PreparedZc, ZcCompleted};

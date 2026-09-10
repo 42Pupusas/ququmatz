@@ -3,9 +3,10 @@
 extern crate std;
 
 use super::{
-    Arrival, Completed, Delivery, Direction, Event, Incoming, MmapBuffer, OwnedPath, PathError,
-    Pending, PendingZc, Prepared, PreparedAccept, PreparedMultishot, PreparedOpen,
-    PreparedVectored, PreparedZc, Receipt, RingId, StableBuffer, VectoredError, ZcCompleted,
+    Arrival, Completed, Delivery, DirectOpenError, DirectSlot, Direction, Event, Incoming,
+    MmapBuffer, OwnedPath, PathError, Pending, PendingZc, Prepared, PreparedAccept,
+    PreparedDirectOpen, PreparedMultishot, PreparedOpen, PreparedVectored, PreparedZc, Receipt,
+    RingId, SlotIndex, SlotTarget, StableBuffer, VectoredError, ZcCompleted,
 };
 use crate::error::{Error, SubmitError};
 use crate::net::Socket;
@@ -1567,6 +1568,279 @@ fn an_open_push_that_does_not_fit_hands_the_path_back() {
     assert_eq!(returned.mode(), FileMode::OWNER_READ);
     assert!(matches!(returned.dir(), DirFd::Cwd));
     tickets.clear();
+}
+
+/// A ring with a sparse file table of `slots` entries.
+///
+/// `-1` means an empty slot: the table exists so the kernel has somewhere
+/// to install, but holds no files yet.
+#[cfg(not(miri))]
+fn ring_with_table(entries: u32, slots: usize) -> crate::IoUring {
+    let mut ring = crate::IoUring::new(entries).expect("ring");
+    ring.register_files(&std::vec![-1; slots])
+        .expect("register a sparse file table");
+    ring
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_direct_open_installs_into_the_table_without_touching_the_process() {
+    let ring = ring_with_table(4, 4);
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let request = PreparedDirectOpen::cwd(
+        path_of(b"/tmp"),
+        OpenFlags::TMPFILE | OpenFlags::RDWR,
+        FileMode::OWNER_READ | FileMode::OWNER_WRITE,
+        SlotTarget::Auto,
+    )
+    .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_direct_open(request)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let opened = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert!(
+        opened.is_ok(),
+        "direct open failed: {}",
+        opened.raw_result()
+    );
+
+    let slot = opened.slot().expect("a successful open names a slot");
+    // The first free slot of an empty table is 0. No descriptor could be 0
+    // here — that is stdin, still open — so a result of 0 is itself
+    // evidence the kernel installed into the table rather than handing
+    // this process a descriptor.
+    assert_eq!(slot.index().get(), 0);
+    assert_eq!(slot.as_fixed_fd(), 0);
+
+    // The file is real: write through the slot, which only resolves
+    // because `fixed_file` makes the kernel read `fd` as a table index.
+    sub.raw()
+        .push(
+            unsafe { crate::Sqe::write_ptr(RawFd::from_raw(0), b"proof".as_ptr(), 5, 0) }
+                .fixed_file()
+                .user_data(9),
+        )
+        .expect("push");
+    sub.submit_and_wait(1).expect("submit");
+    let done = comp.wait_one().expect("completion");
+    assert_eq!(done.raw_result(), 5, "the installed file must be writable");
+}
+
+#[cfg(not(miri))]
+#[test]
+fn an_exact_slot_reports_where_the_caller_asked_not_what_the_cqe_says() {
+    let ring = ring_with_table(4, 4);
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let request = PreparedDirectOpen::cwd(
+        path_of(b"/tmp"),
+        OpenFlags::TMPFILE | OpenFlags::RDWR,
+        FileMode::OWNER_READ | FileMode::OWNER_WRITE,
+        SlotTarget::exact(2).expect("representable"),
+    )
+    .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_direct_open(request)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let opened = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert!(
+        opened.is_ok(),
+        "direct open failed: {}",
+        opened.raw_result()
+    );
+
+    // The kernel returns 0 for an explicit install, so a completion that
+    // believed its result would report slot 0 for a file that is in slot 2.
+    assert_eq!(opened.raw_result(), 0);
+    assert_eq!(opened.index().expect("slot").get(), 2);
+
+    // Reading the index back off the target proves nothing on its own — it
+    // is this crate's arithmetic checked against itself. The kernel is the
+    // only authority on where the file actually landed, so ask it: write
+    // through slot 2 and through slot 1. Exactly one must be occupied, and
+    // it must be the one the caller was told about. If the submission-time
+    // `+1` were dropped, the file would sit in slot 1 and these two
+    // assertions would swap.
+    let write_through = |sub: &mut super::OwnedSubmitter,
+                         comp: &mut super::OwnedCompleter,
+                         slot| {
+        sub.raw()
+            .push(
+                unsafe { crate::Sqe::write_ptr(RawFd::from_raw(slot), b"proof".as_ptr(), 5, 0) }
+                    .fixed_file()
+                    .user_data(1),
+            )
+            .expect("push");
+        sub.submit_and_wait(1).expect("submit");
+        comp.wait_one().expect("completion").raw_result()
+    };
+    assert_eq!(
+        write_through(&mut sub, &mut comp, 2),
+        5,
+        "the file must be in the slot the caller asked for"
+    );
+    assert_eq!(
+        write_through(&mut sub, &mut comp, 1),
+        -9,
+        "EBADF: the neighbouring slot must still be empty"
+    );
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_direct_open_without_a_registered_table_fails_instead_of_leaking_an_fd() {
+    // No `register_files`: there is no table to install into.
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let request = PreparedDirectOpen::cwd(
+        path_of(b"/tmp"),
+        OpenFlags::TMPFILE | OpenFlags::RDWR,
+        FileMode::OWNER_READ | FileMode::OWNER_WRITE,
+        SlotTarget::Auto,
+    )
+    .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_direct_open(request)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let opened = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert!(!opened.is_ok(), "an absent table must not succeed");
+    assert!(opened.slot().is_none(), "a failure names no slot");
+    // The path still comes back, as with any other failed request.
+    let (slot, path) = opened.into_parts();
+    assert!(slot.is_none());
+    assert_eq!(path.as_bytes(), b"/tmp");
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_slot_outside_the_table_is_refused_by_the_kernel() {
+    let ring = ring_with_table(4, 2);
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let request = PreparedDirectOpen::cwd(
+        path_of(b"/tmp"),
+        OpenFlags::TMPFILE | OpenFlags::RDWR,
+        FileMode::OWNER_READ | FileMode::OWNER_WRITE,
+        SlotTarget::exact(9).expect("representable"),
+    )
+    .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_direct_open(request)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let opened = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    // EINVAL: the slot is past the end of a two-entry table.
+    assert_eq!(opened.raw_result(), -22);
+    assert!(opened.slot().is_none());
+}
+
+#[test]
+fn close_on_exec_is_refused_before_submission_with_the_path_returned() {
+    let path = path_of(b"/tmp/whatever");
+    let addr = path.as_bytes().as_ptr();
+    // The kernel answers EINVAL for this combination, because O_CLOEXEC
+    // describes what execve does to a descriptor and a slot is not one.
+    let Err((returned, e)) = PreparedDirectOpen::cwd(
+        path,
+        OpenFlags::RDWR | OpenFlags::CLOEXEC,
+        FileMode::default(),
+        SlotTarget::Auto,
+    ) else {
+        panic!("O_CLOEXEC must be refused for a direct open");
+    };
+    assert_eq!(e, DirectOpenError::CloseOnExec);
+    assert_eq!(returned.as_bytes().as_ptr(), addr, "the path comes back");
+}
+
+#[test]
+fn a_direct_open_push_that_does_not_fit_hands_everything_back() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut tickets = alloc_tickets(&mut sub);
+    let path = path_of(b"/tmp/wherever");
+    let addr = path.as_bytes().as_ptr();
+    let target = SlotTarget::exact(3).expect("representable");
+
+    let request = PreparedDirectOpen::cwd(path, OpenFlags::CREAT, FileMode::OWNER_READ, target)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let Err((returned, e)) = sub.push_direct_open(request) else {
+        panic!("a full queue must reject the push");
+    };
+    assert_eq!(e, Error::Submit(SubmitError::QueueFull));
+    // Every field survives, the target included: a retry that lost it
+    // would install the file somewhere else entirely.
+    assert_eq!(returned.path().as_bytes().as_ptr(), addr);
+    assert_eq!(returned.flags(), OpenFlags::CREAT);
+    assert_eq!(returned.mode(), FileMode::OWNER_READ);
+    assert_eq!(returned.target(), target);
+    tickets.clear();
+}
+
+#[test]
+fn a_direct_open_receipt_for_another_request_is_rejected() {
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let prepare = || {
+        PreparedDirectOpen::cwd(
+            path_of(b"/tmp"),
+            OpenFlags::default(),
+            FileMode::default(),
+            SlotTarget::Auto,
+        )
+        .unwrap_or_else(|(_, e)| panic!("{e}"))
+    };
+    let first = sub
+        .push_direct_open(prepare())
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let second = sub
+        .push_direct_open(prepare())
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let foreign = Receipt {
+        ring: second.ring(),
+        id: second.id(),
+        result: 0,
+        flags: crate::types::CqeFlags::default(),
+    };
+    assert!(!first.matches(&foreign));
+    let Err((first, _)) = first.redeem(foreign) else {
+        panic!("a foreign receipt must not redeem");
+    };
+    // Neither is redeemed, so both leak their path storage on purpose.
+    drop((first, second));
+}
+
+#[test]
+fn a_slot_from_one_ring_is_not_confused_with_anothers() {
+    let mine = RingId::next();
+    let other = RingId::next();
+    let slot = DirectSlot::new(SlotIndex::new(1).expect("index"), mine);
+    // Slot 1 of two different rings names two different files.
+    assert!(slot.belongs_to(mine));
+    assert!(!slot.belongs_to(other));
 }
 
 #[test]

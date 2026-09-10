@@ -284,6 +284,38 @@ impl Sqe {
         Self(sqe)
     }
 
+    /// Prepare an `openat` that installs into the ring's file table.
+    ///
+    /// Unlike [`openat`](Self::openat) the kernel never gives this process
+    /// a descriptor. It installs the file into a slot of the registered
+    /// file table and the CQE reports the slot index (for
+    /// [`SlotTarget::Auto`](crate::owned::SlotTarget)) or `0` (exact), so no fd
+    /// to close and nothing leaks into the process's descriptor table.
+    ///
+    /// `O_CLOEXEC` is rejected by the kernel here with `EINVAL`: the flag
+    /// describes what `execve` does to a descriptor, and a table slot is
+    /// not one.
+    ///
+    /// Requires a registered file table — see
+    /// [`IoUring::register_files`](crate::IoUring::register_files).
+    ///
+    /// # Safety
+    ///
+    /// `path` must be a valid, null-terminated C string that remains valid
+    /// until the operation completes.
+    #[must_use]
+    pub unsafe fn openat_direct(
+        dfd: i32,
+        path: *const u8,
+        flags: OpenFlags,
+        mode: FileMode,
+        slot: i32,
+    ) -> Self {
+        let mut sqe = unsafe { Self::openat_ptr(dfd, path, flags, mode) };
+        sqe.0.splice_fd_in = slot;
+        sqe
+    }
+
     /// Prepare an openat2 operation.
     ///
     /// Like `openat` but accepts an [`OpenHow`] struct for extended control

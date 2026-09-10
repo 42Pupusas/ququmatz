@@ -2,6 +2,7 @@
 
 use super::accept::{MultishotAccept, PreparedAccept};
 use super::buffer::{StableBuffer, StableBufferMut};
+use super::direct::{PendingDirectOpen, PreparedDirectOpen};
 use super::event::{Event, PartialReceipt};
 use super::identity::{RequestIdSource, RingId};
 use super::multishot::{MultishotRecv, PreparedMultishot};
@@ -162,6 +163,41 @@ impl OwnedSubmitter {
             // the path pointer and reclaiming the storage is sound.
             Err(e) => Err((Self::reclaim_open(pending), e)),
         }
+    }
+
+    /// Queue a direct open, taking ownership of its path storage.
+    ///
+    /// Unlike [`push_open`](Self::push_open) the completion yields a
+    /// [`DirectSlot`](super::DirectSlot) rather than a descriptor: the file
+    /// is installed into this ring's registered file table and never enters
+    /// the process's descriptor table at all.
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact,
+    /// still owning its path storage.
+    pub fn push_direct_open<S: StableBuffer>(
+        &mut self,
+        request: PreparedDirectOpen<S>,
+    ) -> Result<PendingDirectOpen<S>, (PreparedDirectOpen<S>, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            // The SQE never became kernel-visible, so the kernel never saw
+            // the path pointer and reclaiming the storage is sound.
+            Err(e) => Err((Self::reclaim_direct_open(pending), e)),
+        }
+    }
+
+    /// Undo a direct-open push that the kernel never observed.
+    fn reclaim_direct_open<S: StableBuffer>(
+        pending: PendingDirectOpen<S>,
+    ) -> PreparedDirectOpen<S> {
+        // SAFETY: only reached when `Submitter::push` reported the queue was
+        // full, which happens before the SQE is written or the tail is
+        // advanced. No kernel-visible pointer to the path exists.
+        unsafe { pending.reclaim_unsubmitted() }
     }
 
     /// Undo an open push that the kernel never observed.

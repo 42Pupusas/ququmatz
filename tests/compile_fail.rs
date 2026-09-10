@@ -71,6 +71,17 @@ fn an_in_flight_path_cannot_be_read_or_rewritten() {
     t.compile_fail("tests/ui/an_in_flight_path_is_unreachable.rs");
 }
 
+/// A direct open produces a third kind of resource: a slot in the ring's
+/// file table, which is neither a borrowed pool buffer nor a descriptor
+/// this process owns. The distinction has to be a type error rather than a
+/// convention, because the three are released in three different ways —
+/// recycled, closed, or handed back to the ring.
+#[test]
+fn a_table_slot_cannot_be_mistaken_for_a_descriptor() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/a_direct_slot_is_not_a_descriptor.rs");
+}
+
 /// An accepted connection is owned rather than borrowed, so the compiler
 /// cannot tie it to a pool the way it does an arrival. What it can do is
 /// refuse to let the result be thrown away unread, which is the failure

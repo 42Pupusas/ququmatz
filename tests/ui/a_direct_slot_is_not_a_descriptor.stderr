@@ -1,0 +1,23 @@
+error[E0599]: no method named `into_file` found for struct `DirectOpened<S>` in the current scope
+  --> tests/ui/a_direct_slot_is_not_a_descriptor.rs:10:12
+   |
+10 |     opened.into_file()
+   |            ^^^^^^^^^ method not found in `DirectOpened<MmapBuffer>`
+
+error[E0599]: no method named `into_socket` found for struct `DirectOpened<S>` in the current scope
+  --> tests/ui/a_direct_slot_is_not_a_descriptor.rs:15:12
+   |
+15 |     opened.into_socket()
+   |            ^^^^^^^^^^^ method not found in `DirectOpened<MmapBuffer>`
+
+error[E0599]: no method named `path` found for reference `&PendingDirectOpen<MmapBuffer>` in the current scope
+  --> tests/ui/a_direct_slot_is_not_a_descriptor.rs:21:20
+   |
+21 |     let _ = ticket.path();
+   |                    ^^^^ private field, not a method
+
+error[E0599]: no method named `into_path` found for struct `PendingDirectOpen<S>` in the current scope
+  --> tests/ui/a_direct_slot_is_not_a_descriptor.rs:26:20
+   |
+26 |     let _ = ticket.into_path();
+   |                    ^^^^^^^^^ method not found in `PendingDirectOpen<MmapBuffer>`
