@@ -103,6 +103,31 @@ bitflags! {
 }
 
 bitflags! {
+    /// Flags the kernel writes *back* into `msg_flags` after a `recvmsg`.
+    ///
+    /// These are an output, not an input: a value set in `msg_flags`
+    /// before submission is overwritten and ignored, which is why they are
+    /// a separate type from [`MsgFlags`] rather than more constants on it.
+    ///
+    /// [`TRUNC`](Self::TRUNC) is the one that matters. A datagram longer
+    /// than the supplied buffers is delivered truncated and the CQE result
+    /// is the number of bytes *kept*, which is indistinguishable from a
+    /// short datagram that arrived whole. Only this flag says the rest was
+    /// discarded.
+    pub struct MsgOutFlags(u32);
+    /// Out-of-band data (`MSG_OOB`).
+    const OOB = 0x1;
+    /// Control data was discarded for lack of room (`MSG_CTRUNC`).
+    const CTRUNC = 0x8;
+    /// Payload was discarded for lack of room (`MSG_TRUNC`).
+    const TRUNC = 0x20;
+    /// This read ends a record (`MSG_EOR`).
+    const EOR = 0x80;
+    /// The message came from the socket error queue (`MSG_ERRQUEUE`).
+    const ERRQUEUE = 0x2000;
+}
+
+bitflags! {
     /// Accept flags (same as socket flags that make sense for accept4).
     ///
     /// Use `AcceptFlags::default()` for no flags.
@@ -126,7 +151,7 @@ bitflags! {
 }
 
 /// IPv4 socket address.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct SockAddrIn {
     pub sin_family: u16,

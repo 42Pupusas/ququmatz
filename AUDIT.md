@@ -655,13 +655,37 @@ kernel's own. None of those is reachable through the owned API —
 `ResolveFlags` is a named-bit type, and `how_size` is written by the crate
 rather than chosen.
 
+`sendmsg` closes the nested-pointer case this finding's acceptance
+criteria name explicitly. It is the first owned request where the
+addresses the kernel dereferences are not SQE fields at all: the SQE names
+a `struct msghdr`, and the kernel reads *that* to find the `iovec` array
+and the destination address before following either to the data. Three
+regions chained by pointers that live in caller memory. The header, the
+descriptors, and the address are staged in one caller-supplied region
+checked once for size and alignment; the payload buffers stay inline under
+`StableBuffer`. Miri exercises the whole chain by reading the header and
+following its own `msg_iov`, so a freed staging region is a dangling-
+pointer error rather than a wrong byte.
+
+Measured while building it: `recvmsg` **writes back** into the caller's
+`msghdr`, making it the first region the kernel both reads and writes, and
+truncation is invisible in the CQE result — an 11-byte datagram delivered
+into a 2-byte buffer reports `2`, indistinguishable from a 2-byte datagram
+that arrived whole, with only the written-back `MSG_TRUNC` saying
+otherwise. `MsgOutFlags` exists as a separate output-only type for that
+reason. The written-back `msg_namelen` can also exceed the buffer the
+caller supplied, so it cannot be trusted to slice the address region.
+
 **Scope limits.** The owned layer now covers read/write, vectored I/O,
-zero-copy send, multishot recv and accept, `openat`, `openat2`, direct
-open, direct accept, direct socket, `statx`, `renameat`, `unlinkat`, and
-`mkdirat`. `epoll_ctl`, `files_update`, `timeout`, and the `msghdr`-based
-send/recv still go through the `unsafe` `Sqe` surface, which remains for
-lock-free users. Neither direct accept nor direct socket has Miri coverage:
-neither owns userspace storage, so there is no pointer lifetime to model.
+zero-copy send, `sendmsg`, multishot recv and accept, `openat`, `openat2`,
+direct open, direct accept, direct socket, `statx`, `renameat`,
+`unlinkat`, and `mkdirat`. `epoll_ctl`, `files_update`, `timeout`, and
+`recvmsg` still go through the `unsafe` `Sqe` surface, which remains for
+lock-free users. `recvmsg` is the larger remaining piece: its header is an
+output as well as an input, so the completed state has to expose what the
+kernel wrote rather than only what was staged. Neither direct accept nor
+direct socket has Miri coverage: neither owns userspace storage, so there
+is no pointer lifetime to model.
 
 **Status (original): confirmed.**
 

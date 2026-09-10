@@ -7,18 +7,18 @@ extern crate std;
 use super::PathOpKind;
 use super::{
     Arrival, Completed, Delivery, DirectIncoming, DirectOpenError, DirectSlot, DirectSocketError,
-    Direction, Event, Incoming, MmapBuffer, Openat2Error, Openat2Mode, OwnedPath, PathError,
-    Pending, PendingStatx, PendingZc, Prepared, PreparedAccept, PreparedDirectAccept,
+    Direction, Event, Incoming, MmapBuffer, MsgRegionError, Openat2Error, Openat2Mode, OwnedPath,
+    PathError, Pending, PendingStatx, PendingZc, Prepared, PreparedAccept, PreparedDirectAccept,
     PreparedDirectOpen, PreparedDirectSocket, PreparedMultishot, PreparedOpen, PreparedOpenat2,
-    PreparedPathOp, PreparedRename, PreparedStatx, PreparedVectored, PreparedZc, Receipt,
-    RenameMode, RingId, SlotIndex, SlotTarget, StableBuffer, StatxError, VectoredError,
-    ZcCompleted,
+    PreparedPathOp, PreparedRename, PreparedSendmsg, PreparedStatx, PreparedVectored, PreparedZc,
+    Receipt, RenameMode, RingId, SendTarget, SlotIndex, SlotTarget, StableBuffer, StatxError,
+    VectoredError, ZcCompleted,
 };
 use crate::error::{Error, SubmitError};
 use crate::net::Socket;
 use crate::types::{
     AcceptFlags, AddressFamily, DirFd, FileMode, MsgFlags, OpenFlags, RawFd, ResolveFlags,
-    SocketFlags, SocketType, Statx, StatxFlags, StatxMask,
+    SockAddrIn, SocketFlags, SocketType, Statx, StatxFlags, StatxMask,
 };
 
 /// Static proof that a ticket crosses a thread boundary. The whole design
@@ -3542,6 +3542,379 @@ fn an_openat2_receipt_for_another_request_is_rejected() {
         panic!("a foreign receipt must not redeem");
     };
     drop((first, second));
+}
+
+/// Staging storage for a `sendmsg`/`recvmsg` header, its descriptors, and
+/// its address, sized exactly rather than generously so a layout that grew
+/// would be caught rather than absorbed by slack.
+fn msg_region<const N: usize>() -> MmapBuffer {
+    let needed = core::mem::size_of::<crate::types::MsgHdr>()
+        + core::mem::size_of::<crate::types::IoVec>() * N
+        + core::mem::size_of::<SockAddrIn>();
+    MmapBuffer::with_capacity(needed).expect("map")
+}
+
+/// A buffer holding exactly `bytes`, for gathering into a message.
+fn filled(bytes: &[u8]) -> MmapBuffer {
+    let mut buf = MmapBuffer::with_capacity(bytes.len()).expect("map");
+    buf.as_mut_slice().copy_from_slice(bytes);
+    buf
+}
+
+#[test]
+fn the_header_names_the_staged_descriptors_before_any_sqe_names_it() {
+    let region = msg_region::<2>();
+    let lo = region.stable_ptr().addr();
+    let hi = lo + region.stable_len();
+
+    let prepared = PreparedSendmsg::new(
+        RawFd::from_raw(3),
+        [filled(b"aa"), filled(b"bbbb")],
+        region,
+        SendTarget::Connected,
+        MsgFlags::default(),
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+
+    // The kernel learns the descriptor array's address from bytes inside
+    // the header, so that address must point into storage the ticket owns
+    // rather than anywhere else.
+    let hdr = prepared.published_header();
+    assert_eq!(hdr.msg_iovlen, 2);
+    let array = hdr.msg_iov.addr();
+    assert!(
+        array >= lo && array < hi,
+        "the header must name an array inside the owned region"
+    );
+    // Inside the region is not enough: the header itself is in there too,
+    // and aiming `msg_iov` at it would satisfy the bounds check while
+    // making the kernel read header bytes as descriptors. The array has to
+    // start past the header.
+    assert!(
+        array >= lo + core::mem::size_of::<crate::types::MsgHdr>(),
+        "the descriptor array must not overlap the header"
+    );
+    // And the array it names holds this request's descriptors: distinct
+    // lengths, so a header aimed at the wrong array would not agree.
+    assert_eq!(prepared.published_descriptor(0).len(), 2);
+    assert_eq!(prepared.published_descriptor(1).len(), 4);
+    assert_eq!(
+        prepared.published_descriptor(0).base().cast_const(),
+        prepared.buffers()[0].stable_ptr()
+    );
+    assert_eq!(
+        prepared.published_descriptor(1).base().cast_const(),
+        prepared.buffers()[1].stable_ptr()
+    );
+    assert_eq!(prepared.total_len(), 6);
+}
+
+#[test]
+fn a_connected_send_stages_no_address_for_the_kernel_to_read() {
+    let prepared = PreparedSendmsg::new(
+        RawFd::from_raw(3),
+        [filled(b"x")],
+        msg_region::<1>(),
+        SendTarget::Connected,
+        MsgFlags::default(),
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+
+    // A non-zero namelen with no address is a read past the end of
+    // whatever `msg_name` happens to hold, so both must be absent
+    // together.
+    let hdr = prepared.published_header();
+    assert!(hdr.msg_name.is_null());
+    assert_eq!(hdr.msg_namelen, 0);
+}
+
+#[test]
+fn an_addressed_send_stages_the_address_inside_the_owned_region() {
+    let addr = SockAddrIn {
+        sin_family: 2,
+        sin_port: 9000u16.to_be(),
+        sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+        sin_zero: [0; 8],
+    };
+    let region = msg_region::<1>();
+    let lo = region.stable_ptr().addr();
+    let hi = lo + region.stable_len();
+
+    let prepared = PreparedSendmsg::new(
+        RawFd::from_raw(3),
+        [filled(b"x")],
+        region,
+        SendTarget::To(addr),
+        MsgFlags::default(),
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+
+    let hdr = prepared.published_header();
+    assert_eq!(hdr.msg_namelen, core::mem::size_of::<SockAddrIn>() as u32);
+    // The address the kernel will read must live in storage the ticket
+    // owns. A pointer to the caller's own copy would dangle the moment
+    // that copy went out of scope, and nothing else here would notice.
+    let name = hdr.msg_name.addr();
+    assert!(
+        name >= lo && name < hi,
+        "staged address must be inside the owned region"
+    );
+}
+
+#[test]
+fn with_lens_shortens_each_descriptor_but_never_extends_it_for_a_message() {
+    let prepared = PreparedSendmsg::new(
+        RawFd::from_raw(3),
+        [filled(b"aaaa"), filled(b"bbbb")],
+        msg_region::<2>(),
+        SendTarget::Connected,
+        MsgFlags::default(),
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"))
+    .with_lens([1, 999]);
+
+    assert_eq!(prepared.published_descriptor(0).len(), 1);
+    // Clamped to the buffer: a descriptor longer than its buffer is a read
+    // past the end, and the CQE would report it as a successful send.
+    assert_eq!(prepared.published_descriptor(1).len(), 4);
+    assert_eq!(prepared.total_len(), 5);
+}
+
+#[test]
+fn a_region_too_small_for_the_staged_layout_is_refused_with_everything_back() {
+    let needed = core::mem::size_of::<crate::types::MsgHdr>()
+        + core::mem::size_of::<crate::types::IoVec>() * 2
+        + core::mem::size_of::<SockAddrIn>();
+    let buf = filled(b"x");
+    let addr = buf.stable_ptr();
+
+    let Err((bufs, store, e)) = PreparedSendmsg::new(
+        RawFd::from_raw(3),
+        [buf, filled(b"y")],
+        MmapBuffer::with_capacity(needed - 1).expect("map"),
+        SendTarget::Connected,
+        MsgFlags::default(),
+    ) else {
+        panic!("a short staging region must be refused");
+    };
+    assert_eq!(
+        e,
+        MsgRegionError::RegionTooSmall {
+            needed,
+            got: needed - 1
+        }
+    );
+    // Refusing costs nothing: every buffer came back at its own address.
+    assert_eq!(bufs[0].stable_ptr(), addr);
+    assert_eq!(store.stable_len(), needed - 1);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_sendmsg_gathers_every_buffer_into_one_message() {
+    let pair = SocketPair::connected();
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let region = msg_region::<3>();
+    let region_addr = region.stable_ptr();
+    // Distinct lengths and contents: three copies of the same buffer would
+    // pass even if the descriptors all named the first one.
+    let bufs = [filled(b"one"), filled(b"two!"), filled(b"three")];
+    let addrs = [
+        bufs[0].stable_ptr(),
+        bufs[1].stable_ptr(),
+        bufs[2].stable_ptr(),
+    ];
+    let prepared = PreparedSendmsg::new(
+        pair.client(),
+        bufs,
+        region,
+        SendTarget::Connected,
+        MsgFlags::NOSIGNAL,
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+
+    let ticket = sub
+        .push_sendmsg(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+
+    let (result, bufs, store) = done.into_parts();
+    assert_eq!(result.expect("send ok"), 12);
+
+    let mut got = [0u8; 32];
+    let n = pair.read_server(&mut got);
+    assert_eq!(&got[..n], b"onetwo!three");
+
+    // Every owner came back at the address it went in at.
+    for (buf, addr) in bufs.iter().zip(addrs.iter()) {
+        assert_eq!(buf.stable_ptr(), *addr);
+    }
+    assert_eq!(store.stable_ptr(), region_addr);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn an_addressed_send_reaches_a_peer_the_socket_never_connected_to() {
+    use crate::syscall;
+    use crate::types;
+
+    // An unconnected UDP socket has no peer, so this can only arrive if
+    // the kernel read the address out of the staged header.
+    let dest = syscall::socket(types::AF_INET, 2, 0).expect("dest");
+    let wanted = SockAddrIn {
+        sin_family: types::AF_INET as u16,
+        sin_port: 0u16.to_be(),
+        sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+        sin_zero: [0; 8],
+    };
+    syscall::bind(
+        dest,
+        (&raw const wanted).cast(),
+        core::mem::size_of::<SockAddrIn>() as u32,
+    )
+    .expect("bind");
+    let mut bound = SockAddrIn::default();
+    let mut len = core::mem::size_of::<SockAddrIn>() as u32;
+    syscall::getsockname(dest, (&raw mut bound).cast(), &raw mut len).expect("getsockname");
+
+    let sender = syscall::socket(types::AF_INET, 2, 0).expect("sender");
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let prepared = PreparedSendmsg::new(
+        sender,
+        [filled(b"addressed")],
+        msg_region::<1>(),
+        SendTarget::To(bound),
+        MsgFlags::NOSIGNAL,
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+    let ticket = sub
+        .push_sendmsg(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(done.result().expect("send ok"), 9);
+
+    let mut got = [0u8; 32];
+    let n = syscall::recvfrom(dest, got.as_mut_ptr(), got.len(), 0).expect("recv");
+    assert_eq!(&got[..n], b"addressed");
+
+    let _ = syscall::close(sender);
+    let _ = syscall::close(dest);
+}
+
+#[test]
+fn a_sendmsg_push_that_does_not_fit_hands_back_the_buffers_and_the_region() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut tickets = alloc_tickets(&mut sub);
+    let region = msg_region::<2>();
+    let region_addr = region.stable_ptr();
+
+    let prepared = PreparedSendmsg::new(
+        RawFd::from_raw(1),
+        [filled(b"aa"), filled(b"bb")],
+        region,
+        SendTarget::Connected,
+        MsgFlags::NOSIGNAL,
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+
+    let Err((returned, e)) = sub.push_sendmsg(prepared) else {
+        panic!("a full queue must reject the push");
+    };
+    assert_eq!(e, Error::Submit(SubmitError::QueueFull));
+    // A retry must issue the same message, so the staged header has to
+    // still name the staged descriptors rather than needing a rebuild.
+    assert_eq!(returned.published_header().msg_iovlen, 2);
+    assert_eq!(returned.total_len(), 4);
+    assert_eq!(returned.flags(), MsgFlags::NOSIGNAL);
+    let (_, store) = returned.into_parts();
+    assert_eq!(store.stable_ptr(), region_addr);
+    tickets.clear();
+}
+
+#[test]
+fn a_sendmsg_receipt_for_another_request_is_rejected() {
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut make = || {
+        let prepared = PreparedSendmsg::new(
+            RawFd::from_raw(1),
+            [filled(b"x")],
+            msg_region::<1>(),
+            SendTarget::Connected,
+            MsgFlags::NOSIGNAL,
+        )
+        .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+        sub.push_sendmsg(prepared)
+            .unwrap_or_else(|(_, e)| panic!("{e}"))
+    };
+    let first = make();
+    let second = make();
+
+    let foreign = Receipt {
+        ring: second.ring(),
+        id: second.id(),
+        result: 0,
+        flags: crate::types::CqeFlags::default(),
+    };
+    assert!(!first.matches(&foreign));
+    let Err((first, _)) = first.redeem(foreign) else {
+        panic!("a foreign receipt must not redeem");
+    };
+    drop((first, second));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_sendmsg_ticket_survives_moving_to_another_thread_before_completion() {
+    let pair = SocketPair::connected();
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let prepared = PreparedSendmsg::new(
+        pair.client(),
+        [filled(b"crossing"), filled(b"-threads")],
+        msg_region::<2>(),
+        SendTarget::Connected,
+        MsgFlags::NOSIGNAL,
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+    let ticket = sub
+        .push_sendmsg(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    // The header, the descriptors it names, and the buffers they name were
+    // all staged on the submitting thread; the ticket owning them is
+    // redeemed on another one.
+    let handle = std::thread::spawn(move || {
+        let receipt = comp.wait_one().expect("completion");
+        let done = ticket
+            .redeem(receipt)
+            .unwrap_or_else(|_| panic!("mismatch"));
+        done.result().expect("send ok")
+    });
+    assert_eq!(handle.join().expect("thread"), 16);
+
+    let mut got = [0u8; 32];
+    let n = pair.read_server(&mut got);
+    assert_eq!(&got[..n], b"crossing-threads");
 }
 
 #[cfg(not(miri))]

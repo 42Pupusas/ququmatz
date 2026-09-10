@@ -1,0 +1,23 @@
+error[E0599]: no method named `published_header` found for struct `PendingSendmsg<B, R, N>` in the current scope
+  --> tests/ui/an_in_flight_message_header_is_unreachable.rs:12:20
+   |
+12 |     let _ = ticket.published_header();
+   |                    ^^^^^^^^^^^^^^^^ method not found in `PendingSendmsg<MmapBuffer, MmapBuffer, 2>`
+
+error[E0599]: no method named `published_descriptor` found for struct `PendingSendmsg<B, R, N>` in the current scope
+  --> tests/ui/an_in_flight_message_header_is_unreachable.rs:18:20
+   |
+18 |     let _ = ticket.published_descriptor(0);
+   |                    ^^^^^^^^^^^^^^^^^^^^ method not found in `PendingSendmsg<MmapBuffer, MmapBuffer, 2>`
+
+error[E0599]: no method named `buffers` found for struct `PendingSendmsg<B, R, N>` in the current scope
+  --> tests/ui/an_in_flight_message_header_is_unreachable.rs:24:20
+   |
+24 |     let _ = ticket.buffers();
+   |                    ^^^^^^^ method not found in `PendingSendmsg<MmapBuffer, MmapBuffer, 2>`
+
+error[E0599]: no method named `into_parts` found for struct `PendingSendmsg<B, R, N>` in the current scope
+  --> tests/ui/an_in_flight_message_header_is_unreachable.rs:31:20
+   |
+31 |     let _ = ticket.into_parts();
+   |                    ^^^^^^^^^^ method not found in `PendingSendmsg<MmapBuffer, MmapBuffer, 2>`

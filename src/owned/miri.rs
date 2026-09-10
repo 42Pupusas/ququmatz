@@ -26,6 +26,7 @@ use super::openat2::{PendingOpenat2, PreparedOpenat2};
 use super::path::OwnedPath;
 use super::pathop::{PendingPathOp, PreparedPathOp};
 use super::rename::{PendingRename, PreparedRename};
+use super::sendmsg::{PendingSendmsg, PreparedSendmsg, SendTarget};
 use super::slot::SlotTarget;
 use super::statx::{PendingStatx, PreparedStatx};
 use super::vectored::{PendingVectored, PreparedVectored};
@@ -36,8 +37,8 @@ use super::{
 };
 use crate::op::Sqe;
 use crate::types::{
-    CqeFlags, FileMode, IoVec, MsgFlags, OpenFlags, OpenHow, RawFd, ResolveFlags, Statx,
-    StatxFlags, StatxMask,
+    CqeFlags, FileMode, IoVec, MsgFlags, MsgHdr, OpenFlags, OpenHow, RawFd, ResolveFlags,
+    SockAddrIn, Statx, StatxFlags, StatxMask,
 };
 
 /// Heap storage standing in for an `MmapBuffer`.
@@ -333,6 +334,94 @@ impl Lifecycle {
     ) -> (FakeKernel, PendingOpenat2<S, H>) {
         let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
         (FakeKernel::holding(sqe), pending)
+    }
+
+    fn submit_sendmsg<B: StableBuffer, R: StableBufferMut, const N: usize>(
+        &self,
+        prepared: PreparedSendmsg<B, R, N>,
+    ) -> (FakeKernel, PendingSendmsg<B, R, N>) {
+        let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
+        (FakeKernel::holding(sqe), pending)
+    }
+}
+
+impl FakeKernel {
+    /// Read the `msghdr` a message request publishes at `addr`.
+    ///
+    /// Every other owned request puts the addresses the kernel will
+    /// dereference in the SQE, where they can be checked at submission.
+    /// Here they are *bytes inside this struct*, so reading it is the only
+    /// way to learn where the kernel goes next — and a header whose
+    /// storage was freed hands back three plausible-looking addresses.
+    fn read_msghdr(&self) -> MsgHdr {
+        // The `MsgRegion` that built this SQE rejected storage that was not
+        // aligned for a `MsgHdr`, so this address is aligned.
+        #[allow(clippy::cast_ptr_alignment)]
+        let base = self.published_ptr().cast::<MsgHdr>();
+        // SAFETY: the live ticket owns storage checked for size and
+        // alignment against `MsgHdr` and written before submission, and
+        // keeps it allocated until redeemed.
+        unsafe { base.read() }
+    }
+
+    /// Follow the header to descriptor `i`, as the kernel does.
+    ///
+    /// Deliberately reached through `msg_iov` rather than through the
+    /// SQE's own address: the array is a *second* region, and a check that
+    /// re-derived its location from anything but the header would still
+    /// pass if the header pointed somewhere stale.
+    fn message_descriptor(&self, i: usize) -> IoVec {
+        let hdr = self.read_msghdr();
+        assert!(i < hdr.msg_iovlen, "descriptor index past msg_iovlen");
+        // SAFETY: the header names an array of `msg_iovlen` descriptors
+        // staged inside storage the live ticket owns, so `add(i)` is in
+        // bounds and initialised.
+        unsafe { hdr.msg_iov.add(i).read() }
+    }
+
+    /// Read every byte the message gathers, header first, exactly as a
+    /// `sendmsg` does: struct, then array, then buffers.
+    ///
+    /// Three levels of indirection, each one a separate allocation that
+    /// must still be live. Any of them freed is a Miri error here rather
+    /// than a wrong byte.
+    fn observe_sendmsg(&self) -> Vec<u8> {
+        let hdr = self.read_msghdr();
+        let mut seen = Vec::new();
+        for i in 0..hdr.msg_iovlen {
+            let vec = self.message_descriptor(i);
+            for j in 0..vec.len() {
+                // SAFETY: the descriptor names a buffer owned by the live
+                // ticket, which keeps it allocated and unaliased.
+                seen.push(unsafe { vec.base().add(j).read() });
+            }
+        }
+        seen
+    }
+
+    /// Read the destination address the header names.
+    ///
+    /// Returns `None` when the message carries no address, which is what a
+    /// connected send stages — the kernel must not be handed a length
+    /// without a pointer.
+    fn message_name(&self) -> Option<SockAddrIn> {
+        let hdr = self.read_msghdr();
+        if hdr.msg_name.is_null() {
+            assert_eq!(hdr.msg_namelen, 0, "a null address must have zero length");
+            return None;
+        }
+        assert_eq!(
+            hdr.msg_namelen as usize,
+            core::mem::size_of::<SockAddrIn>(),
+            "a staged address must be a whole SockAddrIn"
+        );
+        // The `MsgRegion` staged this at an 8-byte-aligned offset from an
+        // address checked for the same alignment.
+        #[allow(clippy::cast_ptr_alignment)]
+        let base = hdr.msg_name.cast::<SockAddrIn>();
+        // SAFETY: the address was written into storage the live ticket owns
+        // before submission, and stays allocated until redeemed.
+        Some(unsafe { base.read() })
     }
 }
 
@@ -1373,6 +1462,166 @@ fn reclaiming_an_unpublished_openat2_returns_both_storages_and_its_mode() {
     assert_eq!(prepared.path().as_bytes(), b"/tmp/unsent");
     let (path, store) = prepared.into_parts();
     drop((path.into_storage(), store));
+}
+
+/// Heap staging for a message header, its descriptors, and its address.
+///
+/// Aligned for a `MsgHdr` rather than for bytes: the region genuinely
+/// requires it, and a byte-aligned allocation is where Miri catches what
+/// the system allocator would hide by handing back aligned addresses
+/// anyway.
+fn msg_region<const N: usize>() -> HeapBuffer {
+    let needed = core::mem::size_of::<MsgHdr>()
+        + core::mem::size_of::<IoVec>() * N
+        + core::mem::size_of::<SockAddrIn>();
+    HeapBuffer::with_alignment(needed, align_of::<MsgHdr>())
+}
+
+/// A heap buffer holding exactly `bytes`.
+fn heap_filled(bytes: &[u8]) -> HeapBuffer {
+    let mut buf = HeapBuffer::with_capacity(bytes.len());
+    buf.as_mut_slice().copy_from_slice(bytes);
+    buf
+}
+
+#[test]
+fn the_kernel_reaches_a_messages_bytes_by_following_the_header_it_published() {
+    let cycle = Lifecycle::new();
+    // Distinct contents and lengths: three copies of one buffer would pass
+    // even if every descriptor named the first.
+    let prepared = PreparedSendmsg::new(
+        RawFd::from_raw(7),
+        [
+            heap_filled(b"one"),
+            heap_filled(b"two!"),
+            heap_filled(b"five5"),
+        ],
+        msg_region::<3>(),
+        SendTarget::Connected,
+        MsgFlags::default(),
+    )
+    .ok()
+    .expect("staging fits");
+    let (kernel, pending) = cycle.submit_sendmsg(prepared);
+
+    // Struct, then array, then buffers — three allocations chained by
+    // pointers the kernel reads out of caller memory, all reached without
+    // touching the ticket that owns them.
+    assert_eq!(kernel.observe_sendmsg(), b"onetwo!five5");
+    assert!(kernel.message_name().is_none());
+
+    let receipt = kernel.post_completion(cycle.ring, 12);
+    let done = pending.redeem(receipt).ok().expect("receipt matches");
+    assert_eq!(done.result().expect("ok"), 12);
+    let (_, bufs, store) = done.into_parts();
+    drop((bufs, store));
+}
+
+#[test]
+fn a_messages_three_regions_survive_the_ticket_moving_between_owners() {
+    // The hazard that decided the design. A `PendingSendmsg` is `Send` and
+    // is meant to move to a completion thread, but the kernel holds a
+    // pointer to a header whose *contents* are further pointers. If any of
+    // it relocated, the kernel would read three addresses out of whatever
+    // now occupied that space and follow them.
+    let cycle = Lifecycle::new();
+    let addr = SockAddrIn {
+        sin_family: 2,
+        sin_port: 4242u16.to_be(),
+        sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+        sin_zero: [0; 8],
+    };
+    let prepared = PreparedSendmsg::new(
+        RawFd::from_raw(7),
+        [heap_filled(b"travel"), heap_filled(b"ling")],
+        msg_region::<2>(),
+        SendTarget::To(addr),
+        MsgFlags::default(),
+    )
+    .ok()
+    .expect("staging fits");
+    let (kernel, pending) = cycle.submit_sendmsg(prepared);
+
+    let pending = Box::new(pending);
+    let pending = core::hint::black_box(pending);
+    let pending = *pending;
+
+    // Every level still reachable after the move, through the one address
+    // the SQE carried before any of it happened.
+    assert_eq!(kernel.observe_sendmsg(), b"travelling");
+    assert_eq!(kernel.message_name().expect("addressed"), addr);
+
+    let receipt = kernel.post_completion(cycle.ring, 10);
+    let done = pending.redeem(receipt).ok().expect("receipt matches");
+    let (_, bufs, store) = done.into_parts();
+    drop((bufs, store));
+}
+
+#[test]
+fn abandoning_a_sendmsg_leaks_every_region_rather_than_freeing_them() {
+    let cycle = Lifecycle::new();
+    let region = msg_region::<2>();
+    let first = heap_filled(b"abandon");
+    let second = heap_filled(b"ed");
+    let leaked_region = (region.ptr, region.len, region.align);
+    let leaked_bufs = [(first.ptr, first.len), (second.ptr, second.len)];
+
+    let prepared = PreparedSendmsg::new(
+        RawFd::from_raw(7),
+        [first, second],
+        region,
+        SendTarget::Connected,
+        MsgFlags::default(),
+    )
+    .ok()
+    .expect("staging fits");
+    let (kernel, pending) = cycle.submit_sendmsg(prepared);
+
+    // Everything leaks, not just the buffers. A ticket that freed the
+    // staging region would leave the kernel reading a header from dead
+    // memory and following whatever addresses it found there — and the
+    // buffers being alive would not save it.
+    drop(pending);
+    assert_eq!(kernel.observe_sendmsg(), b"abandoned");
+
+    // SAFETY: the abandoned ticket leaked these and the stand-in kernel has
+    // finished, so nothing else can reach them.
+    unsafe {
+        dealloc(
+            leaked_region.0,
+            HeapBuffer::layout_of(leaked_region.1, leaked_region.2),
+        );
+        for (ptr, len) in leaked_bufs {
+            HeapBuffer::reclaim_leaked(ptr, len);
+        }
+    }
+}
+
+#[test]
+fn reclaiming_an_unpublished_sendmsg_returns_every_storage_and_its_header() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedSendmsg::new(
+        RawFd::from_raw(7),
+        [heap_filled(b"unsent")],
+        msg_region::<1>(),
+        SendTarget::Connected,
+        MsgFlags::NOSIGNAL,
+    )
+    .ok()
+    .expect("staging fits");
+    let (_kernel, pending) = cycle.submit_sendmsg(prepared);
+
+    // SAFETY: this stands in for a rejected push — the SQE was built but
+    // never made visible to any kernel, so no storage is referenced.
+    let prepared = unsafe { pending.reclaim_unsubmitted() };
+    assert_eq!(prepared.flags(), MsgFlags::NOSIGNAL);
+    assert_eq!(prepared.target(), SendTarget::Connected);
+    // The staged header survived the round trip, so a retry sends the same
+    // message rather than one describing stale addresses.
+    assert_eq!(prepared.published_header().msg_iovlen, 1);
+    assert_eq!(prepared.total_len(), 6);
+    let (bufs, store) = prepared.into_parts();
+    drop((bufs, store));
 }
 
 /// Heap storage aligned for a `Statx`, sized exactly.

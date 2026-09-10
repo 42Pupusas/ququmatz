@@ -13,6 +13,7 @@ use super::openat2::{PendingOpenat2, PreparedOpenat2};
 use super::pathop::{PendingPathOp, PreparedPathOp};
 use super::rename::{PendingRename, PreparedRename};
 use super::request::{Pending, Prepared, Receipt};
+use super::sendmsg::{PendingSendmsg, PreparedSendmsg};
 use super::statx::{PendingStatx, PreparedStatx};
 use super::vectored::{PendingVectored, PreparedVectored};
 use super::zerocopy::{PendingZc, PreparedZc};
@@ -276,6 +277,42 @@ impl OwnedSubmitter {
         // SAFETY: only reached when `Submitter::push` reported the queue was
         // full, which happens before the SQE is written or the tail is
         // advanced. No kernel-visible pointer to either storage exists.
+        unsafe { pending.reclaim_unsubmitted() }
+    }
+
+    /// Queue a `sendmsg`, taking ownership of its buffers and staging
+    /// storage.
+    ///
+    /// The kernel reads a header out of the caller's memory and follows
+    /// the pointers *inside* it to reach the descriptor array and the
+    /// destination address, so the staging storage is owned by the ticket
+    /// for the whole operation just as the buffers are.
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact,
+    /// still owning everything.
+    pub fn push_sendmsg<B: StableBuffer, R: StableBufferMut, const N: usize>(
+        &mut self,
+        request: PreparedSendmsg<B, R, N>,
+    ) -> Result<PendingSendmsg<B, R, N>, (PreparedSendmsg<B, R, N>, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            // The SQE never became kernel-visible, so the kernel never saw
+            // the header pointer and reclaiming everything is sound.
+            Err(e) => Err((Self::reclaim_sendmsg(pending), e)),
+        }
+    }
+
+    /// Undo a `sendmsg` push that the kernel never observed.
+    fn reclaim_sendmsg<B: StableBuffer, R: StableBufferMut, const N: usize>(
+        pending: PendingSendmsg<B, R, N>,
+    ) -> PreparedSendmsg<B, R, N> {
+        // SAFETY: only reached when `Submitter::push` reported the queue was
+        // full, which happens before the SQE is written or the tail is
+        // advanced. No kernel-visible pointer to the staging storage exists.
         unsafe { pending.reclaim_unsubmitted() }
     }
 

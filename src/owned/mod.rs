@@ -115,6 +115,29 @@
 //! this design survives `mem::forget` where a borrowed-guard design cannot.
 //! Normal redemption reclaims everything.
 //!
+//! # A message header holds the addresses, not the SQE
+//!
+//! [`PreparedSendmsg`] is where the indirection stops being something the
+//! SQE describes. Every request above puts the addresses the kernel will
+//! dereference into SQE fields, where they can be checked when the request
+//! is built. A `sendmsg` puts one address there — a `struct msghdr` — and
+//! the kernel reads *that* to learn where the `iovec` array and the
+//! destination address are, then follows those to reach the data.
+//!
+//! So the addresses are bytes in caller memory that happen to be pointers,
+//! and nothing in the type system relates them to what they point at. A
+//! header that moved would leave the kernel reading three plausible
+//! addresses out of whatever now occupied that space. The header, the
+//! descriptors, and the address are therefore staged together in one
+//! caller-supplied region whose stability is checked once and which comes
+//! back at the end; the payload buffers stay inline, since
+//! [`StableBuffer`] already covers them.
+//!
+//! What `sendmsg` adds over [`PreparedVectored`] is what a socket needs and
+//! a file does not: a per-message destination, so one unconnected socket
+//! can be sent from without a `connect` per peer, and flags that belong to
+//! the message rather than the descriptor.
+//!
 //! # `statx` writes a struct, not bytes
 //!
 //! Every other request is bounded by the SQE's length field, so a
@@ -231,6 +254,7 @@ mod direct_accept;
 mod direct_socket;
 mod event;
 mod identity;
+mod msgregion;
 mod multishot;
 mod open;
 mod openat2;
@@ -239,6 +263,7 @@ mod pathop;
 mod queue;
 mod rename;
 mod request;
+mod sendmsg;
 mod slot;
 mod statx;
 mod vectored;
@@ -263,6 +288,7 @@ pub use direct_socket::{
 };
 pub use event::{Event, PartialReceipt};
 pub use identity::{RequestId, RingId};
+pub use msgregion::{MAX_IOV, MsgRegionError};
 pub use multishot::{Armed, Arrival, Delivery, Finished, MultishotRecv, PreparedMultishot};
 pub use open::{Opened, PendingOpen, PreparedOpen};
 pub use openat2::{Openat2Error, Openat2Mode, Opened2, PendingOpenat2, PreparedOpenat2};
@@ -271,6 +297,7 @@ pub use pathop::{PathOpCompleted, PathOpKind, PendingPathOp, PreparedPathOp};
 pub use queue::{OwnedCompleter, OwnedSubmitter};
 pub use rename::{PendingRename, PreparedRename, RenameCompleted, RenameMode};
 pub use request::{Completed, Direction, Pending, Prepared, Receipt};
+pub use sendmsg::{PendingSendmsg, PreparedSendmsg, SendTarget, SendmsgCompleted};
 pub use slot::{DirectSlot, SlotIndex, SlotTarget};
 pub use statx::{PendingStatx, PreparedStatx, StatxCompleted, StatxError};
 pub use vectored::{PendingVectored, PreparedVectored, VectoredCompleted, VectoredError};

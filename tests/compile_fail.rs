@@ -141,6 +141,20 @@ fn an_in_flight_openat2_hides_both_regions_and_is_not_silently_dropped() {
     t.compile_fail("tests/ui/an_openat2_ticket_must_be_kept.rs");
 }
 
+/// A `sendmsg` is the first owned request where the addresses the kernel
+/// dereferences are not in the SQE at all: they are *bytes inside a struct*
+/// in caller memory, which the kernel reads to find the descriptor array
+/// and the destination, then follows to reach the data. Three levels, three
+/// regions, none of them reachable while in flight and none reclaimable
+/// without a receipt — and an abandoned ticket loses all of it silently, so
+/// it has to be diagnosed.
+#[test]
+fn an_in_flight_message_hides_every_region_it_chains_together() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/an_in_flight_message_header_is_unreachable.rs");
+    t.compile_fail("tests/ui/a_sendmsg_ticket_must_be_kept.rs");
+}
+
 /// An accepted connection is owned rather than borrowed, so the compiler
 /// cannot tie it to a pool the way it does an arrival. What it can do is
 /// refuse to let the result be thrown away unread, which is the failure
