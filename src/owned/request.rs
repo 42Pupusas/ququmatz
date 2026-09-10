@@ -29,8 +29,20 @@ pub struct Prepared<B> {
     /// Captured at construction, where the direction-appropriate bound is
     /// in scope. Sound to cache because [`StableBuffer`] guarantees the
     /// address never changes, including across moves.
-    addr: usize,
+    ///
+    /// Held as a pointer rather than a `usize` so the buffer's provenance
+    /// survives the trip into the SQE. Round-tripping through an integer
+    /// would leave the kernel's pointer with no provenance to check, which
+    /// silently disables the aliasing analysis that makes this design
+    /// checkable at all. For a write this is derived from a `*const` and is
+    /// never written through.
+    addr: *mut u8,
 }
+
+// SAFETY: `addr` points into `buf`, which this struct exclusively owns, so
+// the pointer is valid wherever the buffer is. It confers no thread
+// affinity of its own, leaving `B` to decide.
+unsafe impl<B: Send> Send for Prepared<B> {}
 
 impl<B: StableBufferMut> Prepared<B> {
     /// Prepare a read of up to `buf`'s length from `fd` at `offset`.
@@ -40,7 +52,7 @@ impl<B: StableBufferMut> Prepared<B> {
     #[must_use]
     pub fn read(fd: RawFd, mut buf: B, offset: u64) -> Self {
         let len = Self::clamp_len(buf.stable_len());
-        let addr = buf.stable_mut_ptr() as usize;
+        let addr = buf.stable_mut_ptr();
         Self {
             buf,
             fd,
@@ -57,7 +69,7 @@ impl<B: StableBuffer> Prepared<B> {
     #[must_use]
     pub fn write(fd: RawFd, buf: B, offset: u64) -> Self {
         let len = Self::clamp_len(buf.stable_len());
-        let addr = buf.stable_ptr() as usize;
+        let addr = buf.stable_ptr().cast_mut();
         Self {
             buf,
             fd,
@@ -142,12 +154,11 @@ impl<B: StableBuffer> Prepared<B> {
             // `Pending` rather than being dropped, and `Pending` suppresses
             // its destructor unless a receipt proves the kernel finished,
             // so the bytes outlive the kernel's access.
-            Direction::Read => unsafe {
-                Sqe::read_ptr(self.fd, self.addr as *mut u8, self.len, self.offset)
-            },
-            // SAFETY: as above, via `StableBuffer`; the kernel only reads.
+            Direction::Read => unsafe { Sqe::read_ptr(self.fd, self.addr, self.len, self.offset) },
+            // SAFETY: as above, via `StableBuffer`; the kernel only reads,
+            // so handing back the pointer this was derived from is sound.
             Direction::Write => unsafe {
-                Sqe::write_ptr(self.fd, self.addr as *const u8, self.len, self.offset)
+                Sqe::write_ptr(self.fd, self.addr.cast_const(), self.len, self.offset)
             },
         };
         let pending = Pending {
@@ -192,8 +203,14 @@ pub struct Pending<B> {
     offset: u64,
     len: u32,
     direction: Direction,
-    addr: usize,
+    addr: *mut u8,
 }
+
+// SAFETY: `addr` points into `buf`, which this ticket exclusively owns and
+// keeps alive at a fixed address for its whole life. Moving the ticket to
+// another thread moves the owner with it, so the pointer stays valid; `B`
+// decides whether that move is allowed at all.
+unsafe impl<B: Send> Send for Pending<B> {}
 
 impl<B> Pending<B> {
     /// Identity the kernel echoes back in this operation's CQE.

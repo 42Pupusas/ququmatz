@@ -134,14 +134,38 @@ including cross-ring rejection, same-ring wrong-request rejection,
 queue-full returning the buffer intact, kernel errors not stranding
 storage, and a ticket redeemed on a second thread.
 
+**Machine-checked under Miri.** The lifecycle is generic over the buffer,
+so `src/owned/miri.rs` substitutes heap storage and a stand-in kernel that
+touches the bytes only through the address published in the SQE — Miri
+cannot run this crate's syscalls, which are inline `asm!`, so neither
+`MmapBuffer` nor a real ring is reachable. Nine tests cover the kernel
+writing into a live ticket's buffer, reading bytes staged before
+submission, the ticket being moved between owners mid-flight, redemption
+after a rejected receipt, out-of-order redemption of sixteen concurrent
+tickets, and the abandonment paths. They pass under both Stacked Borrows
+and Tree Borrows with leak checking on.
+
+Miri paid for itself immediately by finding a real defect: `Prepared` and
+`Pending` stored the buffer address as a `usize`, so the pointer the kernel
+received had no provenance and every access through it was UB. Both now
+hold a `*mut u8` derived from the buffer, with hand-written `Send` impls
+bounded on `B: Send` replacing the auto-trait that the raw pointer
+suppresses. The two tests that assert abandonment leaks free the storage
+explicitly afterwards so leak checking stays enabled everywhere else.
+
+Two limits on that evidence. `-Zmiri-strict-provenance` cannot pass here by
+construction: io_uring's ABI stores the address as a `u64`, so recovering a
+pointer from the SQE is an integer-to-pointer round trip inherent to the
+interface. Tree Borrows likewise does not model such casts, which makes its
+pass weaker evidence than the Stacked Borrows one. Both accept the crate
+code itself — the remaining cast lives in the test's stand-in kernel, where
+the real kernel would be.
+
 **Scope limits.** This covers ordinary `read`/`write` only. Vectored I/O,
 paths, `statx`, multishot, and zero-copy still go through the `unsafe`
 constructors and need their own owned request types — `send_zc` in
 particular must not release its buffer on the send CQE alone. The
-`unsafe` `Sqe` surface remains for those and for lock-free users. Miri is
-not installed on this toolchain, so the `ManuallyDrop` and provenance
-reasoning in `src/owned/request.rs` has not been machine-checked; that is
-the most valuable next verification step.
+`unsafe` `Sqe` surface remains for those and for lock-free users.
 
 **Status (original): confirmed.**
 

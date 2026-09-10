@@ -72,6 +72,9 @@ mod request;
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 mod tests;
 
+#[cfg(test)]
+mod miri;
+
 pub use buffer::{MmapBuffer, StableBuffer, StableBufferMut};
 pub use identity::{RequestId, RingId};
 pub use queue::{OwnedCompleter, OwnedSubmitter};
