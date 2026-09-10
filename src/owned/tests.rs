@@ -2150,39 +2150,6 @@ fn a_direct_open_receipt_for_another_request_is_rejected() {
     drop((first, second));
 }
 
-#[cfg(not(miri))]
-#[test]
-fn probe_existing_socket_sqe_encoding() {
-    let mut ring = crate::IoUring::new(4).expect("ring");
-    ring.push(
-        crate::Sqe::socket(
-            crate::types::AddressFamily::Inet,
-            crate::types::SocketType::Stream,
-            0,
-            crate::types::SocketFlags::NONBLOCK,
-        )
-        .user_data(1),
-    )
-    .expect("push");
-    ring.submit_and_wait(1).expect("submit");
-    let cqe = ring.complete().expect("cqe");
-    std::eprintln!("PROBE socket-with-flags res={}", cqe.result);
-
-    ring.push(
-        crate::Sqe::socket(
-            crate::types::AddressFamily::Inet,
-            crate::types::SocketType::Stream,
-            0,
-            crate::types::SocketFlags::default(),
-        )
-        .user_data(2),
-    )
-    .expect("push");
-    ring.submit_and_wait(1).expect("submit");
-    let cqe = ring.complete().expect("cqe");
-    std::eprintln!("PROBE socket-no-flags res={}", cqe.result);
-}
-
 #[test]
 fn a_slot_from_one_ring_is_not_confused_with_anothers() {
     let mine = RingId::next();
