@@ -180,6 +180,24 @@
 //! [`PathOpKind::Unlink`] from [`PathOpKind::Rmdir`] makes the two working
 //! combinations the only two reachable ones.
 //!
+//! # `openat2` describes itself in caller memory
+//!
+//! [`PreparedOpen`] puts its flags and mode in the SQE. `openat2` puts
+//! them in a `struct open_how` in the caller's memory and stores only its
+//! address, so the kernel dereferences a *second* region to learn what the
+//! request is. That is the vectored-array hazard rather than an open's:
+//! an inline struct would move when the `Send` ticket moved, and the
+//! kernel would open whatever the parameters at that address described.
+//! [`PreparedOpenat2`] therefore takes owned, size- and alignment-checked
+//! storage for it, like [`PreparedVectored`] does for its descriptors.
+//!
+//! `openat2` also validates what `openat` ignores — a mode without
+//! `CREAT`, a mode above `0o7777`, an unknown flag or resolve bit are all
+//! `EINVAL` rather than silently dropped. [`Openat2Mode`] pairs the mode
+//! with the flag that gives it meaning so the first cannot be written, and
+//! the `how_size` the kernel checks is this crate's own `size_of` rather
+//! than a caller parameter.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -215,6 +233,7 @@ mod event;
 mod identity;
 mod multishot;
 mod open;
+mod openat2;
 mod path;
 mod pathop;
 mod queue;
@@ -246,6 +265,7 @@ pub use event::{Event, PartialReceipt};
 pub use identity::{RequestId, RingId};
 pub use multishot::{Armed, Arrival, Delivery, Finished, MultishotRecv, PreparedMultishot};
 pub use open::{Opened, PendingOpen, PreparedOpen};
+pub use openat2::{Openat2Error, Openat2Mode, Opened2, PendingOpenat2, PreparedOpenat2};
 pub use path::{OwnedPath, PathError};
 pub use pathop::{PathOpCompleted, PathOpKind, PendingPathOp, PreparedPathOp};
 pub use queue::{OwnedCompleter, OwnedSubmitter};

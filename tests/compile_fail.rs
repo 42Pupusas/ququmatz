@@ -129,6 +129,18 @@ fn in_flight_rename_paths_are_unreachable_and_not_silently_dropped() {
     t.compile_fail("tests/ui/a_rename_ticket_must_be_kept.rs");
 }
 
+/// An `openat2` is the only owned request whose *parameters* live in
+/// caller memory: the kernel reads an `open_how` to learn what to open, as
+/// well as the path. So two regions must stay unreachable until a receipt
+/// proves the kernel has stopped, and an abandoned ticket loses both plus
+/// any descriptor the open produced — silent, and therefore diagnosed.
+#[test]
+fn an_in_flight_openat2_hides_both_regions_and_is_not_silently_dropped() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/an_in_flight_open_how_is_unreachable.rs");
+    t.compile_fail("tests/ui/an_openat2_ticket_must_be_kept.rs");
+}
+
 /// An accepted connection is owned rather than borrowed, so the compiler
 /// cannot tie it to a pool the way it does an arrival. What it can do is
 /// refuse to let the result be thrown away unread, which is the failure

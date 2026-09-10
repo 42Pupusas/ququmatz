@@ -9,6 +9,7 @@ use super::event::{Event, PartialReceipt};
 use super::identity::{RequestIdSource, RingId};
 use super::multishot::{MultishotRecv, PreparedMultishot};
 use super::open::{PendingOpen, PreparedOpen};
+use super::openat2::{PendingOpenat2, PreparedOpenat2};
 use super::pathop::{PendingPathOp, PreparedPathOp};
 use super::rename::{PendingRename, PreparedRename};
 use super::request::{Pending, Prepared, Receipt};
@@ -242,6 +243,40 @@ impl OwnedSubmitter {
             // the path pointer and reclaiming the storage is sound.
             Err(e) => Err((Self::reclaim_direct_open(pending), e)),
         }
+    }
+
+    /// Queue an `openat2`, taking ownership of its path and `open_how`.
+    ///
+    /// The kernel reads the request parameters from the caller's memory
+    /// rather than from the SQE, so that storage is owned by the ticket
+    /// for the whole operation just as the path is.
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact,
+    /// still owning both storages.
+    pub fn push_openat2<S: StableBuffer, H: StableBufferMut>(
+        &mut self,
+        request: PreparedOpenat2<S, H>,
+    ) -> Result<PendingOpenat2<S, H>, (PreparedOpenat2<S, H>, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            // The SQE never became kernel-visible, so the kernel never saw
+            // either pointer and reclaiming both storages is sound.
+            Err(e) => Err((Self::reclaim_openat2(pending), e)),
+        }
+    }
+
+    /// Undo an `openat2` push that the kernel never observed.
+    fn reclaim_openat2<S: StableBuffer, H: StableBufferMut>(
+        pending: PendingOpenat2<S, H>,
+    ) -> PreparedOpenat2<S, H> {
+        // SAFETY: only reached when `Submitter::push` reported the queue was
+        // full, which happens before the SQE is written or the tail is
+        // advanced. No kernel-visible pointer to either storage exists.
+        unsafe { pending.reclaim_unsubmitted() }
     }
 
     /// Queue an `unlinkat` or `mkdirat`, taking ownership of its path.

@@ -22,6 +22,7 @@ use super::direct::{PendingDirectOpen, PreparedDirectOpen};
 use super::event::PartialReceipt;
 use super::identity::{RequestId, RequestIdSource, RingId};
 use super::open::{PendingOpen, PreparedOpen};
+use super::openat2::{PendingOpenat2, PreparedOpenat2};
 use super::path::OwnedPath;
 use super::pathop::{PendingPathOp, PreparedPathOp};
 use super::rename::{PendingRename, PreparedRename};
@@ -30,11 +31,13 @@ use super::statx::{PendingStatx, PreparedStatx};
 use super::vectored::{PendingVectored, PreparedVectored};
 use super::zerocopy::{PendingZc, PreparedZc};
 use super::{
-    Direction, PathOpKind, Pending, Prepared, Receipt, RenameMode, StableBuffer, StableBufferMut,
+    Direction, Openat2Mode, PathOpKind, Pending, Prepared, Receipt, RenameMode, StableBuffer,
+    StableBufferMut,
 };
 use crate::op::Sqe;
 use crate::types::{
-    CqeFlags, FileMode, IoVec, MsgFlags, OpenFlags, RawFd, Statx, StatxFlags, StatxMask,
+    CqeFlags, FileMode, IoVec, MsgFlags, OpenFlags, OpenHow, RawFd, ResolveFlags, Statx,
+    StatxFlags, StatxMask,
 };
 
 /// Heap storage standing in for an `MmapBuffer`.
@@ -322,6 +325,41 @@ impl Lifecycle {
     ) -> (FakeKernel, PendingRename<F, T>) {
         let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
         (FakeKernel::holding(sqe), pending)
+    }
+
+    fn submit_openat2<S: StableBuffer, H: StableBufferMut>(
+        &self,
+        prepared: PreparedOpenat2<S, H>,
+    ) -> (FakeKernel, PendingOpenat2<S, H>) {
+        let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
+        (FakeKernel::holding(sqe), pending)
+    }
+}
+
+impl FakeKernel {
+    /// Read the `open_how` an `openat2` publishes at `off`.
+    ///
+    /// `openat2` is the only owned request whose *parameters* live in
+    /// caller memory, so this region needs its own read: a check that only
+    /// scanned the path at `addr` would miss an `open_how` whose storage
+    /// had been freed, and the kernel would open something described by
+    /// whatever replaced it.
+    fn read_open_how(&self) -> OpenHow {
+        let addr = usize::try_from(self.sqe.0.off).expect("address fits a pointer");
+        let base = core::ptr::with_exposed_provenance::<OpenHow>(addr);
+        // SAFETY: the live `PendingOpenat2` owns storage checked for size
+        // and alignment against `OpenHow` and written before submission,
+        // and keeps it allocated until redeemed.
+        unsafe { base.read() }
+    }
+
+    /// The length the SQE tells the kernel the `open_how` is.
+    ///
+    /// The kernel validates this against its own `sizeof`, answering
+    /// `EINVAL` when it is short and `E2BIG` when it is long, so a wrong
+    /// value here is a request that cannot succeed.
+    const fn published_how_size(&self) -> u32 {
+        self.sqe.0.len
     }
 }
 
@@ -1188,6 +1226,153 @@ fn reclaiming_an_unpublished_rename_returns_both_paths_and_its_mode() {
     assert_eq!(from.as_bytes(), b"/tmp/unsent_from");
     assert_eq!(to.as_bytes(), b"/tmp/unsent_to");
     drop((from.into_storage(), to.into_storage()));
+}
+
+/// Heap storage aligned for an `OpenHow`, sized exactly.
+fn how_store() -> HeapBuffer {
+    HeapBuffer::with_alignment(core::mem::size_of::<OpenHow>(), align_of::<OpenHow>())
+}
+
+fn prepared_openat2(
+    path: &[u8],
+    mode: Openat2Mode,
+    resolve: ResolveFlags,
+) -> PreparedOpenat2<HeapBuffer, HeapBuffer> {
+    PreparedOpenat2::cwd(heap_path(path), OpenFlags::RDWR, mode, resolve, how_store())
+        .ok()
+        .expect("how storage fits")
+}
+
+#[test]
+fn an_openat2_keeps_its_path_and_its_open_how_readable_at_once() {
+    let cycle = Lifecycle::new();
+    let prepared = prepared_openat2(
+        b"/tmp/two_regions",
+        Openat2Mode::Create(FileMode::OWNER_READ),
+        ResolveFlags::NO_SYMLINKS,
+    );
+    let (kernel, pending) = cycle.submit_openat2(prepared);
+
+    // Two independent allocations the kernel reads for one request: the
+    // path it resolves, and the struct telling it what to do with it.
+    assert_eq!(kernel.resolve_path(), b"/tmp/two_regions");
+    let how = kernel.read_open_how();
+    assert_eq!(
+        how.flags,
+        u64::from(OpenFlags::RDWR.bits() | OpenFlags::CREAT.bits())
+    );
+    assert_eq!(how.mode, u64::from(FileMode::OWNER_READ.bits()));
+    assert_eq!(how.resolve, ResolveFlags::NO_SYMLINKS.bits());
+    // The kernel checks this against its own sizeof, so it is part of the
+    // request being well-formed rather than an incidental field.
+    assert_eq!(
+        kernel.published_how_size() as usize,
+        core::mem::size_of::<OpenHow>()
+    );
+
+    let done = pending
+        .redeem(kernel.post_open(cycle.ring, 7))
+        .ok()
+        .expect("receipt matches");
+    let (file, path, store) = done.into_parts();
+    assert_eq!(path.as_bytes(), b"/tmp/two_regions");
+    core::mem::forget(file);
+    drop((path.into_storage(), store));
+}
+
+#[test]
+fn an_openat2s_two_regions_survive_the_ticket_moving_between_owners() {
+    let cycle = Lifecycle::new();
+    let prepared = prepared_openat2(
+        b"/tmp/travelling",
+        Openat2Mode::Tmpfile(FileMode::OWNER_WRITE),
+        ResolveFlags::BENEATH,
+    );
+    let (kernel, pending) = cycle.submit_openat2(prepared);
+
+    let pending = Box::new(pending);
+    let pending = core::hint::black_box(pending);
+    let pending = *pending;
+
+    // Both regions still reachable through the addresses the SQE carries,
+    // after the ticket that owns them has moved.
+    assert_eq!(kernel.resolve_path(), b"/tmp/travelling");
+    assert_eq!(kernel.read_open_how().resolve, ResolveFlags::BENEATH.bits());
+
+    let done = pending
+        .redeem(kernel.post_open(cycle.ring, 9))
+        .ok()
+        .expect("receipt matches");
+    let (file, path, store) = done.into_parts();
+    core::mem::forget(file);
+    drop((path.into_storage(), store));
+}
+
+#[test]
+fn abandoning_an_openat2_leaks_both_regions_rather_than_freeing_them() {
+    let cycle = Lifecycle::new();
+    let path_storage = HeapBuffer::with_capacity(64);
+    let how_storage = how_store();
+    let leaked_path = (path_storage.ptr, path_storage.len);
+    let leaked_how = (how_storage.ptr, how_storage.len, how_storage.align);
+    let path = OwnedPath::copy_into(path_storage, b"/tmp/dropped")
+        .ok()
+        .expect("storage fits");
+    let prepared = PreparedOpenat2::cwd(
+        path,
+        OpenFlags::RDWR,
+        Openat2Mode::Create(FileMode::OWNER_READ),
+        ResolveFlags::default(),
+        how_storage,
+    )
+    .ok()
+    .expect("how storage fits");
+    let (kernel, pending) = cycle.submit_openat2(prepared);
+
+    // Both leak, not just the path: a ticket that freed the `open_how`
+    // would leave the kernel reading open parameters from dead memory.
+    drop(pending);
+    assert_eq!(kernel.resolve_path(), b"/tmp/dropped");
+    assert_eq!(kernel.read_open_how().mode, 0o400);
+
+    // SAFETY: the abandoned ticket leaked these and the stand-in kernel has
+    // finished, so nothing else can reach them.
+    unsafe {
+        HeapBuffer::reclaim_leaked(leaked_path.0, leaked_path.1);
+        dealloc(
+            leaked_how.0,
+            HeapBuffer::layout_of(leaked_how.1, leaked_how.2),
+        );
+    }
+}
+
+#[test]
+fn reclaiming_an_unpublished_openat2_returns_both_storages_and_its_mode() {
+    let cycle = Lifecycle::new();
+    let prepared = prepared_openat2(
+        b"/tmp/unsent",
+        Openat2Mode::CreateNew(FileMode::OWNER_WRITE),
+        ResolveFlags::IN_ROOT,
+    );
+    let (_kernel, pending) = cycle.submit_openat2(prepared);
+
+    // SAFETY: this stands in for a rejected push — the SQE was built but
+    // never made visible to any kernel, so neither storage is referenced.
+    let prepared = unsafe { pending.reclaim_unsubmitted() };
+    assert_eq!(
+        prepared.mode(),
+        Openat2Mode::CreateNew(FileMode::OWNER_WRITE)
+    );
+    assert_eq!(prepared.resolve(), ResolveFlags::IN_ROOT);
+    // The published struct survived the round trip, so a retry issues the
+    // same request rather than one describing stale parameters.
+    assert_eq!(
+        prepared.published_how().resolve,
+        ResolveFlags::IN_ROOT.bits()
+    );
+    assert_eq!(prepared.path().as_bytes(), b"/tmp/unsent");
+    let (path, store) = prepared.into_parts();
+    drop((path.into_storage(), store));
 }
 
 /// Heap storage aligned for a `Statx`, sized exactly.

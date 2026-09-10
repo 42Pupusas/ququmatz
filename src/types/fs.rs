@@ -66,6 +66,21 @@ bitflags! {
     const OTHER_EXEC = 0o001;
 }
 
+impl FileMode {
+    /// Construct from an arbitrary raw value, including bits outside the
+    /// permission range.
+    ///
+    /// Test-only: exercises the out-of-range rejection in
+    /// [`PreparedOpenat2`](crate::owned::PreparedOpenat2) against bits that
+    /// cannot be spelled through the named constants, since real callers
+    /// only ever OR those together.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn from_raw_for_test(bits: u32) -> Self {
+        Self(bits)
+    }
+}
+
 bitflags! {
     /// Flags for fsync operations.
     pub struct FsyncFlags(u32);
@@ -305,6 +320,27 @@ pub struct OpenHow {
     pub mode: u64,
     /// Path resolution restrictions (`RESOLVE_*` constants).
     pub resolve: u64,
+}
+
+bitflags! {
+    /// Path-resolution restrictions for [`OpenHow`].
+    ///
+    /// The kernel rejects unknown bits in this field with `EINVAL`, so the
+    /// named constants are the only reachable values. `default()` is
+    /// unrestricted resolution.
+    pub struct ResolveFlags(u64);
+    /// Block mount-point crossings.
+    const NO_XDEV = 0x01;
+    /// Block traversal through magic-links (e.g. `/proc/self/fd/*`).
+    const NO_MAGICLINKS = 0x02;
+    /// Block symlink traversal entirely.
+    const NO_SYMLINKS = 0x04;
+    /// Treat the path as relative to `dfd` even if it starts with `/`.
+    const BENEATH = 0x08;
+    /// Require the path to be inside `dfd` (implies `BENEATH`).
+    const IN_ROOT = 0x10;
+    /// Avoid blocking on slow filesystems (returns `EAGAIN` instead).
+    const CACHED = 0x20;
 }
 
 /// `resolve` field constants for [`OpenHow`].

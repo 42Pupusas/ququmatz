@@ -634,10 +634,31 @@ same degenerate-value mistake as the direct-socket slot `0`: the
 cross-directory rename used the basename `"item"` on **both** sides, so an
 implementation sending one path twice still passed. Distinct names now.
 
+`openat2` was added next, and is the first owned request whose
+*parameters* live in caller memory: the kernel reads a `struct open_how`
+at a second published address to learn what to open. That is the vectored
+descriptor-array hazard rather than an open's, so the storage is
+caller-supplied and size- and alignment-checked, and it gets its own Miri
+read (`read_open_how`) for the reason `resolve_second_path` exists —
+freeing only the second region is invisible to a check that scans the
+first. Six sabotages were run against it, all caught: freeing the
+`open_how` on drop, sending a mode `openat2` rejects, dropping the
+`resolve` restrictions, mis-sizing `how_size`, silently losing `EXCL` from
+`CreateNew`, and pointing the SQE's `open_how` at the path storage.
+
+Measurement drove the API here more than in any previous family, because
+`openat2` validates what `openat` ignores: a mode without `CREAT` is
+`EINVAL` rather than ignored, as are a mode above `0o7777`, an unknown
+flag bit, an unknown `resolve` bit, and any `how_size` that is not the
+kernel's own. None of those is reachable through the owned API —
+`Openat2Mode` pairs the mode with the flag that gives it meaning,
+`ResolveFlags` is a named-bit type, and `how_size` is written by the crate
+rather than chosen.
+
 **Scope limits.** The owned layer now covers read/write, vectored I/O,
-zero-copy send, multishot recv and accept, `openat`, direct open, direct
-accept, direct socket, `statx`, `renameat`, `unlinkat`, and `mkdirat`.
-`openat2`, `epoll_ctl`, `files_update`, `timeout`, and the `msghdr`-based
+zero-copy send, multishot recv and accept, `openat`, `openat2`, direct
+open, direct accept, direct socket, `statx`, `renameat`, `unlinkat`, and
+`mkdirat`. `epoll_ctl`, `files_update`, `timeout`, and the `msghdr`-based
 send/recv still go through the `unsafe` `Sqe` surface, which remains for
 lock-free users. Neither direct accept nor direct socket has Miri coverage:
 neither owns userspace storage, so there is no pointer lifetime to model.

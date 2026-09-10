@@ -1,0 +1,11 @@
+error[E0599]: no method named `published_how` found for struct `PendingOpenat2<S, H>` in the current scope
+  --> tests/ui/an_in_flight_open_how_is_unreachable.rs:12:20
+   |
+12 |     let _ = ticket.published_how();
+   |                    ^^^^^^^^^^^^^ method not found in `PendingOpenat2<MmapBuffer, MmapBuffer>`
+
+error[E0599]: no method named `into_parts` found for struct `PendingOpenat2<S, H>` in the current scope
+  --> tests/ui/an_in_flight_open_how_is_unreachable.rs:18:20
+   |
+18 |     let _ = ticket.into_parts();
+   |                    ^^^^^^^^^^ method not found in `PendingOpenat2<MmapBuffer, MmapBuffer>`

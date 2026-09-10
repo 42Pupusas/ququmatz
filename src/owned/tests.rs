@@ -7,17 +7,18 @@ extern crate std;
 use super::PathOpKind;
 use super::{
     Arrival, Completed, Delivery, DirectIncoming, DirectOpenError, DirectSlot, DirectSocketError,
-    Direction, Event, Incoming, MmapBuffer, OwnedPath, PathError, Pending, PendingStatx, PendingZc,
-    Prepared, PreparedAccept, PreparedDirectAccept, PreparedDirectOpen, PreparedDirectSocket,
-    PreparedMultishot, PreparedOpen, PreparedPathOp, PreparedRename, PreparedStatx,
-    PreparedVectored, PreparedZc, Receipt, RenameMode, RingId, SlotIndex, SlotTarget, StableBuffer,
-    StatxError, VectoredError, ZcCompleted,
+    Direction, Event, Incoming, MmapBuffer, Openat2Error, Openat2Mode, OwnedPath, PathError,
+    Pending, PendingStatx, PendingZc, Prepared, PreparedAccept, PreparedDirectAccept,
+    PreparedDirectOpen, PreparedDirectSocket, PreparedMultishot, PreparedOpen, PreparedOpenat2,
+    PreparedPathOp, PreparedRename, PreparedStatx, PreparedVectored, PreparedZc, Receipt,
+    RenameMode, RingId, SlotIndex, SlotTarget, StableBuffer, StatxError, VectoredError,
+    ZcCompleted,
 };
 use crate::error::{Error, SubmitError};
 use crate::net::Socket;
 use crate::types::{
-    AcceptFlags, AddressFamily, DirFd, FileMode, MsgFlags, OpenFlags, RawFd, SocketFlags,
-    SocketType, Statx, StatxFlags, StatxMask,
+    AcceptFlags, AddressFamily, DirFd, FileMode, MsgFlags, OpenFlags, RawFd, ResolveFlags,
+    SocketFlags, SocketType, Statx, StatxFlags, StatxMask,
 };
 
 /// Static proof that a ticket crosses a thread boundary. The whole design
@@ -3227,4 +3228,352 @@ fn a_statx_ticket_survives_moving_to_another_thread_before_completion() {
         done.stat().expect("statx ok").size()
     });
     assert!(handle.join().expect("thread").is_some());
+}
+
+/// Storage for the `open_how` the kernel reads.
+fn how_store() -> MmapBuffer {
+    MmapBuffer::with_capacity(core::mem::size_of::<crate::types::OpenHow>()).expect("map")
+}
+
+#[test]
+fn the_open_how_is_published_before_any_sqe_names_it() {
+    let prepared = PreparedOpenat2::cwd(
+        path_of(b"/tmp/whatever"),
+        OpenFlags::RDWR,
+        Openat2Mode::Create(FileMode::OWNER_READ | FileMode::OWNER_WRITE),
+        ResolveFlags::NO_SYMLINKS,
+        how_store(),
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+
+    // Read back from the storage the kernel will read, not from the
+    // request's own fields: those could agree while the memory does not.
+    let how = prepared.published_how();
+    assert_eq!(
+        how.flags,
+        u64::from(OpenFlags::RDWR.bits() | OpenFlags::CREAT.bits())
+    );
+    assert_eq!(how.mode, 0o600);
+    assert_eq!(how.resolve, ResolveFlags::NO_SYMLINKS.bits());
+}
+
+#[test]
+fn an_existing_open_sends_no_mode_because_the_kernel_refuses_one() {
+    let prepared = PreparedOpenat2::cwd(
+        path_of(b"/etc/hostname"),
+        OpenFlags::default(),
+        Openat2Mode::Existing,
+        ResolveFlags::default(),
+        how_store(),
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+
+    // openat2 returns EINVAL for a non-zero mode without CREAT/TMPFILE,
+    // so `Existing` must publish a zero one.
+    assert_eq!(prepared.published_how().mode, 0);
+    assert_eq!(prepared.published_how().flags, 0);
+}
+
+#[test]
+fn each_creating_mode_publishes_the_flag_that_gives_its_mode_meaning() {
+    let mode = FileMode::OWNER_READ | FileMode::OWNER_WRITE;
+    let cases = [
+        (Openat2Mode::Create(mode), OpenFlags::CREAT.bits()),
+        (
+            Openat2Mode::CreateNew(mode),
+            OpenFlags::CREAT.bits() | OpenFlags::EXCL.bits(),
+        ),
+        (Openat2Mode::Tmpfile(mode), OpenFlags::TMPFILE.bits()),
+    ];
+    for (kind, expected) in cases {
+        let prepared = PreparedOpenat2::cwd(
+            path_of(b"/tmp/target"),
+            OpenFlags::RDWR,
+            kind,
+            ResolveFlags::default(),
+            how_store(),
+        )
+        .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+        let how = prepared.published_how();
+        assert_eq!(
+            how.flags,
+            u64::from(OpenFlags::RDWR.bits() | expected),
+            "{kind:?} published the wrong flags"
+        );
+        assert_eq!(how.mode, 0o600, "{kind:?} published the wrong mode");
+    }
+}
+
+#[test]
+fn a_mode_outside_the_permission_bits_is_refused_with_the_storage_back() {
+    let path = path_of(b"/tmp/target");
+    let addr = path.as_bytes().as_ptr();
+    let store = how_store();
+    let store_addr = store.stable_ptr();
+
+    // 0o10_000 is outside 0o7777; openat2 answers EINVAL rather than
+    // masking it the way openat does.
+    let Err((path, store, e)) = PreparedOpenat2::cwd(
+        path,
+        OpenFlags::default(),
+        Openat2Mode::Create(FileMode::from_raw_for_test(0o10_000)),
+        ResolveFlags::default(),
+        store,
+    ) else {
+        panic!("a mode outside 0o7777 must be refused");
+    };
+    assert_eq!(
+        e,
+        Openat2Error::ModeOutsidePermissionBits { stray: 0o10_000 }
+    );
+    // Both storages came back, so a rejected request costs no allocation.
+    assert_eq!(path.as_bytes().as_ptr(), addr);
+    assert_eq!(store.stable_ptr(), store_addr);
+}
+
+#[test]
+fn how_storage_too_small_is_rejected_rather_than_read_past() {
+    let needed = core::mem::size_of::<crate::types::OpenHow>();
+    let Err((_, _, e)) = PreparedOpenat2::cwd(
+        path_of(b"/tmp/target"),
+        OpenFlags::default(),
+        Openat2Mode::Existing,
+        ResolveFlags::default(),
+        MmapBuffer::with_capacity(needed - 1).expect("map"),
+    ) else {
+        panic!("short open_how storage must be refused");
+    };
+    assert_eq!(
+        e,
+        Openat2Error::HowTooSmall {
+            needed,
+            got: needed - 1
+        }
+    );
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_openat2_creates_the_file_and_returns_both_storages() {
+    let scratch = Scratch::new("openat2");
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let path = scratch.owned_path("made");
+    let path_addr = path.as_bytes().as_ptr();
+    let store = how_store();
+    let store_addr = store.stable_ptr();
+
+    let prepared = PreparedOpenat2::cwd(
+        path,
+        OpenFlags::RDWR,
+        Openat2Mode::Create(FileMode::OWNER_READ | FileMode::OWNER_WRITE),
+        ResolveFlags::default(),
+        store,
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+    let ticket = sub
+        .push_openat2(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let opened = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert!(opened.is_ok(), "openat2 failed: {}", opened.raw_result());
+
+    let (file, path, store) = opened.into_parts();
+    let file = file.expect("a successful open must carry a descriptor");
+
+    // The descriptor is real and writable, which is what RDWR asked for.
+    let mut ring = crate::IoUring::new(4).expect("ring");
+    ring.push(unsafe { crate::Sqe::write(file.fd(), b"proof", 0) }.user_data(1))
+        .expect("push");
+    ring.submit_and_wait(1).expect("submit");
+    assert_eq!(ring.complete().expect("cqe").result, 5);
+    assert_eq!(scratch.read("made"), b"proof");
+    assert_eq!(scratch.mode_of("made"), 0o600);
+
+    // Both storages came back at the addresses they went in at.
+    assert_eq!(path.as_bytes().as_ptr(), path_addr);
+    assert_eq!(store.stable_ptr(), store_addr);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn create_new_refuses_a_path_that_already_exists() {
+    let scratch = Scratch::new("openat2excl");
+    scratch.write("occupied", b"original");
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let prepared = PreparedOpenat2::cwd(
+        scratch.owned_path("occupied"),
+        OpenFlags::RDWR,
+        Openat2Mode::CreateNew(FileMode::OWNER_READ | FileMode::OWNER_WRITE),
+        ResolveFlags::default(),
+        how_store(),
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+    let ticket = sub
+        .push_openat2(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let opened = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+
+    // EEXIST, and the file the caller did not mean to touch is untouched:
+    // a mode that silently opened it would pass a result-only check.
+    assert_eq!(opened.raw_result(), -17);
+    assert!(opened.into_file().is_none());
+    assert_eq!(scratch.read("occupied"), b"original");
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_resolve_restriction_reaches_the_kernel_and_blocks_the_open() {
+    let scratch = Scratch::new("openat2resolve");
+    scratch.write("real", b"data");
+    std::os::unix::fs::symlink(scratch.path("real"), scratch.path("link")).expect("symlink");
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut open = |name: &str, resolve| {
+        let prepared = PreparedOpenat2::cwd(
+            scratch.owned_path(name),
+            OpenFlags::default(),
+            Openat2Mode::Existing,
+            resolve,
+            how_store(),
+        )
+        .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+        let ticket = sub
+            .push_openat2(prepared)
+            .unwrap_or_else(|(_, e)| panic!("{e}"));
+        sub.submit_and_wait(1).expect("submit");
+        let receipt = comp.wait_one().expect("completion");
+        ticket
+            .redeem(receipt)
+            .unwrap_or_else(|_| panic!("mismatch"))
+            .raw_result()
+    };
+
+    // Without the restriction the symlink opens; with it the kernel
+    // refuses. Both halves matter: the first shows the path is otherwise
+    // fine, so the second is the flag working rather than a broken path.
+    assert!(open("link", ResolveFlags::default()) >= 0);
+    assert_eq!(open("link", ResolveFlags::NO_SYMLINKS), -40);
+    // And the restriction does not block a path that has no symlink in it.
+    assert!(open("real", ResolveFlags::NO_SYMLINKS) >= 0);
+}
+
+#[test]
+fn an_openat2_push_that_does_not_fit_hands_both_storages_back() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut tickets = alloc_tickets(&mut sub);
+    let path = path_of(b"/tmp/wherever");
+    let path_addr = path.as_bytes().as_ptr();
+    let store = how_store();
+    let store_addr = store.stable_ptr();
+
+    let prepared = PreparedOpenat2::cwd(
+        path,
+        OpenFlags::RDWR,
+        Openat2Mode::Create(FileMode::OWNER_READ),
+        ResolveFlags::BENEATH,
+        store,
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+
+    let Err((returned, e)) = sub.push_openat2(prepared) else {
+        panic!("a full queue must reject the push");
+    };
+    assert_eq!(e, Error::Submit(SubmitError::QueueFull));
+    // Every field survived, not just the storage: a retry must issue the
+    // same request, so the published `open_how` must still be intact.
+    assert_eq!(returned.path().as_bytes().as_ptr(), path_addr);
+    assert_eq!(returned.mode(), Openat2Mode::Create(FileMode::OWNER_READ));
+    assert_eq!(returned.resolve(), ResolveFlags::BENEATH);
+    let how = returned.published_how();
+    assert_eq!(
+        how.flags,
+        u64::from(OpenFlags::RDWR.bits() | OpenFlags::CREAT.bits())
+    );
+    assert_eq!(how.resolve, ResolveFlags::BENEATH.bits());
+    let (_, store) = returned.into_parts();
+    assert_eq!(store.stable_ptr(), store_addr);
+    tickets.clear();
+}
+
+#[test]
+fn an_openat2_receipt_for_another_request_is_rejected() {
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut make = || {
+        let prepared = PreparedOpenat2::cwd(
+            path_of(b"/tmp/target"),
+            OpenFlags::default(),
+            Openat2Mode::Existing,
+            ResolveFlags::default(),
+            how_store(),
+        )
+        .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+        sub.push_openat2(prepared)
+            .unwrap_or_else(|(_, e)| panic!("{e}"))
+    };
+    let first = make();
+    let second = make();
+
+    let foreign = Receipt {
+        ring: second.ring(),
+        id: second.id(),
+        result: 0,
+        flags: crate::types::CqeFlags::default(),
+    };
+    assert!(!first.matches(&foreign));
+    let Err((first, _)) = first.redeem(foreign) else {
+        panic!("a foreign receipt must not redeem");
+    };
+    drop((first, second));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn an_openat2_ticket_survives_moving_to_another_thread_before_completion() {
+    let scratch = Scratch::new("openat2thread");
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let prepared = PreparedOpenat2::cwd(
+        scratch.owned_path("crossing"),
+        OpenFlags::RDWR,
+        Openat2Mode::Create(FileMode::OWNER_READ | FileMode::OWNER_WRITE),
+        ResolveFlags::default(),
+        how_store(),
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+    let ticket = sub
+        .push_openat2(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    // The kernel read the path and the `open_how` from the submitting
+    // thread; the ticket owning both is redeemed on another one.
+    let handle = std::thread::spawn(move || {
+        let receipt = comp.wait_one().expect("completion");
+        let opened = ticket
+            .redeem(receipt)
+            .unwrap_or_else(|_| panic!("mismatch"));
+        assert!(opened.is_ok(), "open failed: {}", opened.raw_result());
+        opened.into_file().is_some()
+    });
+    assert!(handle.join().expect("thread"));
+    assert!(scratch.exists("crossing"));
 }

@@ -39,6 +39,18 @@ macro_rules! bitflags {
             pub const fn contains(self, flag: Self) -> bool {
                 (self.0 & flag.0) == flag.0
             }
+
+            /// Combine two sets in a `const` context, where `|` cannot go.
+            #[must_use]
+            pub const fn union_const(self, other: Self) -> Self {
+                Self(self.0 | other.0)
+            }
+
+            /// The empty set, in a `const` context where `default` cannot go.
+            #[must_use]
+            pub const fn empty() -> Self {
+                Self(0)
+            }
         }
 
         impl PartialEq<$inner> for $Name {
@@ -107,7 +119,7 @@ pub use eventfd::EventFdFlags;
 pub(crate) use fs::AT_FDCWD;
 pub use fs::{
     DirFd, FadviseAdvice, FallocateMode, FileMode, FsyncFlags, MadviseAdvice, OpenFlags, OpenHow,
-    RenameFlags, Statx, StatxFlags, StatxMask, StatxTimestamp, UnlinkFlags, resolve,
+    RenameFlags, ResolveFlags, Statx, StatxFlags, StatxMask, StatxTimestamp, UnlinkFlags, resolve,
 };
 pub use inotify::{InotifyEvent, InotifyInitFlags, WatchMask};
 pub use mmap::{MapFlags, Prot};
