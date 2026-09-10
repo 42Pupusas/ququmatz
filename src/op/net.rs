@@ -13,6 +13,10 @@ impl Sqe {
     /// `IPPROTO_UDP = 17`). Pass `0` for the default protocol of the
     /// chosen `sock_type`. `flags` controls fd-level options like
     /// `NONBLOCK` and `CLOEXEC`. The CQE result is the new fd.
+    ///
+    /// The flags are folded into the type field rather than sent in
+    /// `rw_flags`, which the kernel requires to be zero — see
+    /// [`SocketType::with_flags`].
     #[must_use]
     pub fn socket(
         domain: AddressFamily,
@@ -23,9 +27,8 @@ impl Sqe {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Socket.into();
         sqe.fd = domain.as_raw();
-        sqe.off = sock_type.as_raw() as u64;
+        sqe.off = u64::from(sock_type.with_flags(flags));
         sqe.len = protocol as u32;
-        sqe.op_flags = flags.bits();
         Self(sqe)
     }
 
@@ -50,15 +53,34 @@ impl Sqe {
         protocol: i32,
         flags: SocketFlags,
     ) -> Self {
+        // `IORING_FILE_INDEX_ALLOC` — kernel reads splice_fd_in as the
+        // fixed-file index; ~0u32 means "allocate one for me".
+        Self::socket_direct_at(domain, sock_type, protocol, flags, -1)
+    }
+
+    /// Prepare a socket creation that installs into a chosen fixed-file slot.
+    ///
+    /// Like [`socket_direct`](Self::socket_direct) but the slot is named by
+    /// the caller rather than picked by the kernel. `slot` is the encoded
+    /// `file_index` value, not a plain table index: the kernel tests it
+    /// against zero to decide whether the request is direct at all, so an
+    /// explicit slot is sent as `index + 1` and `-1`
+    /// (`IORING_FILE_INDEX_ALLOC`) asks it to allocate. Prefer
+    /// [`SlotTarget`](crate::owned::SlotTarget), which owns that encoding.
+    #[must_use]
+    pub fn socket_direct_at(
+        domain: AddressFamily,
+        sock_type: SocketType,
+        protocol: i32,
+        flags: SocketFlags,
+        slot: i32,
+    ) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Socket.into();
         sqe.fd = domain.as_raw();
-        sqe.off = sock_type.as_raw() as u64;
+        sqe.off = u64::from(sock_type.with_flags(flags));
         sqe.len = protocol as u32;
-        sqe.op_flags = flags.bits();
-        // `IORING_FILE_INDEX_ALLOC` — kernel reads splice_fd_in as the
-        // fixed-file index; ~0u32 means "allocate one for me".
-        sqe.splice_fd_in = -1;
+        sqe.splice_fd_in = slot;
         Self(sqe)
     }
 

@@ -2113,8 +2113,13 @@ fn sqe_builder_socket_places_fields_correctly() {
     let inner = sqe.0;
     assert_eq!(Opcode::Socket, inner.opcode);
     assert_eq!(inner.fd, AddressFamily::Inet.as_raw());
-    assert_eq!(inner.off, SocketType::Stream.as_raw() as u64);
-    assert_eq!(inner.op_flags, SocketFlags::NONBLOCK.bits());
+    // The flags ride in the type field, as socket(2) expects.
+    assert_eq!(
+        inner.off,
+        u64::from(SocketType::Stream.as_raw() as u32 | SocketFlags::NONBLOCK.bits())
+    );
+    // rw_flags must be zero or the kernel rejects the request outright.
+    assert_eq!(inner.op_flags, 0);
     // Plain socket op does NOT set splice_fd_in.
     assert_eq!(inner.splice_fd_in, 0);
 }
@@ -2131,10 +2136,85 @@ fn sqe_builder_socket_direct_sets_file_index_alloc() {
     let inner = sqe.0;
     assert_eq!(Opcode::Socket, inner.opcode);
     assert_eq!(inner.fd, AddressFamily::Inet.as_raw());
-    assert_eq!(inner.off, SocketType::Stream.as_raw() as u64);
-    assert_eq!(inner.op_flags, SocketFlags::NONBLOCK.bits());
+    assert_eq!(
+        inner.off,
+        u64::from(SocketType::Stream.as_raw() as u32 | SocketFlags::NONBLOCK.bits())
+    );
+    assert_eq!(inner.op_flags, 0);
     // IORING_FILE_INDEX_ALLOC: kernel reads splice_fd_in as ~0u32.
     assert_eq!(inner.splice_fd_in, -1);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_socket_sqe_with_flags_is_accepted_by_the_kernel() {
+    use crate::types::{AddressFamily, SocketFlags, SocketType};
+    // The field-placement tests above cannot catch a wrong field: they
+    // assert the encoding the builder produces, whatever it is. An earlier
+    // version put these flags in rw_flags, which the kernel requires to be
+    // zero, so every socket op with a non-default flag failed with EINVAL
+    // while both unit tests passed. Only submitting it says otherwise.
+    let mut ring = crate::IoUring::new(4).expect("ring");
+    for flags in [
+        SocketFlags::default(),
+        SocketFlags::NONBLOCK,
+        SocketFlags::CLOEXEC,
+        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+    ] {
+        ring.push(Sqe::socket(AddressFamily::Inet, SocketType::Stream, 0, flags).user_data(1))
+            .expect("push");
+        ring.submit_and_wait(1).expect("submit");
+        let res = ring.complete().expect("cqe").result;
+        assert!(res >= 0, "socket with flags {flags:?} failed: {res}");
+        let _ = syscall::close(RawFd::from_raw(res as usize));
+    }
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_nonblocking_socket_sqe_really_creates_a_nonblocking_socket() {
+    use crate::types::{AddressFamily, SocketFlags, SocketType};
+    // Acceptance is not application: a flag the kernel ignored would still
+    // give a successful CQE. A non-blocking listener with no pending
+    // connection must fail accept4 with EAGAIN rather than block, which is
+    // observable without a second thread.
+    let mut ring = crate::IoUring::new(4).expect("ring");
+    ring.push(
+        Sqe::socket(
+            AddressFamily::Inet,
+            SocketType::Stream,
+            0,
+            SocketFlags::NONBLOCK,
+        )
+        .user_data(1),
+    )
+    .expect("push");
+    ring.submit_and_wait(1).expect("submit");
+    let res = ring.complete().expect("cqe").result;
+    assert!(res >= 0, "socket failed: {res}");
+    let fd = RawFd::from_raw(res as usize);
+
+    let addr = SockAddrIn {
+        sin_family: types::AF_INET as u16,
+        sin_port: 0,
+        sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+        sin_zero: [0; 8],
+    };
+    syscall::bind(
+        fd,
+        (&raw const addr).cast(),
+        core::mem::size_of::<SockAddrIn>() as u32,
+    )
+    .expect("bind");
+    syscall::listen(fd, 1).expect("listen");
+
+    let mut peer = SockAddrIn::default();
+    let mut len = core::mem::size_of::<SockAddrIn>() as u32;
+    let outcome = syscall::accept4(fd, (&raw mut peer).cast(), &raw mut len, 0);
+    let err = outcome.expect_err("a non-blocking accept4 must not succeed here");
+    assert_eq!(err.raw(), 11, "EAGAIN proves the flag was applied");
+
+    let _ = syscall::close(fd);
 }
 
 #[test]

@@ -1062,7 +1062,7 @@ fn a_real_direct_accept_installs_connections_into_the_table_not_the_process() {
     }
 
     assert_eq!(slots.len(), 3, "one armed accept filled three slots");
-    let indices: std::vec::Vec<u32> = slots.iter().map(|s| s.index().get()).collect();
+    let mut indices: std::vec::Vec<u32> = slots.iter().map(|s| s.index().get()).collect();
 
     // What comes back is a table index, not a descriptor. A fresh sparse
     // table allocates densely from zero, so these are exactly 0, 1, 2 --
@@ -1076,10 +1076,9 @@ fn a_real_direct_accept_installs_connections_into_the_table_not_the_process() {
     // resource, so it raced every other test thread creating and closing
     // descriptors in the same binary, and failed under parallelism for
     // reasons unrelated to accept. This claim is local to the ring.
-    let mut sorted = indices.clone();
-    sorted.sort_unstable();
+    indices.sort_unstable();
     assert_eq!(
-        sorted,
+        indices,
         std::vec![0, 1, 2],
         "a direct accept reports table slots, not process descriptors"
     );

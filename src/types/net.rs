@@ -46,6 +46,28 @@ impl SocketType {
     pub const fn as_raw(self) -> i32 {
         self as i32
     }
+
+    /// Combine this type with socket flags the way `socket(2)` expects.
+    ///
+    /// `SOCK_NONBLOCK` and `SOCK_CLOEXEC` are not a separate argument to
+    /// `socket(2)`; they are OR'd into the type, and `IORING_OP_SOCKET`
+    /// keeps that convention:
+    ///
+    /// ```text
+    /// if (sqe->addr || sqe->rw_flags || sqe->buf_index)
+    ///         return -EINVAL;
+    /// sock->type = READ_ONCE(sqe->off);
+    /// sock->flags = sock->type & ~SOCK_TYPE_MASK;
+    /// ```
+    ///
+    /// So the flags ride in the type field and `rw_flags` must be zero —
+    /// putting the flags there instead fails the request outright with
+    /// `EINVAL`, whatever the flags are.
+    #[must_use]
+    #[allow(clippy::cast_sign_loss)]
+    pub const fn with_flags(self, flags: SocketFlags) -> u32 {
+        self.as_raw() as u32 | flags.bits()
+    }
 }
 
 /// Shutdown modes.
@@ -89,10 +111,13 @@ bitflags! {
 }
 
 bitflags! {
-    /// Flags for `IORING_OP_SOCKET` (passed via `sqe.rw_flags`).
+    /// Flags for `IORING_OP_SOCKET`, carried in the socket *type*.
     ///
-    /// These modify the created socket's behavior independently of the
-    /// socket type passed in `sock_type`.
+    /// These modify the created socket's behaviour independently of the
+    /// socket type, but they do not travel in a field of their own: see
+    /// [`SocketType::with_flags`].
+    ///
+    /// Use `SocketFlags::default()` for no flags.
     pub struct SocketFlags(u32);
     /// Set the socket to non-blocking mode (`SOCK_NONBLOCK`).
     const NONBLOCK = 0o4000;
