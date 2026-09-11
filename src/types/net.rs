@@ -185,28 +185,34 @@ impl SockAddrIn {
 
 /// Message header for sendmsg/recvmsg.
 ///
-/// The padding fields match the `x86_64` C ABI layout of `struct msghdr`:
-/// the compiler inserts padding after `msg_namelen` (u32) to align
-/// `msg_iov` (pointer) to 8 bytes, and after `msg_flags` (i32) to bring
-/// the struct size to a multiple of 8 (the alignment of pointer fields).
+/// Field order matches the kernel's `struct msghdr`. The padding around
+/// `msg_namelen` and `msg_flags` is left to `repr(C)` rather than written
+/// out: on 64-bit targets it inserts four bytes after each to align the
+/// following pointer, and on 32-bit ARM it inserts none, because pointers
+/// there align to 4. Declaring those gaps as `u32` fields would make them
+/// real members on ARM and displace every pointer after them.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct MsgHdr {
     pub msg_name: *mut u8,
     pub msg_namelen: u32,
-    /// Alignment padding after u32 `msg_namelen` to align `msg_iov` to 8 bytes.
-    pub(crate) _pad1: u32,
     pub msg_iov: *mut IoVec,
     pub msg_iovlen: usize,
     pub msg_control: *mut u8,
     pub msg_controllen: usize,
     pub msg_flags: i32,
-    /// Trailing padding after i32 `msg_flags` for 8-byte struct alignment.
-    pub(crate) _pad2: u32,
+}
+
+impl MsgHdr {
+    const LAYOUT_IS_ABI_EXACT: () = assert!(
+        core::mem::size_of::<Self>() == 7 * core::mem::size_of::<*mut u8>(),
+        "MsgHdr must occupy exactly seven pointer-widths: four pointer-sized members, and three 32-bit members each padded out to a pointer. A padding field declared by hand breaks this on 32-bit targets, where the gap it claims to fill does not exist."
+    );
 }
 
 impl Default for MsgHdr {
     fn default() -> Self {
+        let () = Self::LAYOUT_IS_ABI_EXACT;
         // Safety: all fields are integer or pointer types; zero is valid.
         unsafe { core::mem::zeroed() }
     }

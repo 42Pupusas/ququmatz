@@ -972,11 +972,32 @@ reaching them would have invoked, and `write` would have terminated the
 process. Verified by building for `wasm32-unknown-unknown`, where both
 messages appear.
 
-Still open under Q-09: `MsgHdr` and the epoll structs remain hard-coded
-to the x86_64 ABI, layout tests assert 64-bit sizes unconditionally, and
-an x86_64 asm helper in the test module breaks `--all-targets` on
+`MsgHdr` is also fixed. It declared `_pad1` and `_pad2` as real `u32`
+fields to stand in for the padding the x86_64 ABI inserts around
+`msg_namelen` and `msg_flags`. On 32-bit ARM pointers align to 4, so the
+ABI inserts no padding there and those declared fields become genuine
+members, displacing `msg_iov` and every pointer after it by four bytes.
+The fields are gone; `repr(C)` inserts the right padding per target.
+The size assertion is now pointer-width relative, and a new test checks
+every field offset rather than the total size.
+
+**A verification limit worth stating.** Neither the offset test nor a
+`const` size assertion can catch this class of error on x86_64: a
+declared `u32` sitting where the ABI would have put four padding bytes
+produces a byte-identical struct. Reinstating `_pad1` was tried as a
+sabotage and every check still passed. The bug is only observable on a
+32-bit target, and no 32-bit std is installed here, so the fix is
+reasoned from the ABI rule rather than demonstrated. The tests added
+alongside it will detect the regression the moment the suite is run on
+`armv7-unknown-linux-gnueabihf`.
+
+Still open under Q-09: the epoll structs remain hard-coded to the x86_64
+layout, several layout tests still assert 64-bit sizes unconditionally,
+and an x86_64 asm helper in the test module breaks `--all-targets` on
 aarch64. Those need per-target layouts and execution on real hardware,
-not another gate.
+not another gate. The available machines (`arrakis`, `miniforum`) are
+both x86_64 with no cross-runner installed, so no non-x86_64 execution
+has been performed for any claim in this document.
 
 ### Q-10 — Setup allocation failure leaks a separately mapped CQ
 

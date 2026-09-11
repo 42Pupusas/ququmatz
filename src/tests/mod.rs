@@ -91,8 +91,45 @@ fn iovec_layout() {
 
 #[test]
 fn msghdr_layout() {
-    assert_eq!(mem::size_of::<MsgHdr>(), 56);
-    assert_eq!(mem::align_of::<MsgHdr>(), 8);
+    let expected_size = if mem::size_of::<usize>() == 8 { 56 } else { 28 };
+    assert_eq!(mem::size_of::<MsgHdr>(), expected_size);
+    assert_eq!(mem::align_of::<MsgHdr>(), mem::align_of::<*mut u8>());
+}
+
+#[test]
+fn msghdr_field_offsets_follow_the_pointer_width() {
+    let hdr = MsgHdr::default();
+    let base = core::ptr::from_ref(&hdr) as usize;
+    let ptr = mem::size_of::<*mut u8>();
+    let offset_of = |addr: usize| addr - base;
+
+    assert_eq!(offset_of(core::ptr::from_ref(&hdr.msg_name) as usize), 0);
+    assert_eq!(
+        offset_of(core::ptr::from_ref(&hdr.msg_namelen) as usize),
+        ptr
+    );
+    assert_eq!(
+        offset_of(core::ptr::from_ref(&hdr.msg_iov) as usize),
+        2 * ptr,
+        "msg_iov sits one pointer past the msg_namelen slot: on 64-bit that \
+         means the ABI padding is present, on 32-bit that it is absent"
+    );
+    assert_eq!(
+        offset_of(core::ptr::from_ref(&hdr.msg_iovlen) as usize),
+        3 * ptr
+    );
+    assert_eq!(
+        offset_of(core::ptr::from_ref(&hdr.msg_control) as usize),
+        4 * ptr
+    );
+    assert_eq!(
+        offset_of(core::ptr::from_ref(&hdr.msg_controllen) as usize),
+        5 * ptr
+    );
+    assert_eq!(
+        offset_of(core::ptr::from_ref(&hdr.msg_flags) as usize),
+        6 * ptr
+    );
 }
 
 #[test]
