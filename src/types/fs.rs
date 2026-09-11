@@ -311,6 +311,19 @@ impl Statx {
 }
 
 bitflags! {
+    /// Flags for `IORING_OP_FIXED_FD_INSTALL`, carried in the SQE's
+    /// `install_fd_flags` (the `op_flags` field).
+    pub struct InstallFdFlags(u32);
+    /// Do not mark the installed descriptor `O_CLOEXEC`.
+    ///
+    /// The kernel installs `O_CLOEXEC` by default — the opposite default
+    /// from a plain `dup(2)` — because a fixed-file slot most often holds
+    /// something the caller does not want surviving an `execve`. Set this
+    /// bit to keep the descriptor open across one anyway.
+    const NO_CLOEXEC = 1 << 0;
+}
+
+bitflags! {
     /// Flags for renameat2.
     pub struct RenameFlags(u32);
     const NOREPLACE = 1 << 0;

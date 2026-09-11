@@ -9,11 +9,12 @@ use super::{
     MsgRegionError, Openat2Error, Openat2Mode, OwnedPath, PathError, PeerWanted, Pending,
     PendingStatx, PendingZc, Prepared, PreparedAccept, PreparedBind, PreparedCancel,
     PreparedConnect, PreparedDirectAccept, PreparedDirectOpen, PreparedDirectSocket,
-    PreparedEpollCtl, PreparedFilesUpdate, PreparedMsgRing, PreparedMultishot, PreparedOpen,
-    PreparedOpenat2, PreparedPathOp, PreparedRecvmsg, PreparedRename, PreparedSendmsg,
-    PreparedSendmsgZc, PreparedStatx, PreparedTimeout, PreparedVectored, PreparedWaitId,
-    PreparedZc, Receipt, RenameMode, RingId, SendTarget, SlotIndex, SlotTarget, StableBuffer,
-    StatxError, TableEntry, TimeoutError, Update, VectoredError, WaitIdError, ZcCompleted,
+    PreparedEpollCtl, PreparedFilesUpdate, PreparedFixedFdInstall, PreparedMsgRing,
+    PreparedMultishot, PreparedOpen, PreparedOpenat2, PreparedPathOp, PreparedRecvmsg,
+    PreparedRename, PreparedSendmsg, PreparedSendmsgZc, PreparedStatx, PreparedTimeout,
+    PreparedVectored, PreparedWaitId, PreparedZc, Receipt, RenameMode, RingId, SendTarget,
+    SlotIndex, SlotTarget, StableBuffer, StatxError, TableEntry, TimeoutError, Update,
+    VectoredError, WaitIdError, ZcCompleted,
 };
 /// Only the kernel-backed tests name a path-op kind or inspect a peer
 /// address, and those are gated.
@@ -22,9 +23,9 @@ use super::{PathOpKind, PeerAddress};
 use crate::error::{Error, SubmitError};
 use crate::net::Socket;
 use crate::types::{
-    AcceptFlags, AddressFamily, DirFd, EpollEvent, EpollEvents, FileMode, IdType, MsgFlags,
-    OpenFlags, RawFd, ResolveFlags, SockAddrIn, SocketFlags, SocketType, Statx, StatxFlags,
-    StatxMask, Timespec, WaitOptions, WaitidSiginfo,
+    AcceptFlags, AddressFamily, DirFd, EpollEvent, EpollEvents, FileMode, IdType, InstallFdFlags,
+    MsgFlags, OpenFlags, RawFd, ResolveFlags, SockAddrIn, SocketFlags, SocketType, Statx,
+    StatxFlags, StatxMask, Timespec, WaitOptions, WaitidSiginfo,
 };
 
 /// Static proof that a ticket crosses a thread boundary. The whole design
@@ -1981,6 +1982,77 @@ fn a_direct_open_installs_into_the_table_without_touching_the_process() {
     sub.submit_and_wait(1).expect("submit");
     let done = comp.wait_one().expect("completion");
     assert_eq!(done.raw_result(), 5, "the installed file must be writable");
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_fixed_fd_install_promotes_a_table_slot_to_a_process_descriptor() {
+    let ring = ring_with_table(4, 4);
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let opened = {
+        let request = PreparedDirectOpen::cwd(
+            path_of(b"/tmp"),
+            OpenFlags::TMPFILE | OpenFlags::RDWR,
+            FileMode::OWNER_READ | FileMode::OWNER_WRITE,
+            SlotTarget::Auto,
+        )
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+        let ticket = sub
+            .push_direct_open(request)
+            .unwrap_or_else(|(_, e)| panic!("{e}"));
+        sub.submit_and_wait(1).expect("submit");
+        let receipt = comp.wait_one().expect("completion");
+        ticket.redeem(receipt).unwrap_or_else(|_| panic!("mismatch"))
+    };
+    let (slot, _path) = opened.into_parts();
+    let slot = slot.expect("a successful direct open names a slot");
+
+    let install = PreparedFixedFdInstall::of(&slot, InstallFdFlags::empty());
+    let ticket = sub
+        .push_fixed_fd_install(install)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+    let receipt = comp.wait_one().expect("completion");
+    let installed = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert!(
+        installed.is_ok(),
+        "fixed_fd_install failed: {}",
+        installed.raw_result()
+    );
+    let file = installed
+        .into_file()
+        .expect("a successful install yields a descriptor");
+
+    // The returned descriptor is a real, independent fd: writing through
+    // it (a plain syscall, not fixed_file -- it is no longer a table
+    // index) reaches the same file the slot still names.
+    let written = crate::syscall::write(file.fd(), b"promoted".as_ptr(), 8).expect("write");
+    assert_eq!(written, 8);
+
+    // The slot itself was left alone: the table can still reach the same
+    // file, and reading through it sees what the descriptor just wrote.
+    let mut buf = MmapBuffer::with_capacity(16).expect("map");
+    sub.raw()
+        .push(
+            unsafe {
+                crate::Sqe::read_ptr(
+                    RawFd::from_raw(slot.as_fixed_fd() as usize),
+                    buf.as_mut_slice().as_mut_ptr(),
+                    8,
+                    0,
+                )
+            }
+            .fixed_file()
+            .user_data(0xF1),
+        )
+        .expect("push read");
+    sub.submit_and_wait(1).expect("submit");
+    let done = comp.wait_one().expect("completion");
+    assert_eq!(done.raw_result(), 8, "the slot still names the same file");
+    assert_eq!(&buf.as_slice()[..8], b"promoted");
 }
 
 #[cfg(not(miri))]

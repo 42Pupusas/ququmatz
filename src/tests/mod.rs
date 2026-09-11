@@ -1006,6 +1006,22 @@ fn sqe_builder_sync_file_range_places_fields_correctly() {
     assert_eq!(inner.op_flags, SyncFileRangeFlags::WRITE.bits());
 }
 
+#[test]
+fn sqe_builder_fixed_fd_install_sets_fixed_file_and_places_fields_correctly() {
+    use crate::types::{InstallFdFlags, Opcode, SqeFlags};
+
+    let sqe = Sqe::fixed_fd_install(RawFd::from_raw(3), InstallFdFlags::NO_CLOEXEC);
+    let inner = sqe.0;
+    assert_eq!(Opcode::FixedFdInstall, inner.opcode);
+    assert_eq!(inner.fd, 3);
+    assert_eq!(
+        inner.flags & SqeFlags::FIXED_FILE.bits(),
+        SqeFlags::FIXED_FILE.bits(),
+        "the slot is always read as a table index, never a raw fd"
+    );
+    assert_eq!(inner.op_flags, InstallFdFlags::NO_CLOEXEC.bits());
+}
+
 #[cfg(not(miri))]
 #[test]
 fn statx_on_tmp() {

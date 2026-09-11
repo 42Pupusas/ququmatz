@@ -11,6 +11,7 @@ use super::direct_socket::{PendingDirectSocket, PreparedDirectSocket};
 use super::epoll::{PendingEpollCtl, PreparedEpollCtl};
 use super::event::{Event, PartialReceipt};
 use super::filesupdate::{PendingFilesUpdate, PreparedFilesUpdate};
+use super::fixedfdinstall::{PendingFixedFdInstall, PreparedFixedFdInstall};
 use super::futex::{PendingFutexWait, PendingFutexWake, PreparedFutexWait, PreparedFutexWake};
 use super::futexwaitv::{PendingFutexWaitv, PreparedFutexWaitv};
 use super::identity::{RequestIdSource, RingId};
@@ -224,6 +225,29 @@ impl OwnedSubmitter {
         &mut self,
         request: PreparedMsgRing,
     ) -> Result<PendingMsgRing, (PreparedMsgRing, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            // The request owns nothing, so handing back the copy taken
+            // before submission returns it exactly as it arrived.
+            Err(e) => Err((request, e)),
+        }
+    }
+
+    /// Queue an `IORING_OP_FIXED_FD_INSTALL` request.
+    ///
+    /// Owns nothing — the slot and flags travel as SQE fields, not
+    /// through a pointer — so a rejected push simply hands back an
+    /// identical copy of the request.
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact.
+    pub fn push_fixed_fd_install(
+        &mut self,
+        request: PreparedFixedFdInstall,
+    ) -> Result<PendingFixedFdInstall, (PreparedFixedFdInstall, Error)> {
         let id = self.ids.next();
         let (sqe, pending) = request.into_pending(self.ring, id);
         match self.inner.push(sqe) {

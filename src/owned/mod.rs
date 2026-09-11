@@ -358,6 +358,7 @@ mod direct_socket;
 mod epoll;
 mod event;
 mod filesupdate;
+mod fixedfdinstall;
 mod futex;
 mod futexwaitv;
 mod identity;
@@ -408,6 +409,7 @@ pub use event::{Event, PartialReceipt};
 pub use filesupdate::{
     FilesUpdateError, FilesUpdated, PendingFilesUpdate, PreparedFilesUpdate, TableEntry, Update,
 };
+pub use fixedfdinstall::{FixedFdInstalled, PendingFixedFdInstall, PreparedFixedFdInstall};
 pub use futex::{
     FutexWaitDone, FutexWaitOutcome, FutexWakeDone, PendingFutexWait, PendingFutexWake,
     PreparedFutexWait, PreparedFutexWake,

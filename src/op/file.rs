@@ -4,9 +4,9 @@
 
 use super::{Sqe, ZEROED};
 use crate::types::{
-    DirFd, FadviseAdvice, FallocateMode, FileMode, FsyncFlags, IoVec, MadviseAdvice, Opcode,
-    OpenFlags, OpenHow, RawFd, RenameFlags, SpliceFlags, Statx, StatxFlags, StatxMask,
-    SyncFileRangeFlags, UnlinkFlags,
+    DirFd, FadviseAdvice, FallocateMode, FileMode, FsyncFlags, InstallFdFlags, IoVec,
+    MadviseAdvice, Opcode, OpenFlags, OpenHow, RawFd, RenameFlags, SpliceFlags, SqeFlags, Statx,
+    StatxFlags, StatxMask, SyncFileRangeFlags, UnlinkFlags,
 };
 
 impl Sqe {
@@ -618,6 +618,30 @@ impl Sqe {
         sqe.fd = fd_out.as_i32();
         sqe.splice_fd_in = fd_in.as_i32();
         sqe.len = len;
+        sqe.op_flags = flags.bits();
+        Self(sqe)
+    }
+
+    /// Prepare a `IORING_OP_FIXED_FD_INSTALL`.
+    ///
+    /// Promotes a registered/fixed file table slot to a real process file
+    /// descriptor — the reverse of a direct open or direct socket, which
+    /// install *into* the table. `slot` is a plain table index, the same
+    /// number [`DirectSlot::index`](crate::owned::DirectSlot::index)
+    /// reports; the kernel resolves it through the file table because this
+    /// SQE always sets [`SqeFlags::FIXED_FILE`].
+    ///
+    /// The CQE result is the new process descriptor on success. The
+    /// installed descriptor is `O_CLOEXEC` unless `flags` includes
+    /// [`InstallFdFlags::NO_CLOEXEC`]. The slot itself is untouched — the
+    /// file stays registered in the table after this call, so closing the
+    /// returned descriptor later does not remove it from there.
+    #[must_use]
+    pub fn fixed_fd_install(slot: RawFd, flags: InstallFdFlags) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::FixedFdInstall.into();
+        sqe.fd = slot.as_i32();
+        sqe.flags = SqeFlags::FIXED_FILE.bits();
         sqe.op_flags = flags.bits();
         Self(sqe)
     }

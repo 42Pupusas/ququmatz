@@ -52,6 +52,7 @@ pub enum Opcode {
     FutexWait = 51,
     FutexWake = 52,
     FutexWaitv = 53,
+    FixedFdInstall = 54,
     Bind = 56,
     Listen = 57,
 }
