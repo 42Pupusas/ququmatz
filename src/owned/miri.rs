@@ -196,10 +196,13 @@ impl FakeKernel {
 
     /// The published address as a pointer.
     ///
-    /// The SQE stores a `u64` because that is the kernel ABI, so this is an
-    /// int-to-pointer cast by necessity. Miri is told to expose the
-    /// provenance at the source, which is what makes accesses through this
-    /// pointer checkable rather than silently unchecked.
+    /// The SQE stores a `u64` because that is the kernel ABI, so recovering a
+    /// pointer is an int-to-pointer cast by necessity. The `ptr as u64` casts
+    /// in `src/op/` expose the provenance at the source, so accesses through
+    /// this pointer are checked under the default provenance mode. They are
+    /// NOT checked under `-Zmiri-strict-provenance`, which rejects this cast
+    /// outright; these tests are therefore run in the default mode and cannot
+    /// be strengthened to strict without an ABI that carries pointers.
     fn published_ptr(&self) -> *mut u8 {
         let addr = usize::try_from(self.addr()).expect("address fits a pointer");
         core::ptr::with_exposed_provenance_mut(addr)

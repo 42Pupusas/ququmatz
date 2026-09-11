@@ -1022,15 +1022,50 @@ but the ABI claims are now demonstrated rather than reasoned.
 Verified this round: 460 lib tests (default and `--no-default-features`),
 20 compile-fail fixtures, 5 doctests, clippy `-D warnings --all-targets`
 in both feature modes, `cargo check --all-targets` for aarch64, and the
-wasm32 layout cross-check. **Miri was not run: the component is not
-installed for either toolchain on this machine.** The `owned::miri`
-tests ran as ordinary tests, which does not exercise the aliasing model.
+wasm32 layout cross-check.
 
-Still open under Q-09: no non-x86_64 *execution* has occurred. The
-available machines (`arrakis`, `miniforum`) are both x86_64 with no
-cross-runner installed, and `rust-std` is absent for armv7, riscv64 and
-i686. Layout and syscall numbers are checked at compile time against the
-kernel's own headers and tables; nothing has run on the hardware.
+### Miri, and the limit of its checking here
+
+Miri does run: 77 `owned::miri` tests pass under Stacked Borrows in both
+feature modes. That is the aliasing evidence the ownership model needed.
+
+Its strength must be stated precisely. The `FakeKernel` recovers a
+pointer from the SQE's `addr` field, which is a `u64` because that is
+the kernel ABI, so the recovery is an int-to-pointer cast. The `ptr as
+u64` casts in `src/op/` expose provenance at the source, so accesses
+through the recovered pointer are genuinely checked in Miri's default
+mode. They are **not** checked under `-Zmiri-strict-provenance`, which
+rejects the cast outright rather than running the test. The suite is
+therefore run in the default mode, and cannot be strengthened to strict
+without an ABI that carries pointers instead of integers -- which
+io_uring does not.
+
+A doc comment on `published_ptr` previously claimed the crate tells
+Miri to expose the provenance. Nothing in the crate calls
+`expose_provenance`; the exposure is a side effect of the `as` casts.
+The comment has been corrected.
+
+### Non-x86_64 execution
+
+No non-x86_64 execution has occurred *on this machine*, and none can:
+both available hosts (`arrakis`, `miniforum`) are x86_64 with no
+cross-runner, and `rust-std` is absent for armv7, riscv64 and i686.
+
+`.github/workflows/ci.yml` closes that gap on CI. `cross_compile`
+checks `--all-targets` for aarch64, riscv64, armv7 and i686;
+`cross_execute` **runs** the 53 struct-layout, field-offset and SQE
+encoding tests under qemu on each of those four targets. Those tests are
+pure userspace -- they build structs and inspect bytes -- so emulation
+is a sound venue for them.
+
+The io_uring runtime tests are deliberately excluded from the emulated
+jobs: qemu-user does not implement `io_uring_setup`, so running them
+there would produce failures that say nothing about this crate. Runtime
+behaviour is still only exercised on x86_64. The claim CI will support
+is "the ABI layouts and SQE encodings are correct on four
+architectures," not "the crate is known to work on four
+architectures." Q-13 stays open until real non-x86_64 hardware runs the
+full suite.
 
 ### Q-10 — Setup allocation failure leaks a separately mapped CQ
 
