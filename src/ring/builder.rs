@@ -34,6 +34,26 @@ impl IoUringBuilder {
         }
     }
 
+    /// Enable polled I/O completion mode.
+    ///
+    /// Instead of the kernel posting completions asynchronously (typically
+    /// off an interrupt), it polls the device for completions only when
+    /// asked — every call that would otherwise block for completions
+    /// (`submit_and_wait`, `Completer::wait`) drives that poll because it
+    /// already issues `io_uring_enter` with `GETEVENTS`. A plain `submit`
+    /// with no wait does not reap anything: nothing arrives in the CQ
+    /// until something asks the kernel to poll for it.
+    ///
+    /// Requires files opened with `O_DIRECT` for read/write opcodes, and a
+    /// block device/driver that supports polling — most other opcodes
+    /// (network I/O, timeouts, polling primitives) are not iopoll-capable
+    /// and are rejected by the kernel on a ring created with this flag.
+    #[must_use]
+    pub const fn iopoll(mut self) -> Self {
+        self.params.flags |= SetupFlags::IOPOLL.bits();
+        self
+    }
+
     /// Enable kernel-side SQ polling with the given idle timeout in milliseconds.
     ///
     /// When SQPOLL is active, the kernel polls the SQ for new entries without

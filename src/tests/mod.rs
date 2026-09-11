@@ -3,10 +3,11 @@ use std::{vec, vec::Vec};
 
 use super::*;
 use crate::types::{
-    AcceptFlags, EventFdFlags, FileMode, FsyncFlags, InotifyEvent, InotifyInitFlags,
-    IoCqringOffsets, IoSqringOffsets, IoUringBuf, IoUringBufReg, IoUringCqe, IoUringParams,
-    IoUringSqe, MsgFlags, MsgHdr, Opcode, OpenFlags, PollMask, RecvmsgOut, SockAddrIn, SqeFlags,
-    Statx, StatxFlags, StatxMask, StatxTimestamp, WatchMask,
+    AcceptFlags, EventFdFlags, FileMode, Futex2Flags, FutexWaitv, FsyncFlags, IdType,
+    InotifyEvent, InotifyInitFlags, IoCqringOffsets, IoSqringOffsets, IoUringBuf, IoUringBufReg,
+    IoUringCqe, IoUringParams, IoUringSqe, MsgFlags, MsgHdr, Opcode, OpenFlags, PollMask,
+    RecvmsgOut, SockAddrIn, SqeFlags, Statx, StatxFlags, StatxMask, StatxTimestamp, WaitOptions,
+    WaitidSiginfo, WatchMask,
 };
 use core::mem;
 
@@ -29,6 +30,14 @@ struct UniqueTestPath {
 #[cfg(not(miri))]
 impl UniqueTestPath {
     fn new(prefix: &str) -> Self {
+        Self::new_in(std::env::temp_dir().to_str().expect("temp dir is valid UTF-8"), prefix)
+    }
+
+    /// Like [`new`](Self::new), but rooted at `dir` instead of the system
+    /// temp directory — needed for tests (like `O_DIRECT`) that require a
+    /// real block-backed filesystem rather than whatever `temp_dir()`
+    /// resolves to, which is tmpfs on most distros.
+    fn new_in(dir: &str, prefix: &str) -> Self {
         static COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
         let nonce = COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
@@ -36,8 +45,6 @@ impl UniqueTestPath {
             .expect("system clock before epoch")
             .as_nanos();
         let pid = std::process::id();
-        let dir = std::env::temp_dir();
-        let dir = dir.to_str().expect("temp dir is valid UTF-8");
         Self {
             path: std::format!("{dir}/ququmatz_{prefix}_{pid}_{nonce}_{nanos}"),
         }
@@ -565,6 +572,117 @@ fn sqe_builder_cancel_places_fields_correctly() {
     assert_eq!(Opcode::AsyncCancel, inner.opcode);
     assert_eq!(inner.addr, 99); // target user_data
     assert_eq!(inner.user_data, 100);
+    assert_eq!(inner.op_flags, 0);
+}
+
+#[test]
+fn sqe_builder_cancel_with_flags_sets_the_all_bit() {
+    let sqe = Sqe::cancel_with_flags(99, crate::types::CancelFlags::ALL).user_data(100);
+    let inner = sqe.0;
+
+    assert_eq!(Opcode::AsyncCancel, inner.opcode);
+    assert_eq!(inner.addr, 99);
+    assert_eq!(inner.op_flags, crate::types::CancelFlags::ALL.bits());
+}
+
+#[test]
+fn sqe_builder_cancel_fd_matches_by_descriptor() {
+    use crate::types::{CancelFlags, RawFd};
+
+    let sqe = Sqe::cancel_fd(RawFd::from_raw(7), CancelFlags::ALL).user_data(1);
+    let inner = sqe.0;
+
+    assert_eq!(Opcode::AsyncCancel, inner.opcode);
+    assert_eq!(inner.fd, 7);
+    assert_eq!(
+        inner.op_flags,
+        (CancelFlags::FD | CancelFlags::ALL).bits()
+    );
+}
+
+#[test]
+fn sqe_builder_cancel_any_ignores_user_data() {
+    use crate::types::CancelFlags;
+
+    let sqe = Sqe::cancel_any(CancelFlags::ALL).user_data(1);
+    let inner = sqe.0;
+
+    assert_eq!(Opcode::AsyncCancel, inner.opcode);
+    assert_eq!(inner.addr, 0);
+    assert_eq!(
+        inner.op_flags,
+        (CancelFlags::ANY | CancelFlags::ALL).bits()
+    );
+}
+
+#[test]
+fn sqe_builder_cancel_matching_opcode_stores_opcode_in_len() {
+    use crate::types::CancelFlags;
+
+    let sqe = Sqe::cancel_any(CancelFlags::empty()).cancel_matching_opcode(Opcode::Read);
+    let inner = sqe.0;
+
+    assert_eq!(inner.op_flags, (CancelFlags::ANY | CancelFlags::OP).bits());
+    assert_eq!(inner.len, Opcode::Read as u32);
+}
+
+#[test]
+fn sqe_builder_msg_ring_places_fields_correctly() {
+    use crate::types::RawFd;
+
+    let sqe = Sqe::msg_ring(RawFd::from_raw(9), 5, 42).user_data(100);
+    let inner = sqe.0;
+
+    assert_eq!(Opcode::MsgRing, inner.opcode);
+    assert_eq!(inner.fd, 9);
+    assert_eq!(inner.len, 5);
+    assert_eq!(inner.off, 42);
+    assert_eq!(inner.op_flags, 0);
+}
+
+#[test]
+fn sqe_builder_msg_ring_cqe_flags_sets_flags_pass_and_carries_the_flags() {
+    use crate::types::{MsgRingFlags, RawFd};
+
+    let sqe = Sqe::msg_ring_cqe_flags(RawFd::from_raw(9), 5, 42, 0x7);
+    let inner = sqe.0;
+
+    assert_eq!(Opcode::MsgRing, inner.opcode);
+    assert_eq!(inner.op_flags, MsgRingFlags::FLAGS_PASS.bits());
+    assert_eq!(inner.splice_fd_in, 7);
+}
+
+#[test]
+fn sqe_builder_msg_ring_fd_sets_the_send_fd_sentinel() {
+    use crate::types::RawFd;
+
+    let sqe = Sqe::msg_ring_fd(RawFd::from_raw(9), RawFd::from_raw(3), -1, 7);
+    let inner = sqe.0;
+
+    assert_eq!(Opcode::MsgRing, inner.opcode);
+    assert_eq!(inner.addr, 1); // IORING_MSG_SEND_FD
+    assert_eq!(inner.addr3, 3);
+    assert_eq!(inner.off, 7);
+    assert_eq!(inner.splice_fd_in, -1);
+}
+
+#[test]
+fn cancel_outcome_classifies_raw_results() {
+    use crate::types::CancelOutcome;
+
+    assert_eq!(CancelOutcome::from_raw(0), CancelOutcome::Applied(0));
+    assert_eq!(CancelOutcome::from_raw(3), CancelOutcome::Applied(3));
+    assert_eq!(CancelOutcome::from_raw(-2), CancelOutcome::NotFound);
+    assert_eq!(
+        CancelOutcome::from_raw(-114),
+        CancelOutcome::AlreadyCompleting
+    );
+    assert!(matches!(
+        CancelOutcome::from_raw(-22),
+        CancelOutcome::Failed(_)
+    ));
+    assert!(CancelOutcome::from_raw(1).is_applied());
+    assert!(!CancelOutcome::from_raw(-2).is_applied());
 }
 
 #[test]
@@ -629,6 +747,99 @@ fn statx_layout() {
     assert_eq!(mem::offset_of!(Statx, stx_dio_offset_align), 156);
 }
 
+#[test]
+fn waitid_siginfo_layout() {
+    assert_eq!(core::mem::size_of::<WaitidSiginfo>(), 128);
+
+    assert_eq!(mem::offset_of!(WaitidSiginfo, si_signo), 0);
+    assert_eq!(mem::offset_of!(WaitidSiginfo, si_errno), 4);
+    assert_eq!(mem::offset_of!(WaitidSiginfo, si_code), 8);
+    assert_eq!(mem::offset_of!(WaitidSiginfo, si_pid), 16);
+    assert_eq!(mem::offset_of!(WaitidSiginfo, si_uid), 20);
+    assert_eq!(mem::offset_of!(WaitidSiginfo, si_status), 24);
+}
+
+#[test]
+fn sqe_builder_waitid_places_fields_correctly() {
+    let mut info = WaitidSiginfo::default();
+    let sqe = unsafe {
+        Sqe::waitid(
+            IdType::Pid,
+            1234,
+            core::ptr::from_mut(&mut info),
+            WaitOptions::EXITED,
+        )
+    }
+    .user_data(30);
+    let inner = sqe.0;
+
+    assert_eq!(Opcode::WaitId, inner.opcode);
+    assert_eq!(inner.fd, 1234);
+    assert_eq!(inner.len, IdType::Pid.as_raw());
+    assert_eq!(inner.splice_fd_in, WaitOptions::EXITED.bits() as i32);
+    assert_eq!(inner.off, core::ptr::from_mut(&mut info) as u64);
+    assert_eq!(inner.user_data, 30);
+}
+
+#[test]
+fn sqe_builder_futex_wait_places_fields_correctly() {
+    let word: u32 = 0;
+    let sqe = unsafe {
+        Sqe::futex_wait(
+            core::ptr::from_ref(&word),
+            7,
+            u64::from(u32::MAX),
+            Futex2Flags::default_size(),
+        )
+    }
+    .user_data(40);
+    let inner = sqe.0;
+
+    assert_eq!(Opcode::FutexWait, inner.opcode);
+    assert_eq!(inner.addr, core::ptr::from_ref(&word) as u64);
+    assert_eq!(inner.off, 7);
+    assert_eq!(inner.addr3, u64::from(u32::MAX));
+    assert_eq!(inner.fd, Futex2Flags::default_size().bits() as i32);
+    assert_eq!(inner.user_data, 40);
+}
+
+#[test]
+fn sqe_builder_futex_wake_places_fields_correctly() {
+    let word: u32 = 0;
+    let sqe = unsafe {
+        Sqe::futex_wake(
+            core::ptr::from_ref(&word),
+            3,
+            u64::from(u32::MAX),
+            Futex2Flags::default_size(),
+        )
+    }
+    .user_data(41);
+    let inner = sqe.0;
+
+    assert_eq!(Opcode::FutexWake, inner.opcode);
+    assert_eq!(inner.addr, core::ptr::from_ref(&word) as u64);
+    assert_eq!(inner.off, 3);
+    assert_eq!(inner.addr3, u64::from(u32::MAX));
+    assert_eq!(inner.fd, Futex2Flags::default_size().bits() as i32);
+    assert_eq!(inner.user_data, 41);
+}
+
+#[test]
+fn sqe_builder_futex_waitv_places_fields_correctly() {
+    let word: u32 = 0;
+    let waiters = [unsafe {
+        FutexWaitv::new(core::ptr::from_ref(&word), 0, Futex2Flags::default_size())
+    }];
+    let sqe = unsafe { Sqe::futex_waitv(&waiters) }.user_data(42);
+    let inner = sqe.0;
+
+    assert_eq!(Opcode::FutexWaitv, inner.opcode);
+    assert_eq!(inner.addr, waiters.as_ptr() as u64);
+    assert_eq!(inner.len, 1);
+    assert_eq!(inner.user_data, 42);
+}
+
 #[cfg(not(miri))]
 #[test]
 fn fsync_on_tmpfile() {
@@ -652,6 +863,54 @@ fn fsync_on_tmpfile() {
     assert_eq!(cqe.result, 0);
 
     let _ = syscall::close(RawFd::from_raw(fd as usize));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_sync_file_range_writes_out_the_bytes_it_names() {
+    use crate::types::SyncFileRangeFlags;
+
+    let mut ring = IoUring::new(4).expect("setup");
+    let fd = open_tmpfile(&mut ring);
+
+    let buf = b"sync_file_range test";
+    ring.push(unsafe { Sqe::write(RawFd::from_raw(fd as usize), buf, 0) }.user_data(1))
+        .expect("push write");
+    ring.submit_and_wait(1).expect("submit");
+    ring.complete().expect("write cqe");
+
+    ring.push(
+        Sqe::sync_file_range(
+            RawFd::from_raw(fd as usize),
+            0,
+            buf.len() as u32,
+            SyncFileRangeFlags::WAIT_BEFORE
+                | SyncFileRangeFlags::WRITE
+                | SyncFileRangeFlags::WAIT_AFTER,
+        )
+        .user_data(2),
+    )
+    .expect("push sync_file_range");
+    ring.submit_and_wait(1).expect("submit");
+
+    let cqe = ring.complete().expect("sync_file_range cqe");
+    assert_eq!(cqe.user_data, 2);
+    assert_eq!(cqe.result, 0);
+
+    let _ = syscall::close(RawFd::from_raw(fd as usize));
+}
+
+#[test]
+fn sqe_builder_sync_file_range_places_fields_correctly() {
+    use crate::types::{Opcode, SyncFileRangeFlags};
+
+    let sqe = Sqe::sync_file_range(RawFd::from_raw(11), 100, 200, SyncFileRangeFlags::WRITE);
+    let inner = sqe.0;
+    assert_eq!(Opcode::SyncFileRange, inner.opcode);
+    assert_eq!(inner.fd, 11);
+    assert_eq!(inner.off, 100);
+    assert_eq!(inner.len, 200);
+    assert_eq!(inner.op_flags, SyncFileRangeFlags::WRITE.bits());
 }
 
 #[cfg(not(miri))]
@@ -740,6 +999,34 @@ fn nop_roundtrip() {
     assert_eq!(cqe.result, 0);
 
     assert!(ring.complete().is_none());
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_msg_ring_to_its_own_fd_posts_a_second_cqe() {
+    use crate::types::RawFd;
+
+    let mut ring = IoUring::new(4).expect("failed to create io_uring");
+    let own_fd = RawFd::from_raw(ring.raw_fd().as_usize());
+
+    let sqe = Sqe::msg_ring(own_fd, 7, 99).user_data(1);
+    ring.push(sqe).expect("failed to push msg_ring");
+    ring.submit_and_wait(2).expect("failed to submit");
+
+    let mut saw_msg_ring_op = false;
+    let mut saw_message = false;
+    for _ in 0..2 {
+        let cqe = ring.complete().expect("expected a completion");
+        if cqe.user_data == 1 {
+            assert_eq!(cqe.result, 0, "the msg_ring op itself should succeed");
+            saw_msg_ring_op = true;
+        } else if cqe.user_data == 99 {
+            assert_eq!(cqe.result, 7);
+            saw_message = true;
+        }
+    }
+    assert!(saw_msg_ring_op, "the msg_ring request's own completion is missing");
+    assert!(saw_message, "the posted message never arrived");
 }
 
 #[cfg(not(miri))]
@@ -1990,6 +2277,21 @@ fn sqe_builder_send_zc_places_fields_correctly() {
 }
 
 #[test]
+fn sqe_builder_sendmsg_zc_places_fields_correctly() {
+    use crate::types::{MsgFlags, MsgHdr, Opcode};
+    let hdr = MsgHdr::default();
+    let sqe =
+        unsafe { Sqe::sendmsg_zc(RawFd::from_raw(7), &hdr, MsgFlags::NOSIGNAL) }.user_data(67);
+    let inner = sqe.0;
+    assert_eq!(Opcode::SendmsgZc, inner.opcode);
+    assert_eq!(inner.fd, 7);
+    assert_eq!(inner.addr, (&raw const hdr) as u64);
+    assert_eq!(inner.len, 1);
+    assert_eq!(inner.op_flags, MsgFlags::NOSIGNAL.bits());
+    assert_eq!(inner.user_data, 67);
+}
+
+#[test]
 fn sqe_builder_files_update_places_fields_correctly() {
     use crate::types::Opcode;
     let fds = [3i32, 4, -1];
@@ -2047,6 +2349,28 @@ fn sqe_builder_accept_multishot_places_fields_correctly() {
     assert_eq!(inner.fd, 7);
     assert_eq!(inner.ioprio, IORING_ACCEPT_MULTISHOT);
     assert_eq!(inner.op_flags, AcceptFlags::NONBLOCK.bits());
+}
+
+#[test]
+fn sqe_builder_with_accept_sets_dontwait_and_poll_first_bits() {
+    use crate::types::{
+        AcceptFlags, AcceptModifier, IORING_ACCEPT_DONTWAIT, IORING_ACCEPT_POLL_FIRST, Opcode,
+    };
+    let sqe = Sqe::accept(RawFd::from_raw(4), AcceptFlags::default())
+        .with_accept(AcceptModifier::DontWait)
+        .with_accept(AcceptModifier::PollFirst)
+        .user_data(9);
+    let inner = sqe.0;
+    assert_eq!(Opcode::Accept, inner.opcode);
+    assert_eq!(inner.fd, 4);
+    assert_eq!(
+        inner.ioprio & IORING_ACCEPT_DONTWAIT,
+        IORING_ACCEPT_DONTWAIT
+    );
+    assert_eq!(
+        inner.ioprio & IORING_ACCEPT_POLL_FIRST,
+        IORING_ACCEPT_POLL_FIRST
+    );
 }
 
 #[test]
@@ -2122,6 +2446,33 @@ fn sqe_builder_with_report_usage_sets_ioprio_bit() {
     assert_eq!(
         inner.ioprio & IORING_SEND_ZC_REPORT_USAGE,
         IORING_SEND_ZC_REPORT_USAGE
+    );
+}
+
+#[test]
+fn sqe_builder_with_bundle_sets_ioprio_bit() {
+    use crate::types::{IORING_RECVSEND_BUNDLE, MsgFlags, Opcode, SendRecvFlag};
+    let sqe =
+        Sqe::recv_multishot(RawFd::from_raw(4), MsgFlags::default()).with(SendRecvFlag::Bundle);
+    let inner = sqe.0;
+    assert_eq!(Opcode::Recv, inner.opcode);
+    assert_eq!(
+        inner.ioprio & IORING_RECVSEND_BUNDLE,
+        IORING_RECVSEND_BUNDLE
+    );
+}
+
+#[test]
+fn sqe_builder_with_vectorized_sets_ioprio_bit() {
+    use crate::types::{IORING_SEND_VECTORIZED, MsgFlags, Opcode, SendRecvFlag};
+    let buf = [0u8; 4];
+    let sqe = unsafe { Sqe::send_zc(RawFd::from_raw(6), &buf, MsgFlags::default()) }
+        .with(SendRecvFlag::Vectorized);
+    let inner = sqe.0;
+    assert_eq!(Opcode::SendZc, inner.opcode);
+    assert_eq!(
+        inner.ioprio & IORING_SEND_VECTORIZED,
+        IORING_SEND_VECTORIZED
     );
 }
 
@@ -2293,6 +2644,88 @@ fn a_bound_listener_accepts_a_real_connection() {
 
     let _ = syscall::close(RawFd::from_raw(server as usize));
     let _ = syscall::close(RawFd::from_raw(client as usize));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn an_accept_with_dontwait_reports_eagain_rather_than_waiting() {
+    use crate::types::AcceptModifier;
+    // With no connection pending, DontWait must complete at once with
+    // -EAGAIN instead of arming poll or handing the request to io-wq to
+    // block until a peer connects — exactly the non-blocking accept4(2)
+    // contract, driven through the ring instead of a blocking syscall.
+    let mut ring = crate::IoUring::new(8).expect("ring");
+    let (listener, _port) = setup_tcp_listener();
+
+    ring.push(
+        Sqe::accept(RawFd::from_raw(listener as usize), AcceptFlags::default())
+            .with_accept(AcceptModifier::DontWait)
+            .user_data(1),
+    )
+    .expect("push accept");
+    ring.submit_and_wait(1).expect("submit");
+    let result = ring.complete().expect("cqe").result;
+    assert_eq!(result, -11, "expected -EAGAIN, got {result}");
+
+    let _ = syscall::close(RawFd::from_raw(listener as usize));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn an_accept_with_poll_first_still_accepts_a_real_connection() {
+    use crate::types::AcceptModifier;
+    // PollFirst only changes how the kernel waits (poll registration up
+    // front instead of a blocking io-wq worker); it must not change the
+    // outcome — a real pending connection is still accepted normally.
+    let mut ring = crate::IoUring::new(8).expect("ring");
+    let (listener, port) = setup_tcp_listener();
+
+    let client = syscall::socket(types::AF_INET, types::SOCK_STREAM | types::SOCK_NONBLOCK, 0)
+        .expect("client socket")
+        .as_i32();
+
+    ring.push(
+        Sqe::accept(RawFd::from_raw(listener as usize), AcceptFlags::default())
+            .with_accept(AcceptModifier::PollFirst)
+            .user_data(1),
+    )
+    .expect("push accept");
+
+    let connect_addr = SockAddrIn {
+        sin_family: types::AF_INET as u16,
+        sin_port: port.to_be(),
+        sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+        sin_zero: [0; 8],
+    };
+    let addr_bytes: &[u8] = unsafe {
+        core::slice::from_raw_parts(
+            (&raw const connect_addr).cast(),
+            core::mem::size_of::<SockAddrIn>(),
+        )
+    };
+    ring.push(unsafe { Sqe::connect(RawFd::from_raw(client as usize), addr_bytes) }.user_data(2))
+        .expect("push connect");
+    ring.submit_and_wait(2).expect("submit handshake");
+
+    let mut server_fd = -1i32;
+    for _ in 0..2 {
+        let cqe = ring.complete().expect("handshake cqe");
+        if cqe.user_data == 1 {
+            assert!(cqe.result >= 0, "accept failed: {}", cqe.result);
+            server_fd = cqe.result;
+        } else {
+            assert!(
+                cqe.result == 0 || cqe.result == -115,
+                "connect failed: {}",
+                cqe.result
+            );
+        }
+    }
+    assert!(server_fd >= 0, "never got accept completion");
+
+    let _ = syscall::close(RawFd::from_raw(server_fd as usize));
+    let _ = syscall::close(RawFd::from_raw(client as usize));
+    let _ = syscall::close(RawFd::from_raw(listener as usize));
 }
 
 #[cfg(not(miri))]
@@ -2501,6 +2934,7 @@ fn open_flags_new_bits() {
 #[test]
 fn setup_flags_new_bits() {
     use crate::types::SetupFlags;
+    assert_eq!(SetupFlags::IOPOLL.bits(), 1 << 0);
     assert_eq!(SetupFlags::COOP_TASKRUN.bits(), 1 << 8);
     assert_eq!(SetupFlags::DEFER_TASKRUN.bits(), 1 << 13);
     assert_eq!(SetupFlags::NO_MMAP.bits(), 1 << 14);
@@ -2561,6 +2995,14 @@ fn builder_coop_taskrun() {
 
 #[cfg(not(miri))]
 #[test]
+fn builder_iopoll_sets_the_flag_and_the_kernel_accepts_it() {
+    let ring = IoUring::builder(4).iopoll().build().expect("iopoll setup");
+    assert!(ring.setup_flags().contains(crate::types::SetupFlags::IOPOLL));
+    drop(ring);
+}
+
+#[cfg(not(miri))]
+#[test]
 fn builder_defer_taskrun() {
     // DEFER_TASKRUN requires SINGLE_ISSUER on some kernels
     let ring = IoUring::builder(4)
@@ -2569,6 +3011,85 @@ fn builder_defer_taskrun() {
         .build()
         .expect("setup");
     drop(ring);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_iopoll_ring_writes_and_reads_back_through_o_direct() {
+    use crate::MmapBuffer;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // IORING_SETUP_IOPOLL only works on files opened O_DIRECT, backed by a
+    // block device that supports polling. `std::env::temp_dir()` is tmpfs
+    // on most distros, which rejects O_DIRECT outright — anchor the path
+    // under the crate's own directory, which this repo checks out onto a
+    // real (btrfs) filesystem, instead.
+    let dir = env!("CARGO_MANIFEST_DIR");
+    let path = UniqueTestPath::new_in(dir, "iopoll");
+
+    // Most non-polled request types — `openat` included — are rejected on an
+    // IOPOLL ring (see io_uring_setup(2)): only the small set of opcodes
+    // that can actually be polled for completion is allowed. Open the file
+    // through a plain syscall and reserve the ring for the pollable
+    // read/write this test exercises.
+    let file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .custom_flags(OpenFlags::DIRECT.bits() as i32)
+        .open(path.as_str())
+        .expect("open with O_DIRECT");
+    let fd = {
+        use std::os::fd::AsRawFd;
+        file.as_raw_fd()
+    };
+
+    let mut ring = IoUring::builder(4).iopoll().build().expect("iopoll setup");
+
+    // O_DIRECT imposes alignment restrictions on the buffer address and
+    // length that an ordinary heap `Vec` does not satisfy on every
+    // filesystem; `MmapBuffer` is page-aligned by construction.
+    let mut buf = MmapBuffer::with_capacity(4096).expect("mmap buffer");
+    buf.as_mut_slice()[..5].copy_from_slice(b"iouri");
+
+    ring.push(
+        unsafe { Sqe::write(RawFd::from_raw(fd as usize), buf.as_slice(), 0) }.user_data(1),
+    )
+    .expect("push write");
+    ring.submit_and_wait(1).expect("submit write");
+    let cqe = ring.complete().expect("write cqe");
+    assert_eq!(cqe.user_data, 1);
+
+    // Polling is a property of the block device and driver, not just the
+    // kernel API: `-EOPNOTSUPP` here means this machine's storage queue
+    // has `/sys/block/*/queue/io_poll` disabled (common under
+    // virtualized/sandboxed block devices), not that this crate's IOPOLL
+    // plumbing is wrong. Accept either a full pollable round trip or that
+    // specific, well-understood rejection, and only fail on anything else.
+    if cqe.result == -libc_eopnotsupp() {
+        drop(file);
+        return;
+    }
+    assert_eq!(cqe.result, 4096);
+
+    let mut read_buf = MmapBuffer::with_capacity(4096).expect("mmap buffer");
+    ring.push(
+        unsafe { Sqe::read(RawFd::from_raw(fd as usize), read_buf.as_mut_slice(), 0) }
+            .user_data(2),
+    )
+    .expect("push read");
+    ring.submit_and_wait(1).expect("submit read");
+    let cqe = ring.complete().expect("read cqe");
+    assert_eq!(cqe.user_data, 2);
+    assert_eq!(cqe.result, 4096);
+    assert_eq!(&read_buf.as_slice()[..5], b"iouri");
+
+    drop(file);
+}
+
+#[cfg(not(miri))]
+const fn libc_eopnotsupp() -> i32 {
+    95
 }
 
 #[cfg(not(miri))]
@@ -3180,6 +3701,25 @@ fn error_display_delegates_to_inner() {
 // ---------------------------------------------------------------
 // SQPOLL submit path — needs a real kernel, skipped under Miri.
 // ---------------------------------------------------------------
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_ring_fd_registration_can_be_undone() {
+    let mut ring = IoUring::new(4).expect("setup");
+    let offset = ring.register_ring_fd().expect("register_ring_fd");
+    ring.unregister_ring_fd(offset)
+        .expect("unregister_ring_fd");
+}
+
+
+
+#[cfg(not(miri))]
+#[test]
+fn enabling_a_ring_that_was_never_disabled_is_rejected() {
+    let mut ring = IoUring::new(4).expect("setup");
+    ring.enable_rings()
+        .expect_err("EBADFD: ring was not created with SetupFlags::R_DISABLED");
+}
 
 #[cfg(not(miri))]
 #[test]

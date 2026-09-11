@@ -3,16 +3,17 @@
 extern crate std;
 
 use super::{
-    Arrival, BindError, BindOutcome, Completed, ConnectError, ConnectOutcome, Count, Delivery,
-    DirectIncoming, DirectOpenError, DirectSlot, DirectSocketError, Direction, EpollChange,
-    EpollError, EpollOutcome, Event, Expiry, FilesUpdateError, Incoming, MmapBuffer,
+    Arrival, BindError, BindOutcome, CancelTarget, Completed, ConnectError, ConnectOutcome, Count,
+    Delivery, DirectIncoming, DirectOpenError, DirectSlot, DirectSocketError, Direction,
+    EpollChange, EpollError, EpollOutcome, Event, Expiry, FilesUpdateError, Incoming, MmapBuffer,
     MsgRegionError, Openat2Error, Openat2Mode, OwnedPath, PathError, PeerWanted, Pending,
-    PendingStatx, PendingZc, Prepared, PreparedAccept, PreparedBind, PreparedConnect,
-    PreparedDirectAccept, PreparedDirectOpen, PreparedDirectSocket, PreparedEpollCtl,
-    PreparedFilesUpdate, PreparedMultishot, PreparedOpen, PreparedOpenat2, PreparedPathOp,
-    PreparedRecvmsg, PreparedRename, PreparedSendmsg, PreparedStatx, PreparedTimeout,
-    PreparedVectored, PreparedZc, Receipt, RenameMode, RingId, SendTarget, SlotIndex, SlotTarget,
-    StableBuffer, StatxError, TableEntry, TimeoutError, Update, VectoredError, ZcCompleted,
+    PendingStatx, PendingZc, Prepared, PreparedAccept, PreparedBind, PreparedCancel,
+    PreparedConnect, PreparedDirectAccept, PreparedDirectOpen, PreparedDirectSocket,
+    PreparedEpollCtl, PreparedFilesUpdate, PreparedMsgRing, PreparedMultishot, PreparedOpen,
+    PreparedOpenat2, PreparedPathOp, PreparedRecvmsg, PreparedRename, PreparedSendmsg,
+    PreparedSendmsgZc, PreparedStatx, PreparedTimeout, PreparedVectored, PreparedWaitId,
+    PreparedZc, Receipt, RenameMode, RingId, SendTarget, SlotIndex, SlotTarget, StableBuffer,
+    StatxError, TableEntry, TimeoutError, Update, VectoredError, WaitIdError, ZcCompleted,
 };
 /// Only the kernel-backed tests name a path-op kind or inspect a peer
 /// address, and those are gated.
@@ -21,9 +22,9 @@ use super::{PathOpKind, PeerAddress};
 use crate::error::{Error, SubmitError};
 use crate::net::Socket;
 use crate::types::{
-    AcceptFlags, AddressFamily, DirFd, EpollEvent, EpollEvents, FileMode, MsgFlags, OpenFlags,
-    RawFd, ResolveFlags, SockAddrIn, SocketFlags, SocketType, Statx, StatxFlags, StatxMask,
-    Timespec,
+    AcceptFlags, AddressFamily, DirFd, EpollEvent, EpollEvents, FileMode, IdType, MsgFlags,
+    OpenFlags, RawFd, ResolveFlags, SockAddrIn, SocketFlags, SocketType, Statx, StatxFlags,
+    StatxMask, Timespec, WaitOptions, WaitidSiginfo,
 };
 
 /// Static proof that a ticket crosses a thread boundary. The whole design
@@ -3777,6 +3778,67 @@ fn a_real_sendmsg_gathers_every_buffer_into_one_message() {
 
 #[cfg(not(miri))]
 #[test]
+fn a_real_sendmsg_zc_gathers_every_buffer_and_releases_them_only_on_the_terminal_cqe() {
+    let pair = SocketPair::connected();
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let region = msg_region::<2>();
+    let bufs = [filled(b"zero"), filled(b"copy!")];
+    let addrs = [bufs[0].stable_ptr(), bufs[1].stable_ptr()];
+    let region_addr = region.stable_ptr();
+
+    let prepared = PreparedSendmsgZc::new(
+        pair.client(),
+        bufs,
+        region,
+        SendTarget::Connected,
+        MsgFlags::NOSIGNAL,
+    )
+    .unwrap_or_else(|(_, _, e)| panic!("{e}"));
+
+    let mut ticket = sub
+        .push_sendmsg_zc(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit");
+
+    // Same two-completion protocol as plain `send_zc`: drive events until
+    // a terminal one arrives, recording any partial notice along the way.
+    let done = 'outer: loop {
+        comp.wait(1).expect("wait");
+        while let Some(event) = comp.reap_event() {
+            match event {
+                Event::Partial(notice) => {
+                    ticket = ticket
+                        .record_sent(notice)
+                        .unwrap_or_else(|_| panic!("notice for our request"));
+                }
+                Event::Complete(receipt) => {
+                    break 'outer ticket
+                        .redeem(receipt)
+                        .unwrap_or_else(|_| panic!("matching receipt"));
+                }
+            }
+        }
+        comp.sync();
+    };
+    comp.sync();
+
+    let (result, bufs, store) = done.into_parts();
+    assert_eq!(result.expect("send ok"), 9);
+
+    let mut got = [0u8; 32];
+    let n = pair.read_server(&mut got);
+    assert_eq!(&got[..n], b"zerocopy!");
+
+    for (buf, addr) in bufs.iter().zip(addrs.iter()) {
+        assert_eq!(buf.stable_ptr(), *addr);
+    }
+    assert_eq!(store.stable_ptr(), region_addr);
+}
+
+#[cfg(not(miri))]
+#[test]
 fn an_addressed_send_reaches_a_peer_the_socket_never_connected_to() {
     use crate::syscall;
     use crate::types;
@@ -4844,6 +4906,112 @@ fn a_timeout_push_that_does_not_fit_hands_the_storage_back() {
     assert_eq!(returned.count(), Count::Completions(3));
     assert_eq!(returned.into_store().stable_ptr(), addr);
     tickets.clear();
+}
+
+#[test]
+fn a_cancel_ticket_reports_its_target_and_identity() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let prepared = PreparedCancel::user_data(42, crate::types::CancelFlags::empty());
+    let ticket = sub
+        .push_cancel(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    assert_eq!(ticket.target(), CancelTarget::UserData(42));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_cancel_by_user_data_stops_a_pending_timeout() {
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    // A timeout far longer than the test should take, so the cancel is
+    // what ends it rather than expiry.
+    let prepared = PreparedTimeout::after(
+        Timespec::from_millis(60_000),
+        Count::Timer,
+        timespec_store(),
+    )
+    .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let timeout_ticket = sub
+        .push_timeout(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let target_user_data = timeout_ticket.cancel_key();
+    sub.submit().expect("submit timeout");
+
+    let mut cancel_ticket = Some(
+        sub.push_cancel(PreparedCancel::user_data(
+            target_user_data,
+            crate::types::CancelFlags::empty(),
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}")),
+    );
+    sub.submit_and_wait(2).expect("submit cancel");
+
+    let mut cancel_done = None;
+    let mut timeout_receipt = None;
+    while cancel_done.is_none() || timeout_receipt.is_none() {
+        let receipt = comp.wait_one().expect("completion");
+        if cancel_ticket.as_ref().is_some_and(|t| t.matches(&receipt)) {
+            let ticket = cancel_ticket.take().expect("checked above");
+            cancel_done = Some(ticket.redeem(receipt).unwrap_or_else(|_| unreachable!()));
+        } else if timeout_ticket.matches(&receipt) {
+            timeout_receipt = Some(receipt);
+        }
+    }
+
+    let cancel_done = cancel_done.expect("cancel receipt observed");
+    assert!(cancel_done.outcome().is_applied());
+
+    let done = timeout_ticket
+        .redeem(timeout_receipt.expect("timeout receipt observed"))
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(done.expiry(), Expiry::Cancelled);
+}
+
+#[test]
+fn a_msg_ring_ticket_reports_its_target() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let target = RawFd::from_raw(9);
+    let prepared = PreparedMsgRing::new(target, 5, 42, crate::types::MsgRingFlags::empty());
+    let ticket = sub
+        .push_msg_ring(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    assert_eq!(ticket.target(), target);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_msg_ring_to_its_own_ring_posts_a_second_cqe() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let own_fd = RawFd::from_raw(ring.raw_fd().as_usize());
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let prepared = PreparedMsgRing::new(own_fd, 7, 99, crate::types::MsgRingFlags::empty());
+    let ticket = sub
+        .push_msg_ring(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(2).expect("submit");
+
+    let mut own_receipt = None;
+    let mut saw_message = false;
+    for _ in 0..2 {
+        let receipt = comp.wait_one().expect("completion");
+        if ticket.matches(&receipt) {
+            own_receipt = Some(receipt);
+        } else if receipt.id().raw() == 99 {
+            assert_eq!(receipt.raw_result(), 7);
+            saw_message = true;
+        }
+    }
+    let done = ticket
+        .redeem(own_receipt.expect("the msg_ring request's own receipt"))
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert!(done.is_ok());
+    assert!(saw_message, "the posted message never arrived");
 }
 
 #[cfg(not(miri))]
@@ -6471,4 +6639,287 @@ fn a_connect_ticket_survives_moving_to_another_thread_before_completion() {
     let (outcome, store) = handle.join().expect("thread");
     assert_eq!(outcome, ConnectOutcome::Connected);
     assert_eq!(store.stable_ptr(), addr);
+}
+
+/// A destination big and aligned enough for a `WaitidSiginfo`.
+fn waitid_dest() -> MmapBuffer {
+    MmapBuffer::with_capacity(core::mem::size_of::<WaitidSiginfo>()).expect("map")
+}
+
+const _: () = assert_send::<super::PendingWaitId<MmapBuffer>>();
+const _: () = assert_send::<PreparedWaitId<MmapBuffer>>();
+
+#[test]
+fn a_destination_too_small_for_a_waitid_is_rejected_with_the_storage_back() {
+    let short = MmapBuffer::with_capacity(core::mem::size_of::<WaitidSiginfo>() - 1).expect("map");
+    let got = short.stable_len();
+    let Err((short, e)) = PreparedWaitId::new(IdType::Pid, 1, WaitOptions::EXITED, short) else {
+        panic!("an undersized destination must be refused");
+    };
+    assert_eq!(
+        e,
+        WaitIdError::DestTooSmall {
+            needed: core::mem::size_of::<WaitidSiginfo>(),
+            got
+        }
+    );
+    drop(short);
+}
+
+#[cfg(not(miri))]
+#[test]
+// `waitid` itself is what reaps this child: calling `Child::wait` first
+// would let the kernel reap the zombie before the request under test ever
+// ran, and a second `waitid` on an already-reaped child reports `-ECHILD`
+// rather than the exit this test asserts on.
+#[allow(clippy::zombie_processes)]
+fn a_waitid_reaps_a_real_child_that_has_already_exited() {
+    let child = std::process::Command::new("true")
+        .spawn()
+        .expect("spawn /bin/true");
+    let pid = child.id();
+
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let dest = waitid_dest();
+    let dest_addr = dest.stable_ptr();
+    #[allow(clippy::cast_possible_wrap)]
+    let prepared = PreparedWaitId::new(
+        IdType::Pid,
+        pid as i32,
+        WaitOptions::EXITED,
+        dest,
+    )
+    .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_waitid(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert!(done.is_ok(), "waitid failed: {}", done.raw_result());
+
+    let info = done.info().expect("a successful waitid must carry info");
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        assert_eq!(info.si_pid, pid as i32);
+    }
+    assert_eq!(info.event(), crate::ChildEvent::Exited);
+    assert_eq!(info.si_status, 0);
+
+    let dest = done.into_dest().expect("destination was given");
+    assert_eq!(dest.stable_ptr(), dest_addr);
+}
+
+#[cfg(not(miri))]
+#[test]
+// See `a_waitid_reaps_a_real_child_that_has_already_exited`: `waitid`
+// reaps this child, so `Child::wait` must not run first.
+#[allow(clippy::zombie_processes)]
+fn a_waitid_that_discards_its_info_still_reports_success() {
+    let child = std::process::Command::new("true")
+        .spawn()
+        .expect("spawn /bin/true");
+    let pid = child.id();
+
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    #[allow(clippy::cast_possible_wrap)]
+    let prepared: PreparedWaitId<MmapBuffer> =
+        PreparedWaitId::discard(IdType::Pid, pid as i32, WaitOptions::EXITED);
+    let ticket = sub
+        .push_waitid(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert!(done.is_ok(), "waitid failed: {}", done.raw_result());
+    assert!(
+        done.info().is_none(),
+        "a discarded destination has nothing to read"
+    );
+    assert!(done.into_dest().is_none());
+}
+
+const _: () = assert_send::<super::PreparedFutexWait>();
+const _: () = assert_send::<super::PendingFutexWait>();
+const _: () = assert_send::<super::PreparedFutexWake>();
+const _: () = assert_send::<super::PendingFutexWake>();
+const _: () = assert_send::<super::PreparedFutexWaitv<MmapBuffer>>();
+const _: () = assert_send::<super::PendingFutexWaitv<MmapBuffer>>();
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_futex_wake_wakes_a_real_futex_wait() {
+    use crate::types::Futex2Flags;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU32;
+
+    let word = Arc::new(AtomicU32::new(0));
+
+    let waiter_ring = crate::IoUring::new(4).expect("waiter ring");
+    let (mut wait_sub, mut wait_comp) =
+        waiter_ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let uaddr: *const u32 = word.as_ptr().cast_const();
+    // SAFETY: `word` is an `Arc`, kept alive by this test past the point
+    // the wait ticket is redeemed below, and an `AtomicU32`'s address is
+    // stable for the life of its allocation.
+    let prepared_wait = unsafe {
+        super::PreparedFutexWait::new(uaddr, 0, u64::from(u32::MAX), Futex2Flags::default_size())
+    };
+    let wait_ticket = wait_sub
+        .push_futex_wait(prepared_wait)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    wait_sub.submit().expect("submit wait");
+
+    // Give the kernel a moment to actually queue the waiter before the
+    // wake fires, so this is a real wake-after-wait rather than a race
+    // that happens to work because the wake was issued first.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let waker_ring = crate::IoUring::new(4).expect("waker ring");
+    let (mut wake_sub, mut wake_comp) =
+        waker_ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    // SAFETY: same address, same lifetime guarantee as the wait above.
+    let prepared_wake = unsafe {
+        super::PreparedFutexWake::new(uaddr, 1, u64::from(u32::MAX), Futex2Flags::default_size())
+    };
+    let wake_ticket = wake_sub
+        .push_futex_wake(prepared_wake)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    wake_sub.submit_and_wait(1).expect("submit wake");
+    let wake_receipt = wake_comp.wait_one().expect("wake completion");
+    let wake_done = wake_ticket
+        .redeem(wake_receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(
+        wake_done.woken(),
+        Ok(1),
+        "the wake must report one waiter woken"
+    );
+
+    let wait_receipt = wait_comp.wait_one().expect("wait completion");
+    let wait_done = wait_ticket
+        .redeem(wait_receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(wait_done.outcome(), super::FutexWaitOutcome::Woken);
+
+    drop(word);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_futex_wait_whose_value_already_mismatches_returns_at_once() {
+    use crate::types::Futex2Flags;
+    use std::sync::atomic::AtomicU32;
+
+    let word = AtomicU32::new(9);
+    let uaddr: *const u32 = word.as_ptr().cast_const();
+
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    // SAFETY: `word` outlives the ticket, which is redeemed before this
+    // function returns.
+    let prepared = unsafe {
+        super::PreparedFutexWait::new(uaddr, 0, u64::from(u32::MAX), Futex2Flags::default_size())
+    };
+    let ticket = sub
+        .push_futex_wait(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(done.outcome(), super::FutexWaitOutcome::ValueMismatch);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_futex_waitv_reports_the_index_that_woke_it() {
+    use crate::types::{Futex2Flags, FutexWaitv};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU32;
+
+    let word_a = Arc::new(AtomicU32::new(0));
+    let word_b = Arc::new(AtomicU32::new(0));
+
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    // SAFETY: both words are kept alive by the `Arc`s held in this scope
+    // past the point the ticket is redeemed below.
+    let waiters = [
+        unsafe {
+            FutexWaitv::new(
+                word_a.as_ptr().cast_const(),
+                0,
+                Futex2Flags::default_size(),
+            )
+        },
+        unsafe {
+            FutexWaitv::new(
+                word_b.as_ptr().cast_const(),
+                0,
+                Futex2Flags::default_size(),
+            )
+        },
+    ];
+    let array = MmapBuffer::with_capacity(core::mem::size_of_val(&waiters)).expect("map");
+    // SAFETY: both entries in `waiters` uphold `FutexWaitv::new`'s
+    // contract, as established above.
+    let prepared = unsafe { super::PreparedFutexWaitv::new(&waiters, array) }
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_futex_waitv(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit waitv");
+
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let waker_ring = crate::IoUring::new(4).expect("waker ring");
+    let (mut wake_sub, mut wake_comp) =
+        waker_ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    // SAFETY: `word_b` outlives this call.
+    let prepared_wake = unsafe {
+        super::PreparedFutexWake::new(
+            word_b.as_ptr().cast_const(),
+            1,
+            u64::from(u32::MAX),
+            Futex2Flags::default_size(),
+        )
+    };
+    let wake_ticket = wake_sub
+        .push_futex_wake(prepared_wake)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    wake_sub.submit_and_wait(1).expect("submit wake");
+    let wake_receipt = wake_comp.wait_one().expect("wake completion");
+    let wake_done = wake_ticket
+        .redeem(wake_receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(wake_done.woken(), Ok(1));
+
+    let receipt = comp.wait_one().expect("waitv completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(
+        done.woken_index(),
+        Ok(1),
+        "index 1 (word_b) is the one woken"
+    );
+
+    drop(word_a);
+    drop(word_b);
 }

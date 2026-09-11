@@ -858,6 +858,12 @@ impl IoUring {
         self.features
     }
 
+    /// Returns the setup flags this ring was created with.
+    #[must_use]
+    pub const fn setup_flags(&self) -> SetupFlags {
+        SetupFlags::from_raw(self.setup_flags)
+    }
+
     /// Returns the ring's file descriptor.
     #[must_use]
     pub const fn raw_fd(&self) -> RawFd {

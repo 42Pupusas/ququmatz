@@ -481,4 +481,44 @@ impl Sqe {
         sqe.op_flags = flags.bits();
         Self(sqe)
     }
+
+    /// Prepare a zero-copy sendmsg operation (kernel 6.1+).
+    ///
+    /// Like [`sendmsg`](Self::sendmsg), but the kernel maps the message's
+    /// buffers directly into the NIC without copying — the `sendmsg`
+    /// counterpart to [`send_zc`](Self::send_zc). As with `send_zc`, a
+    /// first CQE confirms submission and a second, carrying
+    /// `CqeFlags::NOTIF`, confirms the kernel has released every buffer
+    /// `msg` references.
+    ///
+    /// # Safety
+    ///
+    /// `msg` and every buffer it references are borrowed only for this call
+    /// — the returned `Sqe` stores a raw pointer derived from `msg`, not
+    /// the borrow itself. The caller must ensure `msg` and everything it
+    /// points to remain valid and readable until the kernel posts the
+    /// `CqeFlags::NOTIF` completion that releases them — not merely the
+    /// first completion, which may only signal submission.
+    #[must_use]
+    pub unsafe fn sendmsg_zc(fd: RawFd, msg: &MsgHdr, flags: MsgFlags) -> Self {
+        unsafe { Self::sendmsg_zc_ptr(fd, core::ptr::from_ref(msg), flags) }
+    }
+
+    /// Prepare a zero-copy sendmsg operation from a raw pointer.
+    ///
+    /// # Safety
+    ///
+    /// `msg` and all buffers it references must remain valid and readable
+    /// until the kernel posts the `CqeFlags::NOTIF` completion that
+    /// releases them.
+    #[must_use]
+    pub unsafe fn sendmsg_zc_ptr(fd: RawFd, msg: *const MsgHdr, flags: MsgFlags) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::SendmsgZc.into();
+        sqe.fd = fd.as_i32();
+        sqe.addr = msg as u64;
+        sqe.len = 1;
+        sqe.op_flags = flags.bits();
+        Self(sqe)
+    }
 }

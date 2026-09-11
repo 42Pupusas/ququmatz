@@ -15,6 +15,11 @@ bitflags! {
 bitflags! {
     /// Flags for `io_uring_setup`.
     pub struct SetupFlags(u32);
+    /// Polled I/O completion. The device driver polls for completions
+    /// instead of waiting on an interrupt; requires files opened with
+    /// `O_DIRECT` and hardware/filesystem support for polling. See
+    /// [`IoUringBuilder::iopoll`](crate::ring::IoUringBuilder::iopoll).
+    const IOPOLL = 1 << 0;
     /// Kernel-side SQ polling thread.
     const SQPOLL = 1 << 1;
     /// Bind SQPOLL thread to a specific CPU.
@@ -52,7 +57,8 @@ impl SetupFlags {
     /// this mask before the setup syscall runs, so an accepted `IoUring`
     /// never has a layout its mapping code cannot handle.
     pub(crate) const SUPPORTED_MASK: Self = Self(
-        Self::SQPOLL.0
+        Self::IOPOLL.0
+            | Self::SQPOLL.0
             | Self::SQ_AFF.0
             | Self::CQSIZE.0
             | Self::CLAMP.0
@@ -73,6 +79,15 @@ impl SetupFlags {
     #[must_use]
     pub(crate) const fn from_raw_for_test(bits: u32) -> Self {
         Self(bits)
+    }
+
+    /// Construct from the raw value the ring was actually created with.
+    ///
+    /// Used by [`IoUring::setup_flags`](crate::ring::IoUring::setup_flags)
+    /// to hand callers a typed view of the flags `io_uring_setup` accepted,
+    /// which may include bits this crate does not name.
+    pub(crate) const fn from_raw(raw: u32) -> Self {
+        Self(raw)
     }
 }
 

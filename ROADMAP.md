@@ -1,0 +1,115 @@
+# ququmatz kernel-surface roadmap
+
+## Purpose
+
+`AUDIT.md` covers soundness of what already exists. This document covers
+*coverage*: which parts of the `io_uring` UAPI (opcodes, register ops, setup
+flags, feature bits, per-op tunables) this crate does not yet expose, and the
+order to close those gaps in.
+
+Baseline comparison: `include/uapi/linux/io_uring.h` at `torvalds/linux`
+master, against `src/types/opcodes.rs`, `src/types/ring_ctrl.rs`,
+`src/types/sendrecv.rs`, and the `src/op/*` builders, surveyed 2026-09-11.
+
+## How to read the tables
+
+- **Effort**: S (one opcode/flag, mechanical, follows an existing pattern in
+  the same file), M (new field plumbing, a new owned-state wrapper, or a
+  handful of interacting flags), L (new subsystem: new mmap region, new
+  registration protocol, new ownership model).
+- **Value**: how much this unlocks for realistic users of a zero-dep io_uring
+  crate — throughput/latency wins, or common-case API completeness — versus
+  being a rarely-touched corner of the UAPI.
+- **Rank** is Value-weighted first, Effort-broken ties second: cheap+useful
+  things go first, expensive+niche things go last. Within a tier, order is
+  the suggested execution order.
+- Every item must ship per the standing rules: its own module/struct, no
+  free functions, tests + clippy + build in every feature combination before
+  moving to the next line.
+
+## Tier 0 — do first (small effort, high value)
+
+| # | Item | Effort | Value | Notes |
+|---|---|---|---|---|
+| 1 | ~~`AsyncCancel` flag family~~ **Done** | S | High | Shipped: `CancelFlags` (`types/cancel.rs`) plus `Sqe::cancel_fd`/`cancel_any`/`cancel_with_flags`/`cancel_matching_opcode`, `CancelOutcome` for classifying `-ENOENT`/`-EALREADY`, and a full owned ticketing path (`owned/cancel.rs`: `PreparedCancel`/`PendingCancel`/`CancelDone`, wired into `OwnedSubmitter::push_cancel`). Verified end-to-end against a real kernel (cancelling a pending timeout by `user_data`). |
+| 2 | ~~`IORING_OP_MSG_RING`~~ **Done** | S–M | High | Shipped: `Opcode::MsgRing`, `MsgRingFlags` (`types/msgring.rs`), `Sqe::msg_ring`/`msg_ring_with_flags`/`msg_ring_cqe_flags`/`msg_ring_fd(_with_flags)` (`op/msgring.rs`) covering the data-message and fd-transfer sub-modes, plus an owned ticketing path (`owned/msgring.rs`: `PreparedMsgRing`/`PendingMsgRing`/`MsgRingDone`, wired into `OwnedSubmitter::push_msg_ring`). Verified end-to-end against a real kernel (a ring messaging itself and observing both the request's own CQE and the delivered message). |
+| 3 | ~~`RECVSEND_BUNDLE` / `SEND_VECTORIZED` ioprio flags~~ **Done** | S | Med-High | Shipped: `SendRecvFlag::Bundle`/`Vectorized` (`types/sendrecv.rs`), wired into `Sqe::with`. Verified with unit tests asserting the `ioprio` bits land on `recv`/`send_zc` SQEs (real use needs a ring-provided buffer group / iovec array respectively, so these are builder-level tests, matching the existing `PollFirst`/`FixedBuf`/`ReportUsage` tests in the same file). |
+| 4 | ~~`IORING_OP_SYNC_FILE_RANGE`~~ **Done** | S | Low-Med | Shipped: `Opcode::SyncFileRange` (value 8), `SyncFileRangeFlags` (`types/fs.rs`), `Sqe::sync_file_range` (`op/file.rs`). Verified end-to-end against a real kernel (write a tmpfile, then `sync_file_range` with `WAIT_BEFORE|WRITE|WAIT_AFTER` and observe a clean completion). |
+| 5 | ~~`RegisterOp::UnregisterRingFds`~~ **Done** | S | Med | Shipped: `RegisterOp::UnregisterRingFds`, `IoUring::unregister_ring_fd` (`ring/register.rs`), pairing with the existing `register_ring_fd`. Verified against a real kernel (register then unregister a ring fd). Closes the audit's noted asymmetry (missing teardown twin). |
+| 6 | ~~`RegisterOp::EnableRings`~~ **Done** | S | Med | Shipped: `RegisterOp::RegisterEnableRings`, `IoUring::enable_rings` (`ring/register.rs`). Verified against a real kernel that calling it on a normally-created (non-`R_DISABLED`) ring is rejected with `EBADFD`, matching documented kernel semantics; the full disabled→enabled round-trip needs `SetupFlags::R_DISABLED` (Tier 1 #28) to actually create a disabled ring, so is deferred to that item. |
+
+## Tier 1 — high value, moderate effort
+
+| # | Item | Effort | Value | Notes |
+|---|---|---|---|---|
+| 7 | ~~`SetupFlags::IOPOLL`~~ **Done** | M | High | Shipped: `SetupFlags::IOPOLL`, `IoUringBuilder::iopoll()`, `OpenFlags::DIRECT`, `IoUring::setup_flags()` accessor. Investigation showed no distinct submit/wait *code path* was actually needed — `submit_and_wait`/`Completer::wait` already issue `io_uring_enter(GETEVENTS)`, which is exactly what drives the kernel's poll for an IOPOLL ring; a plain `submit()` with no wait already does not reap anything on any ring, polled or not. The gap was purely the flag being absent from `SetupFlags`/`SUPPORTED_MASK` and no way to open a file `O_DIRECT`. Verified against a real kernel: an IOPOLL ring is created, a file opened `O_DIRECT` (via a plain syscall — `openat` itself is not a pollable opcode and is rejected on an IOPOLL ring, so the file must be opened before submitting to it), and a page-aligned `MmapBuffer` written and read back through the ring. The test also documents and tolerates `-EOPNOTSUPP`, since this sandbox's block queue has polling disabled at `/sys/block/*/queue/io_poll` — that is a property of the host's storage, not of this crate's plumbing, which the test confirms right up to the point where the kernel would poll. |
+| 8 | ~~`IORING_OP_SEND_ZC` msg variant: `SendmsgZc` (opcode 48)~~ **Done** | M | Med-High | Shipped: `Opcode::SendmsgZc` (`types/opcodes.rs`), `Sqe::sendmsg_zc`/`sendmsg_zc_ptr` (`op/net.rs`), and a full owned path in the new `owned/sendmsg_zc.rs` module (`PreparedSendmsgZc`/`PendingSendmsgZc`/`SendmsgZcCompleted`) that combines `PreparedSendmsg`'s `MsgRegion` staging with `PreparedZc`'s two-completion (send result, then `NOTIF`) release story — a request can only have one `Drop` and one `redeem`, so the two existing modules could not simply be composed and this needed its own type. Wired into `OwnedSubmitter::push_sendmsg_zc` (`owned/queue.rs`). Verified against a real kernel: a connected socket pair, a `sendmsg_zc` gathering two buffers, driven through `record_sent`/`redeem` exactly like the existing `send_zc` owned test, confirming the message arrives intact and the buffers only come back after the terminal CQE. |
+| 10 | ~~`AcceptFlags` completeness check (`MULTISHOT`/`DONTWAIT`/`POLL_FIRST`)~~ **Done** | S–M | Med | Investigation against `io_uring/net.c` (`io_accept_prep`, `ACCEPT_FLAGS` mask) showed three separate flag surfaces get conflated by one name: `AcceptFlags` (this crate's type) is actually `sqe->accept_flags` (`SOCK_NONBLOCK`/`SOCK_CLOEXEC`, socket-level, already fully wired), while `MULTISHOT`/`DONTWAIT`/`POLL_FIRST` are three bits of `sqe->ioprio` — a different field entirely, the same field `SendRecvFlag` already uses for send/recv tunables. `MULTISHOT` (bit 0) was already set by the dedicated `accept_multishot`/`accept_multishot_direct` constructors; `DONTWAIT` (bit 1, Linux 6.7+, completes at once with `-EAGAIN` instead of arming poll when nothing is pending) and `POLL_FIRST` (bit 2, Linux 6.7+, same poll-first/io-wq tradeoff `SendRecvFlag::PollFirst` documents for send/recv) were missing. Shipped: `IORING_ACCEPT_DONTWAIT`/`IORING_ACCEPT_POLL_FIRST` constants (`types/sendrecv.rs`), a new `AcceptModifier` enum mirroring `SendRecvFlag`'s shape, and `Sqe::with_accept` (`op/mod.rs`) composing with the existing `accept`/`accept_ptr`/`accept_with_addr`/`accept_multishot` constructors. Verified against a real kernel: `DontWait` on a listener with nothing pending completes at once with `-EAGAIN` rather than waiting; `PollFirst` still accepts a real connection normally, confirming the modifier changes only how the kernel waits, not the outcome. |
+| 11 | ~~`IORING_OP_WAITID`~~ **Done** | M | Med | Async `waitid(2)` (Linux 6.7+, opcode 50). The kernel reads `id_type` from `len`, the pid/pgid/pidfd from `fd`, `options` from the field that aliases `splice_fd_in`, and a `siginfo_t*` destination from `off` — a different field layout from every other op in the crate, confirmed against `io_uring/waitid.c`'s `io_waitid_prep`. Shipped: `Opcode::WaitId`, a new `types/waitid.rs` module (`IdType`, `WaitOptions`, `ChildEvent`, and `WaitidSiginfo` — a `repr(C)` struct matching glibc's `siginfo_t` layout for exactly the seven fields `io_waitid_copy_si` writes, sized to the full 128-byte `SI_MAX_SIZE` the kernel's `user_write_access_begin` bounds-checks against even though it never touches the reserved tail), `Sqe::waitid` (`op/waitid.rs`), and an owned path in the new `owned/waitid.rs` module (`PreparedWaitId`/`PendingWaitId`/`WaitIdCompleted`) shaped like `PreparedStatx` — the kernel writes a fixed-size struct with no length field, so the destination is checked once and owned until redeemed — but with a `None` destination as a first-class case, since `waitid(2)`'s `infop == NULL` is a documented way to wait for a state change without wanting the details. Wired into `OwnedSubmitter::push_waitid`. Verified against a real kernel: spawning a real child via `std::process::Command` and reaping it two ways — with a destination (`ChildEvent::Exited`, correct `si_pid`/`si_status`) and with `PreparedWaitId::discard` (succeeds, reports no info). The child is deliberately *not* pre-reaped with `Child::wait`, since `waitid` itself is what reaps it here; doing so first would race it into `-ECHILD`. |
+| 12 | ~~`IORING_OP_FUTEX_WAIT` / `FUTEX_WAKE` / `FUTEX_WAITV`~~ **Done** | M | Med-High | Async futex integration (Linux 6.7+, opcodes 51–53). Confirmed against `io_uring/futex.c`'s `io_futex_prep`/`io_futexv_prep`: the two single-futex ops share one layout — `addr` is the word's address, `addr2` (this crate's `off`) is the expected value (wait) or wake count (wake), `addr3` is a bitset mask, and `fd` carries futex2 flags (word size/private/NUMA) rather than a descriptor, with `len`/`buf_index`/`file_index`/`futex_flags` all forced to zero. `FUTEX_WAITV` is shaped differently again: `addr` points to an array of `struct futex_waitv` and `len` is its count, every other field zero. Shipped: `Opcode::FutexWait`/`FutexWake`/`FutexWaitv`; `types/futex.rs` (`Futex2Flags`, `FutexWaitv`, `FUTEX_WAITV_MAX`); `Sqe::futex_wait`/`futex_wake`/`futex_waitv`(`_ptr`) in `op/futex.rs`. The owned path split into two modules reflecting a real ownership difference the audit-driven design rules force to the surface: `owned/futex.rs` (`PreparedFutexWait`/`PreparedFutexWake` and their `Pending`/`Done` pairs) intentionally own **nothing**, because a futex word's whole purpose is to be mutated by other threads while the wait is outstanding — modelling it as owned, exclusive storage the way every other request in this crate does would contradict the primitive itself, so these are `unsafe fn new` on the raw pointer, the same contract as any other pointer-bearing `Sqe` constructor. `owned/futexwaitv.rs` (`PreparedFutexWaitv`/`PendingFutexWaitv`) is a hybrid: it owns the **array** (a real vectored-array hazard, same shape as `PreparedVectored`'s descriptor array, and copied by the kernel at prep time so it needs the same own-until-completion treatment as a timeout's `Timespec`) while still not owning the individual futex words each entry names. Wired into `OwnedSubmitter::push_futex_wait`/`push_futex_wake`/`push_futex_waitv`. Verified against a real kernel with genuine cross-ring wait/wake pairs: a `futex_wait` on one ring genuinely blocks until a `futex_wake` issued from a second ring (after a delay, to rule out the wake winning a race by having already fired) reports one waiter woken and the wait reports `Woken`; a `futex_wait` whose value already mismatches at issue time returns at once as `ValueMismatch`; and a `futex_waitv` across two words correctly reports the index of whichever one was woken. |
+| 13 | `RegisterOp::SyncCancel` | M | Med | Synchronous cancel-and-wait in one register call, avoids a submit/poll round trip for cancellation-heavy shutdown paths. |
+| 14 | `RegisterOp::FileAllocRange` | S | Med | Pairs with the existing fixed-file/direct-descriptor support (`owned/direct_socket.rs`, `owned/direct_accept.rs` already model direct-fd ownership) — lets callers reserve a slot range for predictable allocation instead of kernel-chosen slots. |
+| 15 | `RegisterOp::PbufStatus` | S | Low-Med | Cheap addition, useful for diagnosing/tuning existing provided-buffer-ring support (`ring/pbuf.rs`). |
+| 16 | `IOU_PBUF_RING_INC` flag | S | Med | One flag bit on the existing `RegisterPbufRing`/`ring/pbuf.rs` path enabling incremental buffer consumption — meaningful memory-efficiency win for streaming recv workloads already using provided buffers. |
+
+## Tier 2 — real value, larger or riskier effort
+
+| # | Item | Effort | Value | Notes |
+|---|---|---|---|---|
+| 17 | `IORING_OP_FIXED_FD_INSTALL` | M | Med | Promote a direct/fixed descriptor to a real process fd — complements the existing direct-fd ownership types in `src/owned/`. |
+| 18 | `Symlinkat` / `Linkat` / `Fsetxattr` / `Setxattr` / `Fgetxattr` / `Getxattr` | M | Low-Med | Round out the filesystem op family (`src/op/file.rs`, `src/types/fs.rs` already has the pattern for `Renameat`/`Unlinkat`/`Mkdirat`). Batchable as one focused pass since they share shape with existing fs ops. |
+| 19 | `Ftruncate` | S | Low-Med | Small, standalone, same file as the xattr batch above — bundle together. |
+| 20 | `IORING_OP_READV_FIXED` / `WRITEV_FIXED` | M | Med | Vectorized I/O against registered buffers — natural extension of existing `ReadFixed`/`WriteFixed` in `op/file.rs`. |
+| 21 | `IORING_OP_READ_MULTISHOT` | M | Med | Multishot read pairs conceptually with existing multishot accept/recv; needs the same "own the buffer selection" treatment already solved for recv multishot + provided buffers. |
+| 22 | `IORING_OP_EPOLL_WAIT` | M | Low-Med | Folds an epoll_wait into the ring; you already have `EpollCtl` support (`src/op/epoll.rs`, `src/types/epoll.rs`) — natural sibling, but check for interaction with your existing epoll ownership model before assuming it's mechanical. |
+| 23 | `IORING_OP_PIPE` | S–M | Low | Creates a pipe pair via SQE — small, self-contained, low urgency. |
+| 24 | `RegisterOp::Files2` / `FilesUpdate2` / `Buffers2` (tagged resource variants) | M | Med | Tagged registration enables safe resource lifecycle tracking (dead-resource notification) — arguably relevant to the audit's ownership concerns (Q-05), worth sequencing near any audit remediation work touching provided buffers. |
+| 25 | `RegisterOp::IowqAff` / `UnregisterIowqAff` / `IowqMaxWorkers` completeness | S | Low-Med | You already have `RegisterIowqMaxWorkers`; add the affinity pair for full io-wq tuning coverage. |
+| 26 | `RegisterOp::CloneBuffers` | M | Low | Cross-ring buffer sharing — niche but occasionally load-bearing for multi-ring pooling designs. |
+| 27 | `RegisterOp::Napi` / `UnregisterNapi` | M | Low | Busy-poll tuning for low-latency networking; valuable only to a narrow (but real) high-perf-networking audience. |
+| 28 | `SetupFlags::R_DISABLED` + `SUBMIT_ALL` + `TASKRUN_FLAG` | M | Low-Med | Three independent flag additions; `R_DISABLED` only pays off once `EnableRings` (Tier 0 #6) lands, sequence after it. |
+| 29 | `Features::RW_ATTR` / `NO_IOWAIT` reporting | S | Low | Read-only feature bits, trivial to add once the underlying ops exist to gate on them (`RW_ATTR` should follow the SQE128/PI work below, not precede it). |
+
+## Tier 3 — large effort, narrow or speculative value
+
+| # | Item | Effort | Value | Notes |
+|---|---|---|---|---|
+| 30 | `SetupFlags::SQE128` / `CQE32` + PI attributes (`attr_ptr`/`attr_type_mask`) | L | Med (narrow audience) | Changes the SQE/CQE stride throughout the ring mapping and parsing code — this is a structural change to `ring/mod.rs`, not just a new flag bit. Real value for storage integrity (PI) workloads, but touches nearly everything. Needs its own design doc before implementation. |
+| 31 | `SetupFlags::NO_MMAP` | L | Low-Med | Requires caller-provided ring memory end to end (`io_uring_region_desc`, `sq_off`/`cq_off` pre-description) — `SUPPORTED_MASK`'s own comment already documents why this is unimplemented. Real value mainly for io_uring-over-shared-memory / restricted-mmap sandboxes. |
+| 32 | `SetupFlags::NO_SQARRAY` | M–L | Low-Med | Mapping/parsing code currently assumes an SQ indirection array unconditionally (per `SetupFlags` doc comment); needs a real code path, not just accepting the bit. |
+| 33 | `SetupFlags::REGISTERED_FD_ONLY` / `HYBRID_IOPOLL` / `CQE_MIXED` / `SQE_MIXED` / `SQ_REWIND` | L | Low | All either depend on Tier 3 #30/#32 landing first (mixed/128-wide SQE-CQE modes) or are very new kernel additions (`SQ_REWIND`) with minimal ecosystem validation yet. Track but do not schedule until the prerequisites above exist and upstream kernels have had time to stabilize the newest ones. |
+| 34 | `IORING_OP_URING_CMD` / `UringCmd128` socket ioctl surface (`SOCKET_URING_OP_*`) | L | Low (narrow) | Already have the base `UringCmd` opcode; the socket sub-command enum (`SIOCINQ`/`GETSOCKOPT`/`TX_TIMESTAMP`/etc.) is its own mini-protocol layered on top of `cmd[]` bytes — real design work, narrow audience beyond specialized networking use. |
+| 35 | Zero-copy RX subsystem: `IORING_OP_RECV_ZC` + `RegisterOp::ZcrxIfq` / `ZcrxCtrl` | L | Low (narrow) | Originally listed at Tier 1 (as `IORING_OP_RECV_ZC` alone) but re-ranked here after investigation: unlike `SendmsgZc` (Tier 1 #8), the opcode is not usable standalone. It requires `IORING_REGISTER_ZCRX_IFQ` (a new registration op taking a NIC ifindex + specific HW RX queue, `io_uring_zcrx_ifq_reg`), a new mmap'd refill ring (`io_uring_zcrx_rqe` producer/consumer state distinct from the SQ/CQ), a separate memory-area registration (`io_uring_zcrx_area_reg`, optionally dmabuf-backed) that becomes the RX buffer pool, completions riding a second struct (`io_uring_zcrx_cqe`) on top of `CQE32`, and out-of-band NIC configuration (header/data-split, flow steering, RSS via `ethtool`) with no kernel-side way to configure it. The `NODEV` registration flag exists for NIC-less testing but still copies data, so it cannot exercise genuine zero-copy semantics — meaning this cannot be verified against a real kernel the way every other item in this roadmap has been, only against a real NIC test rig. Full netdev hw-queue zero-copy RX registration — new mmap region, new descriptor structs, kernel-version- and NIC-driver-sensitive. High payoff only for a very specific high-throughput networking audience; largest effort-to-audience ratio in this document. |
+| 36 | `RegisterOp::ResizeRings` / `MemRegion` / `Query` / `BpfFilter` / `Clock` | L | Low | Newest/most obscure register ops in the current header; some (`Query`, `BpfFilter`) don't have widely stabilized userspace conventions yet. Revisit once they've had a few kernel releases to settle, rather than chasing a moving target now. |
+
+## Suggested execution order
+
+1. Tier 0 items 1–6, in listed order — each is a self-contained afternoon,
+   verified individually (build/test/clippy × feature combos) before the next.
+2. Tier 1 items 7, 8, 10–16 — start with 7 (`IOPOLL`) since it's the
+   highest-value single addition and forces you to audit the wait/submit
+   path, which de-risks everything after it. Item 8 (zero-copy send)
+   benefits from doing 7 first only in that both touch completion-ownership
+   reasoning already established in `owned/zerocopy.rs`; otherwise
+   independent — order 10–16 by convenience. Item 9 (zero-copy recv) was
+   re-ranked to Tier 3 item 35 after investigation showed it needs a whole
+   new registration subsystem and real NIC hardware to verify, unlike its
+   Tier 1 siblings.
+3. Tier 2 — batch the filesystem-op cluster (18–19) together since they
+   share a file and pattern; otherwise take items in listed order.
+4. Tier 3 — do not schedule concretely yet. Items 30 and 32 are prerequisites
+   for 33; write short design notes for 30 (SQE128/CQE32 stride change) and
+   31 (NO_MMAP) before touching `ring/mod.rs`, since both are structural
+   rather than additive. Revisit 34–36 opportunistically; they're
+   correctly-scoped-but-low-priority rather than blocked.
+
+## Explicitly out of scope for this roadmap
+
+- Everything in `AUDIT.md` (soundness, lifetime, ownership defects) — that
+  work is independent of and should not be blocked on this coverage work,
+  but Tier 2 item 24 (tagged resource registration) and Tier 3 item 30
+  (SQE128) should be sequenced with an eye on whatever the audit's P0/P1
+  remediation lands, since both touch the same ownership/lifetime surface
+  Q-01/Q-02/Q-05 are about.
+- Non-Linux platforms, `no_std` allocator concerns, and architecture ABI
+  work beyond what Q-09 in the audit already tracks.

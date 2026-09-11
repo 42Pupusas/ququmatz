@@ -5,7 +5,8 @@
 use super::{Sqe, ZEROED};
 use crate::types::{
     DirFd, FadviseAdvice, FallocateMode, FileMode, FsyncFlags, IoVec, MadviseAdvice, Opcode,
-    OpenFlags, OpenHow, RawFd, RenameFlags, SpliceFlags, Statx, StatxFlags, StatxMask, UnlinkFlags,
+    OpenFlags, OpenHow, RawFd, RenameFlags, SpliceFlags, Statx, StatxFlags, StatxMask,
+    SyncFileRangeFlags, UnlinkFlags,
 };
 
 impl Sqe {
@@ -32,6 +33,27 @@ impl Sqe {
     #[must_use]
     pub fn fdatasync(fd: RawFd) -> Self {
         Self::fsync(fd, FsyncFlags::DATASYNC)
+    }
+
+    /// Prepare a `sync_file_range` operation: write out (and optionally
+    /// wait for) `nbytes` bytes of `fd` starting at `offset`.
+    ///
+    /// `nbytes` of `0` means "to the end of the file". `flags` selects
+    /// which of the wait-before/write/wait-after phases run.
+    #[must_use]
+    pub fn sync_file_range(
+        fd: RawFd,
+        offset: u64,
+        nbytes: u32,
+        flags: SyncFileRangeFlags,
+    ) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::SyncFileRange.into();
+        sqe.fd = fd.as_i32();
+        sqe.off = offset;
+        sqe.len = nbytes;
+        sqe.op_flags = flags.bits();
+        Self(sqe)
     }
 
     /// Prepare a fallocate operation.

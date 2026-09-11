@@ -177,4 +177,44 @@ impl IoUring {
         )?;
         Ok(reg.offset)
     }
+
+    /// Undo a previous `register_ring_fd`, releasing the fixed-fd slot at
+    /// `offset`.
+    ///
+    /// After this call, `EnterFlags::REGISTERED_RING` must not be passed to
+    /// `io_uring_enter` again until a fresh `register_ring_fd` call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `offset` names no registered ring fd.
+    pub fn unregister_ring_fd(&mut self, offset: u32) -> Result<(), Error> {
+        let mut reg = IoUringRsrcUpdate {
+            offset,
+            resv: 0,
+            data: 0,
+        };
+        syscall::io_uring_register(
+            self.fd,
+            RegisterOp::UnregisterRingFds.into(),
+            core::ptr::from_mut(&mut reg) as usize,
+            1,
+        )?;
+        Ok(())
+    }
+
+    /// Start accepting submissions on a ring created with
+    /// `SetupFlags::R_DISABLED`.
+    ///
+    /// A disabled ring rejects `io_uring_enter` until this call runs, which
+    /// lets a caller finish registering buffers, files, or other resources
+    /// before any request can execute against them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the kernel rejects the request (e.g. the ring
+    /// was not created disabled).
+    pub fn enable_rings(&mut self) -> Result<(), Error> {
+        syscall::io_uring_register(self.fd, RegisterOp::RegisterEnableRings.into(), 0, 0)?;
+        Ok(())
+    }
 }

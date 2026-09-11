@@ -13,6 +13,7 @@ pub enum Opcode {
     WriteFixed = 5,
     PollAdd = 6,
     PollRemove = 7,
+    SyncFileRange = 8,
     SendMsg = 9,
     RecvMsg = 10,
     Timeout = 11,
@@ -42,9 +43,15 @@ pub enum Opcode {
     Renameat = 35,
     Unlinkat = 36,
     Mkdirat = 37,
+    MsgRing = 40,
     Socket = 45,
     UringCmd = 46,
     SendZc = 47,
+    SendmsgZc = 48,
+    WaitId = 50,
+    FutexWait = 51,
+    FutexWake = 52,
+    FutexWaitv = 53,
     Bind = 56,
     Listen = 57,
 }
@@ -76,10 +83,15 @@ pub enum RegisterOp {
     /// Ask the kernel which SQE opcodes it supports.
     RegisterProbe = 8,
     RegisterRestrictions = 11,
+    /// Start a ring created with `SetupFlags::R_DISABLED` actually accepting
+    /// submissions.
+    RegisterEnableRings = 12,
     RegisterBuffersUpdate = 16,
     RegisterIowqMaxWorkers = 19,
     /// Register the ring fd itself as a fixed fd (saves file-table lookup on enter).
     RegisterRingFds = 20,
+    /// Undo `RegisterRingFds`, releasing the registered-fd slots it took.
+    UnregisterRingFds = 21,
     /// Register a provided-buffer ring (kernel 5.19+).
     RegisterPbufRing = 22,
     /// Unregister a provided-buffer ring.

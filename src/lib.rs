@@ -43,14 +43,19 @@ pub use ring::{
     ProvidedBufferRing, SplitCompletions, Submitter,
 };
 pub use types::{
-    AcceptFlags, AddressFamily, CqeFlags, DirFd, EnterFlags, EpollEvent, EpollEvents, EpollOp,
+    AcceptFlags, AcceptModifier, AddressFamily, CancelFlags, CancelOutcome, CqeFlags, DirFd,
+    EnterFlags,
+    EpollEvent, EpollEvents, EpollOp,
     EventFdFlags, FadviseAdvice, FallocateMode, Features, FileMode, FsyncFlags, InotifyEvent,
     InotifyInitFlags, IoUringBuf, IoUringBufReg, IoUringCqe, IoUringFilesUpdate, IoUringParams,
-    IoUringRsrcUpdate, IoUringSqe, IoVec, MadviseAdvice, MsgFlags, OpenFlags, OpenHow, PollMask,
+    IoUringRsrcUpdate, IoUringSqe, IoVec, MadviseAdvice, MsgFlags, MsgRingFlags, OpenFlags,
+    OpenHow, PollMask,
     RawFd, RecvmsgOut, RecvmsgParts, RenameFlags, SendRecvFlag, SetupFlags, ShutdownHow,
     SocketFlags, SocketType, SpliceFlags, SqeFlags, StatxFlags, StatxMask, TimeoutFlags, Timespec,
-    UnlinkFlags, WatchMask,
+    UnlinkFlags, WaitOptions, WaitidSiginfo, WatchMask,
 };
+pub use types::{ChildEvent, IdType};
+
 
 #[cfg(test)]
 #[allow(

@@ -350,6 +350,7 @@
 mod accept;
 mod bind;
 mod buffer;
+mod cancel;
 mod connect;
 mod direct;
 mod direct_accept;
@@ -357,8 +358,11 @@ mod direct_socket;
 mod epoll;
 mod event;
 mod filesupdate;
+mod futex;
+mod futexwaitv;
 mod identity;
 mod msgregion;
+mod msgring;
 mod multishot;
 mod open;
 mod openat2;
@@ -369,10 +373,12 @@ mod recvmsg;
 mod rename;
 mod request;
 mod sendmsg;
+mod sendmsg_zc;
 mod slot;
 mod statx;
 mod timeout;
 mod vectored;
+mod waitid;
 mod zerocopy;
 
 #[cfg(test)]
@@ -388,6 +394,7 @@ mod miri;
 pub use accept::{AcceptFinished, Incoming, MultishotAccept, PreparedAccept};
 pub use bind::{BindDone, BindError, BindOutcome, PendingBind, PreparedBind};
 pub use buffer::{MmapBuffer, StableBuffer, StableBufferMut};
+pub use cancel::{CancelDone, CancelTarget, PendingCancel, PreparedCancel};
 pub use connect::{ConnectDone, ConnectError, ConnectOutcome, PendingConnect, PreparedConnect};
 pub use direct::{DirectOpenError, DirectOpened, PendingDirectOpen, PreparedDirectOpen};
 pub use direct_accept::{DirectAccept, DirectAcceptFinished, DirectIncoming, PreparedDirectAccept};
@@ -401,8 +408,16 @@ pub use event::{Event, PartialReceipt};
 pub use filesupdate::{
     FilesUpdateError, FilesUpdated, PendingFilesUpdate, PreparedFilesUpdate, TableEntry, Update,
 };
+pub use futex::{
+    FutexWaitDone, FutexWaitOutcome, FutexWakeDone, PendingFutexWait, PendingFutexWake,
+    PreparedFutexWait, PreparedFutexWake,
+};
+pub use futexwaitv::{
+    FutexWaitvDone, FutexWaitvError, PendingFutexWaitv, PreparedFutexWaitv,
+};
 pub use identity::{RequestId, RingId};
 pub use msgregion::{MAX_IOV, MsgRegionError};
+pub use msgring::{MsgRingDone, PendingMsgRing, PreparedMsgRing};
 pub use multishot::{Armed, Arrival, Delivery, Finished, MultishotRecv, PreparedMultishot};
 pub use open::{Opened, PendingOpen, PreparedOpen};
 pub use openat2::{Openat2Error, Openat2Mode, Opened2, PendingOpenat2, PreparedOpenat2};
@@ -415,8 +430,10 @@ pub use recvmsg::{
 pub use rename::{PendingRename, PreparedRename, RenameCompleted, RenameMode};
 pub use request::{Completed, Direction, Pending, Prepared, Receipt};
 pub use sendmsg::{PendingSendmsg, PreparedSendmsg, SendTarget, SendmsgCompleted};
+pub use sendmsg_zc::{PendingSendmsgZc, PreparedSendmsgZc, SendmsgZcCompleted};
 pub use slot::{DirectSlot, SlotIndex, SlotTarget};
 pub use statx::{PendingStatx, PreparedStatx, StatxCompleted, StatxError};
 pub use timeout::{Count, Expiry, PendingTimeout, PreparedTimeout, TimeoutCompleted, TimeoutError};
 pub use vectored::{PendingVectored, PreparedVectored, VectoredCompleted, VectoredError};
+pub use waitid::{PendingWaitId, PreparedWaitId, WaitIdCompleted, WaitIdError};
 pub use zerocopy::{PendingZc, PreparedZc, ZcCompleted};

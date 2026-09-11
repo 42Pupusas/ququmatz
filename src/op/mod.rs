@@ -8,15 +8,19 @@
 //! live in this file.
 
 use crate::types::{
-    IORING_RECVSEND_FIXED_BUF, IORING_RECVSEND_POLL_FIRST, IORING_SEND_ZC_REPORT_USAGE, IoUringSqe,
-    SendRecvFlag, SqeFlags,
+    AcceptModifier, IORING_ACCEPT_DONTWAIT, IORING_ACCEPT_POLL_FIRST, IORING_RECVSEND_BUNDLE,
+    IORING_RECVSEND_FIXED_BUF, IORING_RECVSEND_POLL_FIRST, IORING_SEND_VECTORIZED,
+    IORING_SEND_ZC_REPORT_USAGE, IoUringSqe, SendRecvFlag, SqeFlags,
 };
 
 mod buffers;
 mod control;
 mod epoll;
 mod file;
+mod futex;
+mod msgring;
 mod net;
+mod waitid;
 
 /// A prepared submission queue entry, ready to be pushed onto the ring.
 ///
@@ -191,6 +195,23 @@ impl Sqe {
                 self.0.buf_index = idx;
             }
             SendRecvFlag::ReportUsage => self.0.ioprio |= IORING_SEND_ZC_REPORT_USAGE,
+            SendRecvFlag::Bundle => self.0.ioprio |= IORING_RECVSEND_BUNDLE,
+            SendRecvFlag::Vectorized => self.0.ioprio |= IORING_SEND_VECTORIZED,
+        }
+        self
+    }
+
+    /// Apply an [`AcceptModifier`] tunable to an accept-family op.
+    ///
+    /// Composes — call multiple times to set several flags, and combines
+    /// freely with the `IORING_ACCEPT_MULTISHOT` bit that the dedicated
+    /// multishot constructors already set. See [`AcceptModifier`] for what
+    /// each variant does.
+    #[must_use]
+    pub const fn with_accept(mut self, flag: AcceptModifier) -> Self {
+        match flag {
+            AcceptModifier::DontWait => self.0.ioprio |= IORING_ACCEPT_DONTWAIT,
+            AcceptModifier::PollFirst => self.0.ioprio |= IORING_ACCEPT_POLL_FIRST,
         }
         self
     }

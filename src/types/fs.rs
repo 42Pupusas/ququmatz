@@ -18,6 +18,10 @@ bitflags! {
     const TRUNC = 0o1000;
     const APPEND = 0o2000;
     const NONBLOCK = 0o4000;
+    /// Bypass the page cache; required by files used with `SetupFlags::IOPOLL`
+    /// read/write opcodes. Imposes filesystem-dependent alignment
+    /// restrictions on buffer address, length, and file offset.
+    const DIRECT = 0o40000;
     const NOFOLLOW = 0o400_000;
     const CLOEXEC = 0o2_000_000;
     const DIRECTORY = 0o200_000;
@@ -86,6 +90,20 @@ bitflags! {
     pub struct FsyncFlags(u32);
     /// Only sync file data, not metadata (fdatasync behavior).
     const DATASYNC = 1 << 0;
+}
+
+bitflags! {
+    /// Flags for `sync_file_range` operations, controlling which parts of
+    /// the write-out this call waits for.
+    pub struct SyncFileRangeFlags(u32);
+    /// Wait for write-out of pages already submitted before this call
+    /// began, before starting any new write-out.
+    const WAIT_BEFORE = 1 << 0;
+    /// Initiate write-out of dirty pages in the range.
+    const WRITE = 1 << 1;
+    /// Wait for write-out of every page in the range, including ones
+    /// this call itself submitted, before returning.
+    const WAIT_AFTER = 1 << 2;
 }
 
 bitflags! {

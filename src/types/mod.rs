@@ -95,11 +95,14 @@ macro_rules! bitflags {
 }
 
 mod buffers;
+mod cancel;
 mod epoll;
 mod eventfd;
 mod fs;
+mod futex;
 mod inotify;
 mod mmap;
+mod msgring;
 mod net;
 mod opcodes;
 mod poll;
@@ -108,21 +111,26 @@ mod sendrecv;
 mod splice;
 mod sqe_cqe;
 mod timeout;
+mod waitid;
 
 pub use buffers::{
     IoCqringOffsets, IoSqringOffsets, IoUringBuf, IoUringBufReg, IoUringFilesUpdate,
     IoUringRsrcUpdate, IoVec, RawFd,
 };
+pub use cancel::{CancelFlags, CancelOutcome};
 pub use epoll::{EpollEvent, EpollEvents, EpollOp};
 pub use eventfd::EventFdFlags;
 #[cfg(test)]
 pub(crate) use fs::AT_FDCWD;
 pub use fs::{
     DirFd, FadviseAdvice, FallocateMode, FileMode, FsyncFlags, MadviseAdvice, OpenFlags, OpenHow,
-    RenameFlags, ResolveFlags, Statx, StatxFlags, StatxMask, StatxTimestamp, UnlinkFlags, resolve,
+    RenameFlags, ResolveFlags, Statx, StatxFlags, StatxMask, StatxTimestamp, SyncFileRangeFlags,
+    UnlinkFlags, resolve,
 };
+pub use futex::{FUTEX_WAITV_MAX, Futex2Flags, FutexWaitv};
 pub use inotify::{InotifyEvent, InotifyInitFlags, WatchMask};
 pub use mmap::{MapFlags, Prot};
+pub use msgring::MsgRingFlags;
 #[cfg(test)]
 pub(crate) use net::{AF_INET, SOCK_NONBLOCK, SOCK_STREAM};
 pub use net::{
@@ -132,11 +140,13 @@ pub use net::{
 pub use opcodes::{Opcode, RegisterOp, RingOffset};
 pub use poll::PollMask;
 pub use ring_ctrl::{EnterFlags, Features, SetupFlags, SqeFlags};
-pub use sendrecv::SendRecvFlag;
+pub use sendrecv::{AcceptModifier, SendRecvFlag};
 pub(crate) use sendrecv::{
-    IORING_ACCEPT_MULTISHOT, IORING_RECV_MULTISHOT, IORING_RECVSEND_FIXED_BUF,
-    IORING_RECVSEND_POLL_FIRST, IORING_SEND_ZC_REPORT_USAGE,
+    IORING_ACCEPT_DONTWAIT, IORING_ACCEPT_MULTISHOT, IORING_ACCEPT_POLL_FIRST,
+    IORING_RECV_MULTISHOT, IORING_RECVSEND_BUNDLE, IORING_RECVSEND_FIXED_BUF,
+    IORING_RECVSEND_POLL_FIRST, IORING_SEND_VECTORIZED, IORING_SEND_ZC_REPORT_USAGE,
 };
 pub use splice::SpliceFlags;
 pub use sqe_cqe::{CqeFlags, IoUringCqe, IoUringParams, IoUringSqe};
 pub use timeout::{TimeoutFlags, Timespec};
+pub use waitid::{ChildEvent, IdType, WaitOptions, WaitidSiginfo};

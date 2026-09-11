@@ -3,6 +3,7 @@
 use super::accept::{MultishotAccept, PreparedAccept};
 use super::bind::{PendingBind, PreparedBind};
 use super::buffer::{StableBuffer, StableBufferMut};
+use super::cancel::{PendingCancel, PreparedCancel};
 use super::connect::{PendingConnect, PreparedConnect};
 use super::direct::{PendingDirectOpen, PreparedDirectOpen};
 use super::direct_accept::{DirectAccept, PreparedDirectAccept};
@@ -10,7 +11,10 @@ use super::direct_socket::{PendingDirectSocket, PreparedDirectSocket};
 use super::epoll::{PendingEpollCtl, PreparedEpollCtl};
 use super::event::{Event, PartialReceipt};
 use super::filesupdate::{PendingFilesUpdate, PreparedFilesUpdate};
+use super::futex::{PendingFutexWait, PendingFutexWake, PreparedFutexWait, PreparedFutexWake};
+use super::futexwaitv::{PendingFutexWaitv, PreparedFutexWaitv};
 use super::identity::{RequestIdSource, RingId};
+use super::msgring::{PendingMsgRing, PreparedMsgRing};
 use super::multishot::{MultishotRecv, PreparedMultishot};
 use super::open::{PendingOpen, PreparedOpen};
 use super::openat2::{PendingOpenat2, PreparedOpenat2};
@@ -19,9 +23,11 @@ use super::recvmsg::{PendingRecvmsg, PreparedRecvmsg};
 use super::rename::{PendingRename, PreparedRename};
 use super::request::{Pending, Prepared, Receipt};
 use super::sendmsg::{PendingSendmsg, PreparedSendmsg};
+use super::sendmsg_zc::{PendingSendmsgZc, PreparedSendmsgZc};
 use super::statx::{PendingStatx, PreparedStatx};
 use super::timeout::{PendingTimeout, PreparedTimeout};
 use super::vectored::{PendingVectored, PreparedVectored};
+use super::waitid::{PendingWaitId, PreparedWaitId};
 use super::zerocopy::{PendingZc, PreparedZc};
 use crate::error::Error;
 use crate::ring::{Completer, IoUring, Submitter};
@@ -182,6 +188,117 @@ impl OwnedSubmitter {
         }
     }
 
+    /// Queue an async-cancel request.
+    ///
+    /// Owns nothing — a cancel touches no caller memory the kernel
+    /// dereferences — so a rejected push simply hands back an identical
+    /// copy of the request rather than reclaiming any storage.
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact.
+    pub fn push_cancel(
+        &mut self,
+        request: PreparedCancel,
+    ) -> Result<PendingCancel, (PreparedCancel, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            // The request owns nothing, so handing back the copy taken
+            // before submission returns it exactly as it arrived.
+            Err(e) => Err((request, e)),
+        }
+    }
+
+    /// Queue an `IORING_OP_MSG_RING` request.
+    ///
+    /// Owns nothing — `len` and `data` travel as SQE fields, not through a
+    /// pointer — so a rejected push simply hands back an identical copy of
+    /// the request.
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact.
+    pub fn push_msg_ring(
+        &mut self,
+        request: PreparedMsgRing,
+    ) -> Result<PendingMsgRing, (PreparedMsgRing, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            // The request owns nothing, so handing back the copy taken
+            // before submission returns it exactly as it arrived.
+            Err(e) => Err((request, e)),
+        }
+    }
+
+    /// Queue a `futex_wait`.
+    ///
+    /// Owns nothing — the word it references belongs to the caller, not
+    /// to this ticket, per `PreparedFutexWait::new`'s safety contract —
+    /// so a rejected push simply hands back an identical copy of the
+    /// request.
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact.
+    pub fn push_futex_wait(
+        &mut self,
+        request: PreparedFutexWait,
+    ) -> Result<PendingFutexWait, (PreparedFutexWait, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            Err(e) => Err((request, e)),
+        }
+    }
+
+    /// Queue a `futex_wake`.
+    ///
+    /// Owns nothing, for the same reason as `push_futex_wait`.
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact.
+    pub fn push_futex_wake(
+        &mut self,
+        request: PreparedFutexWake,
+    ) -> Result<PendingFutexWake, (PreparedFutexWake, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            Err(e) => Err((request, e)),
+        }
+    }
+
+    /// Queue a `futex_waitv`, taking ownership of the descriptor array's
+    /// storage.
+    ///
+    /// Unlike the single-futex requests, the array itself is owned here,
+    /// though the words its entries name are not.
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact,
+    /// still owning the array storage.
+    pub fn push_futex_waitv<V: StableBufferMut>(
+        &mut self,
+        request: PreparedFutexWaitv<V>,
+    ) -> Result<PendingFutexWaitv<V>, (PreparedFutexWaitv<V>, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            // The SQE never became kernel-visible, so the kernel never saw
+            // the array pointer and reclaiming the storage is sound.
+            Err(e) => Err((Self::reclaim_futex_waitv(pending), e)),
+        }
+    }
+
     /// Queue a vectored operation, taking ownership of every buffer and of
     /// the descriptor array naming them.
     ///
@@ -322,6 +439,43 @@ impl OwnedSubmitter {
         unsafe { pending.reclaim_unsubmitted() }
     }
 
+    /// Queue a zero-copy `sendmsg`, taking ownership of its buffers and
+    /// staging storage.
+    ///
+    /// Combines [`push_sendmsg`](Self::push_sendmsg)'s staged header and
+    /// descriptor array with [`push_zc`](Self::push_zc)'s two-completion
+    /// release: the returned ticket holds everything until the *terminal*
+    /// completion, normally the notification rather than the send result
+    /// — see [`PendingSendmsgZc`].
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact,
+    /// still owning everything.
+    pub fn push_sendmsg_zc<B: StableBuffer, R: StableBufferMut, const N: usize>(
+        &mut self,
+        request: PreparedSendmsgZc<B, R, N>,
+    ) -> Result<PendingSendmsgZc<B, R, N>, (PreparedSendmsgZc<B, R, N>, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            // The SQE never became kernel-visible, so the kernel never saw
+            // the header pointer and reclaiming everything is sound.
+            Err(e) => Err((Self::reclaim_sendmsg_zc(pending), e)),
+        }
+    }
+
+    /// Undo a zero-copy `sendmsg` push that the kernel never observed.
+    fn reclaim_sendmsg_zc<B: StableBuffer, R: StableBufferMut, const N: usize>(
+        pending: PendingSendmsgZc<B, R, N>,
+    ) -> PreparedSendmsgZc<B, R, N> {
+        // SAFETY: only reached when `Submitter::push` reported the queue was
+        // full, which happens before the SQE is written or the tail is
+        // advanced. No kernel-visible pointer to the staging storage exists.
+        unsafe { pending.reclaim_unsubmitted() }
+    }
+
     /// Queue a `recvmsg`, taking ownership of its buffers and staging
     /// storage.
     ///
@@ -426,6 +580,29 @@ impl OwnedSubmitter {
             // The SQE never became kernel-visible, so the kernel never saw
             // either pointer and reclaiming both storages is sound.
             Err(e) => Err((Self::reclaim_statx(pending), e)),
+        }
+    }
+
+    /// Queue a `waitid`, taking ownership of its destination (if any).
+    ///
+    /// The kernel writes a fixed-size struct into the destination after
+    /// submission, so the storage is owned by the ticket until redeemed.
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact,
+    /// still owning its destination.
+    pub fn push_waitid<D: StableBufferMut>(
+        &mut self,
+        request: PreparedWaitId<D>,
+    ) -> Result<PendingWaitId<D>, (PreparedWaitId<D>, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            // The SQE never became kernel-visible, so the kernel never saw
+            // the destination pointer and reclaiming the storage is sound.
+            Err(e) => Err((Self::reclaim_waitid(pending), e)),
         }
     }
 
@@ -622,6 +799,24 @@ impl OwnedSubmitter {
         // SAFETY: only reached when `Submitter::push` reported the queue was
         // full, which happens before the SQE is written or the tail is
         // advanced. No kernel-visible pointer to either storage exists.
+        unsafe { pending.reclaim_unsubmitted() }
+    }
+
+    /// Undo a `waitid` push that the kernel never observed.
+    fn reclaim_waitid<D: StableBufferMut>(pending: PendingWaitId<D>) -> PreparedWaitId<D> {
+        // SAFETY: only reached when `Submitter::push` reported the queue was
+        // full, which happens before the SQE is written or the tail is
+        // advanced. No kernel-visible pointer to the destination exists.
+        unsafe { pending.reclaim_unsubmitted() }
+    }
+
+    /// Undo a `futex_waitv` push that the kernel never observed.
+    fn reclaim_futex_waitv<V: StableBufferMut>(
+        pending: PendingFutexWaitv<V>,
+    ) -> PreparedFutexWaitv<V> {
+        // SAFETY: only reached when `Submitter::push` reported the queue was
+        // full, which happens before the SQE is written or the tail is
+        // advanced. No kernel-visible pointer to the array exists.
         unsafe { pending.reclaim_unsubmitted() }
     }
 
