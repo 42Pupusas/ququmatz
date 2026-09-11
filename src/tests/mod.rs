@@ -149,35 +149,41 @@ fn recvmsg_out_layout() {
     assert_eq!(RecvmsgOut::SIZE, 16);
 }
 
-/// Build a synthetic multishot-recvmsg buffer exactly as the kernel lays it
+/// Builds a synthetic multishot-recvmsg buffer exactly as the kernel lays it
 /// out: `[recvmsg_out header][name padded to name_reserved][control padded to
-/// ctrl_reserved][payload]`. Header fields report the *would-have-been* lengths.
-fn make_recvmsg_buf(
+/// ctrl_reserved][payload]`. Header fields report the *would-have-been*
+/// lengths, which may exceed the reserved widths.
+///
+/// The header is written native-endian because that is what the kernel does.
+struct RecvmsgBufFixture<'a> {
     name_reserved: usize,
     ctrl_reserved: usize,
     hdr_namelen: u32,
     hdr_controllen: u32,
-    name: &[u8],
-    control: &[u8],
-    payload: &[u8],
-) -> Vec<u8> {
-    let mut buf = Vec::new();
-    // header: namelen, controllen, payloadlen, flags (all LE u32)
-    buf.extend_from_slice(&hdr_namelen.to_le_bytes());
-    buf.extend_from_slice(&hdr_controllen.to_le_bytes());
-    buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    buf.extend_from_slice(&0u32.to_le_bytes()); // flags
-    // name region, fixed width = name_reserved
-    let mut name_region = vec![0u8; name_reserved];
-    name_region[..name.len()].copy_from_slice(name);
-    buf.extend_from_slice(&name_region);
-    // control region, fixed width = ctrl_reserved
-    let mut ctrl_region = vec![0u8; ctrl_reserved];
-    ctrl_region[..control.len()].copy_from_slice(control);
-    buf.extend_from_slice(&ctrl_region);
-    // payload (the remainder)
-    buf.extend_from_slice(payload);
-    buf
+    name: &'a [u8],
+    control: &'a [u8],
+    payload: &'a [u8],
+}
+
+impl RecvmsgBufFixture<'_> {
+    fn build(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&self.hdr_namelen.to_ne_bytes());
+        buf.extend_from_slice(&self.hdr_controllen.to_ne_bytes());
+        buf.extend_from_slice(&(self.payload.len() as u32).to_ne_bytes());
+        buf.extend_from_slice(&0u32.to_ne_bytes());
+
+        let mut name_region = vec![0u8; self.name_reserved];
+        name_region[..self.name.len()].copy_from_slice(self.name);
+        buf.extend_from_slice(&name_region);
+
+        let mut ctrl_region = vec![0u8; self.ctrl_reserved];
+        ctrl_region[..self.control.len()].copy_from_slice(self.control);
+        buf.extend_from_slice(&ctrl_region);
+
+        buf.extend_from_slice(self.payload);
+        buf
+    }
 }
 
 #[test]
@@ -188,15 +194,16 @@ fn recvmsg_out_parse_splits_name_control_payload() {
     let control = [0x22u8; 10];
     let payload = b"hello multishot recvmsg";
 
-    let buf = make_recvmsg_buf(
-        NAME_RES,
-        CTRL_RES,
-        name.len() as u32,
-        control.len() as u32,
-        &name,
-        &control,
+    let buf = RecvmsgBufFixture {
+        name_reserved: NAME_RES,
+        ctrl_reserved: CTRL_RES,
+        hdr_namelen: name.len() as u32,
+        hdr_controllen: control.len() as u32,
+        name: &name,
+        control: &control,
         payload,
-    );
+    }
+    .build();
 
     let parts = RecvmsgOut::parse(&buf, NAME_RES as u32, CTRL_RES as u32).expect("buffer is valid");
 
@@ -218,15 +225,16 @@ fn recvmsg_out_parse_caps_truncated_name_at_reserved() {
     let name_in_buf = [0xABu8; 8]; // only 8 bytes physically present
     let payload = b"payload";
 
-    let buf = make_recvmsg_buf(
-        NAME_RES,
-        CTRL_RES,
-        128, // header claims a 128-byte address (truncated)
-        0,
-        &name_in_buf,
-        &[],
+    let buf = RecvmsgBufFixture {
+        name_reserved: NAME_RES,
+        ctrl_reserved: CTRL_RES,
+        hdr_namelen: 128,
+        hdr_controllen: 0,
+        name: &name_in_buf,
+        control: &[],
         payload,
-    );
+    }
+    .build();
 
     let parts = RecvmsgOut::parse(&buf, NAME_RES as u32, CTRL_RES as u32).expect("valid");
     // Header preserves the kernel-reported (truncated) length...
@@ -260,7 +268,16 @@ fn recvmsg_out_parse_zero_name_and_control() {
     // The common TCP case: no peer name, no control data. Payload starts
     // right after the 16-byte header.
     let payload = b"just bytes";
-    let buf = make_recvmsg_buf(0, 0, 0, 0, &[], &[], payload);
+    let buf = RecvmsgBufFixture {
+        name_reserved: 0,
+        ctrl_reserved: 0,
+        hdr_namelen: 0,
+        hdr_controllen: 0,
+        name: &[],
+        control: &[],
+        payload,
+    }
+    .build();
     let parts = RecvmsgOut::parse(&buf, 0, 0).expect("valid");
     assert!(parts.name.is_empty());
     assert!(parts.control.is_empty());

@@ -309,12 +309,11 @@ impl RecvmsgOut {
             return None;
         }
 
-        // Read the four little-endian u32s without assuming buffer alignment.
         let header = Self {
-            namelen: read_u32(buf, 0),
-            controllen: read_u32(buf, 4),
-            payloadlen: read_u32(buf, 8),
-            flags: read_u32(buf, 12),
+            namelen: Self::read_u32(buf, 0),
+            controllen: Self::read_u32(buf, 4),
+            payloadlen: Self::read_u32(buf, 8),
+            flags: Self::read_u32(buf, 12),
         };
 
         // The readable name/control are capped at what we reserved: a truncated
@@ -333,10 +332,12 @@ impl RecvmsgOut {
             payload: &buf[payload_start..],
         })
     }
-}
-
-/// Read a little-endian `u32` at `off` from `buf`, without alignment
-/// assumptions. Callers guarantee `off + 4 <= buf.len()`.
-fn read_u32(buf: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+    /// Read a `u32` at `off` from `buf` without assuming alignment.
+    ///
+    /// The kernel writes `struct io_uring_recvmsg_out` in native byte order,
+    /// so this decodes native-endian. Callers guarantee `off + 4 <=
+    /// buf.len()`.
+    const fn read_u32(buf: &[u8], off: usize) -> u32 {
+        u32::from_ne_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+    }
 }
