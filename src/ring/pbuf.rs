@@ -4,8 +4,8 @@ use super::{IoUring, Submitter};
 use crate::error::{Error, InvalidArgKind, SetupError};
 use crate::syscall;
 use crate::types::{
-    IoUringBuf, IoUringBufReg, IoUringBufStatus, MapFlags, Prot, RawFd, RecvmsgOut, RecvmsgParts,
-    RegisterOp,
+    IoUringBuf, IoUringBufReg, IoUringBufStatus, MapFlags, PbufRingFlags, Prot, RawFd, RecvmsgOut,
+    RecvmsgParts, RegisterOp,
 };
 
 /// Kernel-enforced limit for `IORING_REGISTER_PBUF_RING`: the ring must be
@@ -44,6 +44,7 @@ fn register_provided_buffers_on(
     bgid: u16,
     count: u32,
     buf_size: u32,
+    flags: PbufRingFlags,
 ) -> Result<ProvidedBufferRing, Error> {
     if count == 0 {
         return Err(SetupError::InvalidArg(InvalidArgKind::BufferCountZero).into());
@@ -93,7 +94,7 @@ fn register_provided_buffers_on(
         ring_addr: ring_addr as u64,
         ring_entries: count,
         bgid,
-        flags: 0,
+        flags: flags.bits(),
         resv: [0; 3],
     };
 
@@ -157,7 +158,28 @@ impl Submitter {
         count: u32,
         buf_size: u32,
     ) -> Result<ProvidedBufferRing, Error> {
-        register_provided_buffers_on(self.raw_fd(), bgid, count, buf_size)
+        register_provided_buffers_on(self.raw_fd(), bgid, count, buf_size, PbufRingFlags::empty())
+    }
+
+    /// Register a provided-buffer ring that supports incremental buffer
+    /// consumption (`IOU_PBUF_RING_INC`, kernel 6.12+).
+    ///
+    /// See [`IoUring::register_incremental_buffers`] for the argument
+    /// contract and how incremental consumption changes the recycle
+    /// contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `count` is not a power of two, if mmap fails, or if
+    /// the kernel rejects registration (e.g. the running kernel predates
+    /// incremental buffer support).
+    pub fn register_incremental_buffers(
+        &self,
+        bgid: u16,
+        count: u32,
+        buf_size: u32,
+    ) -> Result<ProvidedBufferRing, Error> {
+        register_provided_buffers_on(self.raw_fd(), bgid, count, buf_size, PbufRingFlags::INC)
     }
 }
 
@@ -191,7 +213,45 @@ impl IoUring {
         count: u32,
         buf_size: u32,
     ) -> Result<ProvidedBufferRing, Error> {
-        register_provided_buffers_on(self.fd, bgid, count, buf_size)
+        register_provided_buffers_on(self.fd, bgid, count, buf_size, PbufRingFlags::empty())
+    }
+
+    /// Register a provided-buffer ring that supports incremental buffer
+    /// consumption (`IOU_PBUF_RING_INC`, kernel 6.12+).
+    ///
+    /// Ordinarily a completion that selects a pool buffer consumes the
+    /// whole thing — a recv or similar hands back at most `buf_size` bytes,
+    /// and once you've read them the id goes straight back to the pool via
+    /// [`ProvidedBufferRing::recycle`]. With incremental consumption a
+    /// single large buffer can back many completions in turn — each recv
+    /// picks up where the last one left off inside the same buffer — which
+    /// is useful for streaming protocols where allocating one buffer per
+    /// read would be wasteful.
+    ///
+    /// The contract for recycling changes to match: check
+    /// [`CqeFlags::BUF_MORE`](crate::types::CqeFlags::BUF_MORE) on each
+    /// completion. While it is set, the kernel still owns the buffer and
+    /// will write further data into it on a later completion — do not
+    /// recycle. Only call [`ProvidedBufferRing::recycle`] once a
+    /// completion for that buffer id arrives *without* that flag,
+    /// signalling the kernel is done with it.
+    ///
+    /// Otherwise identical to [`register_provided_buffers`](Self::register_provided_buffers):
+    /// `count` must be a power of two and both `count` and `buf_size` must
+    /// be non-zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `count` is not a power of two, if mmap fails, or if
+    /// the kernel rejects registration (e.g. the running kernel predates
+    /// incremental buffer support).
+    pub fn register_incremental_buffers(
+        &mut self,
+        bgid: u16,
+        count: u32,
+        buf_size: u32,
+    ) -> Result<ProvidedBufferRing, Error> {
+        register_provided_buffers_on(self.fd, bgid, count, buf_size, PbufRingFlags::INC)
     }
 
     /// Unregister a provided-buffer ring by group id.

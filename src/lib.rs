@@ -50,7 +50,7 @@ pub use types::{
     InotifyInitFlags, IoUringBuf, IoUringBufReg, IoUringBufStatus, IoUringCqe,
     IoUringFileIndexRange, IoUringFilesUpdate, IoUringParams, IoUringRsrcUpdate, IoUringSqe,
     IoVec, MadviseAdvice, MsgFlags, MsgRingFlags, OpenFlags,
-    OpenHow, PollMask,
+    OpenHow, PbufRingFlags, PollMask,
     RawFd, RecvmsgOut, RecvmsgParts, RenameFlags, SendRecvFlag, SetupFlags, ShutdownHow,
     SocketFlags, SocketType, SpliceFlags, SqeFlags, StatxFlags, StatxMask, SyncCancelReg,
     TimeoutFlags, Timespec, UnlinkFlags, WaitOptions, WaitidSiginfo, WatchMask,

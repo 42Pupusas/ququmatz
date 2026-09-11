@@ -5,7 +5,8 @@ use super::*;
 use crate::types::{
     AcceptFlags, EventFdFlags, FileMode, Futex2Flags, FutexWaitv, FsyncFlags, IdType,
     InotifyEvent, InotifyInitFlags, IoCqringOffsets, IoSqringOffsets, IoUringBuf, IoUringBufReg,
-    IoUringCqe, IoUringParams, IoUringSqe, MsgFlags, MsgHdr, Opcode, OpenFlags, PollMask,
+    IoUringCqe, IoUringParams, IoUringSqe, MsgFlags, MsgHdr, Opcode, OpenFlags, PbufRingFlags,
+    PollMask,
     RecvmsgOut, SockAddrIn, SqeFlags, Statx, StatxFlags, StatxMask, StatxTimestamp, WaitOptions,
     WaitidSiginfo, WatchMask,
 };
@@ -325,6 +326,11 @@ fn io_uring_buf_layout() {
 fn io_uring_buf_reg_layout() {
     assert_eq!(mem::size_of::<IoUringBufReg>(), 40);
     assert_eq!(mem::align_of::<IoUringBufReg>(), 8);
+}
+
+#[test]
+fn pbuf_ring_flags_inc_matches_kernel_bit() {
+    assert_eq!(PbufRingFlags::INC.bits(), 1 << 1);
 }
 
 #[test]
@@ -1799,6 +1805,110 @@ fn provided_buffer_ring_recv() {
         }
     }
     assert!(got_send && got_recv);
+
+    let _ = syscall::close(RawFd::from_raw(server_fd as usize));
+    let _ = syscall::close(RawFd::from_raw(client as usize));
+    let _ = syscall::close(RawFd::from_raw(listener as usize));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_incremental_buffer_ring_consumes_one_buffer_across_two_recvs() {
+    // A single 16-byte buffer, registered for incremental consumption
+    // (IOU_PBUF_RING_INC). Two separate 8-byte sends are received by two
+    // separate recv requests against the *same* bgid; the kernel should
+    // hand back the same buffer id both times, advancing into it rather
+    // than treating each recv as claiming a fresh buffer.
+    use crate::types::CqeFlags;
+
+    let mut ring = IoUring::new(8).expect("setup");
+    let (listener, port) = setup_tcp_listener();
+    let client = syscall::socket(types::AF_INET, types::SOCK_STREAM | types::SOCK_NONBLOCK, 0)
+        .expect("client socket")
+        .as_i32();
+
+    let Ok(mut pbuf) = ring.register_incremental_buffers(9, 1, 16) else {
+        // Kernel predates IOU_PBUF_RING_INC (6.12+); nothing to test.
+        let _ = syscall::close(RawFd::from_raw(client as usize));
+        let _ = syscall::close(RawFd::from_raw(listener as usize));
+        return;
+    };
+
+    let server_fd = tcp_handshake(&mut ring, listener, client, port);
+
+    let first = b"AAAAAAAA";
+    let second = b"BBBBBBBB";
+
+    ring.push(
+        unsafe { Sqe::send(RawFd::from_raw(client as usize), first, MsgFlags::default()) }
+            .user_data(10),
+    )
+    .expect("push send 1");
+    ring.submit_and_wait(1).expect("submit send 1");
+    let cqe = ring.complete().expect("send 1 cqe");
+    assert_eq!(cqe.result, first.len() as i32);
+
+    let recv1 = unsafe {
+        Sqe::recv_ptr(
+            RawFd::from_raw(server_fd as usize),
+            core::ptr::null_mut(),
+            0,
+            MsgFlags::default(),
+        )
+    }
+    .buffer_select(9)
+    .user_data(11);
+    ring.push(recv1).expect("push recv 1");
+    ring.submit_and_wait(1).expect("submit recv 1");
+    let cqe1 = ring.complete().expect("recv 1 cqe");
+    assert_eq!(cqe1.result, first.len() as i32, "recv 1: {}", cqe1.result);
+    let buf_id_1 = cqe1.buffer_id().expect("buffer_id on recv 1");
+    assert!(
+        cqe1.flags.contains(CqeFlags::BUF_MORE),
+        "first partial recv must keep the buffer under kernel ownership"
+    );
+
+    ring.push(
+        unsafe { Sqe::send(RawFd::from_raw(client as usize), second, MsgFlags::default()) }
+            .user_data(12),
+    )
+    .expect("push send 2");
+    ring.submit_and_wait(1).expect("submit send 2");
+    let cqe = ring.complete().expect("send 2 cqe");
+    assert_eq!(cqe.result, second.len() as i32);
+
+    let recv2 = unsafe {
+        Sqe::recv_ptr(
+            RawFd::from_raw(server_fd as usize),
+            core::ptr::null_mut(),
+            0,
+            MsgFlags::default(),
+        )
+    }
+    .buffer_select(9)
+    .user_data(13);
+    ring.push(recv2).expect("push recv 2");
+    ring.submit_and_wait(1).expect("submit recv 2");
+    let cqe2 = ring.complete().expect("recv 2 cqe");
+    assert_eq!(cqe2.result, second.len() as i32, "recv 2: {}", cqe2.result);
+    let buf_id_2 = cqe2.buffer_id().expect("buffer_id on recv 2");
+    assert_eq!(
+        buf_id_1, buf_id_2,
+        "incremental consumption must hand back the same buffer id"
+    );
+    assert!(
+        !cqe2.flags.contains(CqeFlags::BUF_MORE),
+        "the buffer is now fully drained and should return to the pool"
+    );
+
+    // Both partial writes land in the same physically contiguous 16-byte
+    // slot — the kernel advances the buffer's tracked address between
+    // completions, not the underlying memory.
+    let whole = pbuf.buffer(buf_id_2, 16).expect("full 16-byte buffer");
+    assert_eq!(&whole[..8], first);
+    assert_eq!(&whole[8..], second);
+
+    pbuf.recycle_and_commit(buf_id_2);
 
     let _ = syscall::close(RawFd::from_raw(server_fd as usize));
     let _ = syscall::close(RawFd::from_raw(client as usize));

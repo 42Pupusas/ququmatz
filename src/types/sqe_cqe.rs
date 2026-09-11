@@ -64,6 +64,16 @@ bitflags! {
     const SOCK_NONEMPTY = 1 << 2;
     /// Notification-only CQE (e.g. zero-copy send confirmation).
     const NOTIF = 1 << 3;
+    /// The completed buffer id is still partially unconsumed and will
+    /// generate further completions before it returns to the pool.
+    ///
+    /// Only set for buffers taken from a ring registered with
+    /// [`PbufRingFlags::INC`](super::PbufRingFlags::INC) — for any other
+    /// provided-buffer setup every completion that carries a buffer id
+    /// hands the whole buffer back and this flag never appears. While
+    /// it is set, do not recycle the id: the kernel still owns it and
+    /// will keep writing to the same slot.
+    const BUF_MORE = 1 << 4;
 }
 
 impl CqeFlags {

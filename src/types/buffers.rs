@@ -41,9 +41,26 @@ pub struct IoUringBufReg {
     pub ring_entries: u32,
     /// Buffer group id that SQEs will reference via `buf_group`.
     pub bgid: u16,
-    /// Reserved / flags — leave zero for user-allocated rings.
+    /// Registration flags — see [`PbufRingFlags`].
     pub flags: u16,
     pub(crate) resv: [u64; 3],
+}
+
+bitflags! {
+    /// Flags for `IORING_REGISTER_PBUF_RING` (`struct io_uring_buf_reg::flags`).
+    pub struct PbufRingFlags(u16);
+    /// The buffers in this ring can be incrementally consumed
+    /// (`IOU_PBUF_RING_INC`, kernel 6.12+).
+    ///
+    /// Without this flag, a completion that selects a buffer always
+    /// hands the whole thing over and the id returns to the pool once
+    /// the application calls `recycle`. With it, a single buffer can
+    /// satisfy many completions in turn — each one picks up where the
+    /// last left off — and the kernel keeps the id out of the recycle
+    /// pool for as long as the completion's `BUF_MORE` flag is set;
+    /// only recycle once a completion for that id arrives without that
+    /// flag.
+    const INC = 1 << 1;
 }
 
 /// A single buffer descriptor inside a provided-buffer ring.
