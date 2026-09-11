@@ -38,6 +38,14 @@ assert_eq!(cqe.user_data, 42);
 assert_eq!(cqe.result, 0);
 ```
 
+## Benchmarks
+
+See [`BENCHMARKS.md`](BENCHMARKS.md) for head-to-head numbers against the
+[`io-uring`](https://crates.io/crates/io-uring) crate — the only other
+actively maintained raw `io_uring` binding for Rust — plus an honest
+account of what those numbers do and don't establish, and one unresolved
+anomaly flagged for follow-up rather than dressed up as a result.
+
 ## License
 
 MIT
