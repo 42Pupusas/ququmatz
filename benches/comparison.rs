@@ -5,10 +5,16 @@
 )]
 
 //! Head-to-head benchmarks: ququmatz (raw syscall) vs io-uring crate.
+//!
+//! The io-uring comparison crate compiles only on `x86_64`, so every benchmark
+//! here is gated to that architecture and `main` becomes a no-op elsewhere.
 
+#[cfg(target_arch = "x86_64")]
 use ququmatz::types::RawFd;
+#[cfg(target_arch = "x86_64")]
 use std::os::unix::io::IntoRawFd;
 
+#[cfg(target_arch = "x86_64")]
 fn open_tmpfile(path: &str) -> i32 {
     std::fs::File::options()
         .read(true)
@@ -20,6 +26,7 @@ fn open_tmpfile(path: &str) -> i32 {
         .into_raw_fd()
 }
 
+#[cfg(target_arch = "x86_64")]
 fn drain_cq(cq: &mut io_uring::cqueue::CompletionQueue<'_>) -> usize {
     let mut n = 0;
     while cq.next().is_some() {
@@ -28,6 +35,7 @@ fn drain_cq(cq: &mut io_uring::cqueue::CompletionQueue<'_>) -> usize {
     n
 }
 
+#[cfg(target_arch = "x86_64")]
 mod ring_setup {
     #[divan::bench]
     fn ququmatz() {
@@ -40,6 +48,7 @@ mod ring_setup {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 mod sqe_build_nop {
     #[divan::bench]
     fn ququmatz() {
@@ -52,6 +61,7 @@ mod sqe_build_nop {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 mod sqe_build_read {
     use super::RawFd;
 
@@ -76,6 +86,7 @@ mod sqe_build_read {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 mod sqe_build_write {
     use super::RawFd;
 
@@ -100,6 +111,7 @@ mod sqe_build_write {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 mod nop_single {
     use super::drain_cq;
 
@@ -129,6 +141,7 @@ mod nop_single {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 mod nop_batch_32 {
     use super::drain_cq;
 
@@ -162,6 +175,7 @@ mod nop_batch_32 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 mod nop_batch_128 {
     use super::drain_cq;
 
@@ -195,6 +209,7 @@ mod nop_batch_128 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 mod write_4k {
     use super::{RawFd, drain_cq, open_tmpfile};
 
@@ -269,6 +284,7 @@ mod write_4k {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 mod read_4k {
     use super::{RawFd, drain_cq, open_tmpfile};
 
@@ -347,6 +363,7 @@ mod read_4k {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 mod writev_2x2k {
     use super::{RawFd, drain_cq, open_tmpfile};
 
@@ -399,6 +416,7 @@ mod writev_2x2k {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 mod linked_nops_3 {
     use super::drain_cq;
 
@@ -442,6 +460,7 @@ mod linked_nops_3 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 mod struct_sizes {
     #[divan::bench]
     fn size_validation() {
@@ -464,5 +483,6 @@ mod struct_sizes {
 }
 
 fn main() {
+    #[cfg(target_arch = "x86_64")]
     divan::main();
 }

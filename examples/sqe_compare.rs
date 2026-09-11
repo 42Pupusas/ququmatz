@@ -1,5 +1,15 @@
+//! Byte-for-byte SQE comparison against the io-uring crate, which compiles
+//! only on `x86_64`. Elsewhere this example does nothing.
+
+#[cfg(target_arch = "x86_64")]
 use ququmatz::types::RawFd;
 
+#[cfg(not(target_arch = "x86_64"))]
+fn main() {
+    println!("sqe_compare requires the io-uring crate, which is x86_64-only");
+}
+
+#[cfg(target_arch = "x86_64")]
 fn main() {
     let buf = [0xABu8; 4096];
 

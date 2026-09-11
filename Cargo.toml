@@ -22,8 +22,12 @@ dhat = { version = "0.3", optional = true }
 
 [dev-dependencies]
 divan = "0.1"
-io-uring = "0.7"
 trybuild = "1"
+
+# io-uring ships a prebuilt sys.rs valid only for x86_64 and refuses to
+# compile elsewhere. It backs benches/comparison only.
+[target.'cfg(target_arch = "x86_64")'.dev-dependencies]
+io-uring = "0.7"
 
 [[bench]]
 name = "io_uring"
