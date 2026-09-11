@@ -686,6 +686,53 @@ fn cancel_outcome_classifies_raw_results() {
 }
 
 #[test]
+fn sync_cancel_reg_layout_matches_the_kernel_struct() {
+    use crate::types::RawSyncCancelReg;
+
+    assert_eq!(mem::size_of::<RawSyncCancelReg>(), 64);
+    assert_eq!(mem::align_of::<RawSyncCancelReg>(), 8);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_sync_cancel_stops_a_pending_timeout_without_a_submit_round_trip() {
+    use crate::types::{CancelFlags, SyncCancelReg};
+
+    let mut ring = IoUring::new(8).expect("setup");
+
+    // A timeout far longer than the test should take, so the sync cancel
+    // is what ends it rather than expiry.
+    let ts = Timespec::from_millis(60_000);
+    let target_user_data = 99;
+    ring.push(unsafe { Sqe::timeout(&ts, 0, TimeoutFlags::default()) }.user_data(target_user_data))
+        .expect("push timeout");
+    ring.submit().expect("submit timeout");
+
+    let outcome = ring
+        .sync_cancel(SyncCancelReg::user_data(target_user_data, CancelFlags::empty()))
+        .expect("sync_cancel register call");
+    assert!(outcome.is_applied(), "expected the timeout to be cancelled, got {outcome:?}");
+
+    // The cancelled timeout still posts its own CQE, reporting -ECANCELED.
+    ring.submit_and_wait(1).expect("wait for cancelled timeout's cqe");
+    let cqe = ring.complete().expect("completion");
+    assert_eq!(cqe.user_data, target_user_data);
+    assert_eq!(cqe.result, -125); // -ECANCELED
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_sync_cancel_with_no_match_reports_not_found() {
+    use crate::types::{CancelFlags, CancelOutcome, SyncCancelReg};
+
+    let mut ring = IoUring::new(4).expect("setup");
+    let outcome = ring
+        .sync_cancel(SyncCancelReg::user_data(0xDEAD_BEEF, CancelFlags::empty()))
+        .expect("sync_cancel register call");
+    assert_eq!(outcome, CancelOutcome::NotFound);
+}
+
+#[test]
 fn timespec_from_millis() {
     let ts = Timespec::from_millis(1500);
     assert_eq!(ts.tv_sec(), 1);

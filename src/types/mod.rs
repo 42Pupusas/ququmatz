@@ -117,7 +117,8 @@ pub use buffers::{
     IoCqringOffsets, IoSqringOffsets, IoUringBuf, IoUringBufReg, IoUringFilesUpdate,
     IoUringRsrcUpdate, IoVec, RawFd,
 };
-pub use cancel::{CancelFlags, CancelOutcome};
+pub use cancel::{CancelFlags, CancelOutcome, SyncCancelReg};
+pub(crate) use cancel::RawSyncCancelReg;
 pub use epoll::{EpollEvent, EpollEvents, EpollOp};
 pub use eventfd::EventFdFlags;
 #[cfg(test)]

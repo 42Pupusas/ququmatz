@@ -1,5 +1,9 @@
-//! Flags and outcomes for `IORING_OP_ASYNC_CANCEL`.
+//! Flags and outcomes for `IORING_OP_ASYNC_CANCEL`, and the argument for
+//! its synchronous register-level sibling `IORING_REGISTER_SYNC_CANCEL`.
 
+use super::buffers::RawFd;
+use super::opcodes::Opcode;
+use super::timeout::Timespec;
 use crate::error::Errno;
 
 bitflags! {
@@ -94,4 +98,163 @@ impl core::fmt::Display for CancelOutcome {
             Self::Failed(e) => write!(f, "cancel failed: {e}"),
         }
     }
+}
+
+/// A `struct __kernel_timespec`-shaped pair the kernel reads for
+/// `IORING_REGISTER_SYNC_CANCEL`'s timeout.
+///
+/// [`Timespec`] cannot represent this: its nanosecond field forbids
+/// negative values, but `tv_sec == -1 && tv_nsec == -1` is the kernel's
+/// documented sentinel for "wait indefinitely", so "no timeout" needs its
+/// own tiny raw representation rather than an invariant-violating
+/// `Timespec`.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+struct RawTimeout {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+impl RawTimeout {
+    /// `-1/-1`: wait as long as it takes.
+    const NONE: Self = Self {
+        tv_sec: -1,
+        tv_nsec: -1,
+    };
+}
+
+impl From<Timespec> for RawTimeout {
+    fn from(ts: Timespec) -> Self {
+        Self {
+            tv_sec: ts.tv_sec(),
+            tv_nsec: ts.tv_nsec(),
+        }
+    }
+}
+
+/// Which request `IORING_REGISTER_SYNC_CANCEL` targets — the same three
+/// keys `IORING_OP_ASYNC_CANCEL` supports, resolved synchronously inside
+/// the register syscall instead of through a submitted SQE and its own
+/// completion.
+#[derive(Debug, Clone, Copy)]
+enum SyncCancelKey {
+    UserData(u64),
+    Fd(RawFd),
+    Any,
+}
+
+/// Argument for [`IoUring::sync_cancel`](crate::IoUring::sync_cancel).
+///
+/// Builds the kernel's `io_uring_sync_cancel_reg` without exposing its
+/// padding: every reserved byte the kernel rejects when nonzero
+/// (`sc.pad`/`sc.pad2`) is zeroed by construction, so a caller cannot
+/// accidentally trip `-EINVAL` by handing the kernel an uninitialized
+/// struct.
+#[derive(Debug, Clone, Copy)]
+pub struct SyncCancelReg {
+    key: SyncCancelKey,
+    flags: CancelFlags,
+    opcode: Option<Opcode>,
+    timeout: Option<Timespec>,
+}
+
+impl SyncCancelReg {
+    /// Cancel synchronously by the target's `user_data`.
+    #[must_use]
+    pub const fn user_data(target_user_data: u64, flags: CancelFlags) -> Self {
+        Self {
+            key: SyncCancelKey::UserData(target_user_data),
+            flags,
+            opcode: None,
+            timeout: None,
+        }
+    }
+
+    /// Cancel synchronously every in-flight request on `fd`.
+    ///
+    /// As with [`Sqe::cancel_fd`](crate::Sqe::cancel_fd), closing `fd`
+    /// does not by itself cancel requests still using it.
+    #[must_use]
+    pub const fn fd(target: RawFd, flags: CancelFlags) -> Self {
+        Self {
+            key: SyncCancelKey::Fd(target),
+            flags,
+            opcode: None,
+            timeout: None,
+        }
+    }
+
+    /// Cancel synchronously any single in-flight request, ignoring
+    /// `user_data` entirely.
+    #[must_use]
+    pub const fn any(flags: CancelFlags) -> Self {
+        Self {
+            key: SyncCancelKey::Any,
+            flags,
+            opcode: None,
+            timeout: None,
+        }
+    }
+
+    /// Narrow the match to only the given original opcode (Linux 6.6+).
+    #[must_use]
+    pub const fn matching_opcode(mut self, opcode: Opcode) -> Self {
+        self.opcode = Some(opcode);
+        self
+    }
+
+    /// Bound how long the kernel will wait once it has found a match that
+    /// is already too late to cancel outright (`-EALREADY`) and is
+    /// instead being waited out. Without this the kernel waits
+    /// indefinitely; if the bound elapses first, [`IoUring::sync_cancel`]
+    /// reports it through [`CancelOutcome::Failed`] carrying `-ETIME`.
+    ///
+    /// [`IoUring::sync_cancel`]: crate::ring::IoUring::sync_cancel
+    #[must_use]
+    pub const fn timeout(mut self, ts: Timespec) -> Self {
+        self.timeout = Some(ts);
+        self
+    }
+
+    /// Build the raw kernel argument.
+    pub(crate) fn as_raw(&self) -> RawSyncCancelReg {
+        let mut flags = self.flags;
+        let (addr, fd) = match self.key {
+            SyncCancelKey::UserData(target) => (target, 0),
+            SyncCancelKey::Fd(target) => {
+                flags |= CancelFlags::FD;
+                (0, target.as_i32())
+            }
+            SyncCancelKey::Any => {
+                flags |= CancelFlags::ANY;
+                (0, 0)
+            }
+        };
+        let opcode = self.opcode.map_or(0, |op| {
+            flags |= CancelFlags::OP;
+            u8::from(op)
+        });
+        RawSyncCancelReg {
+            addr,
+            fd,
+            flags: flags.bits(),
+            timeout: self.timeout.map_or(RawTimeout::NONE, RawTimeout::from),
+            opcode,
+            pad: [0; 7],
+            pad2: [0; 3],
+        }
+    }
+}
+
+/// Raw `io_uring_sync_cancel_reg` argument, byte-for-byte.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct RawSyncCancelReg {
+    addr: u64,
+    fd: i32,
+    flags: u32,
+    timeout: RawTimeout,
+    opcode: u8,
+    pad: [u8; 7],
+    pad2: [u64; 3],
 }

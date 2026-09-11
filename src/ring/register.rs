@@ -4,7 +4,10 @@
 use super::IoUring;
 use crate::error::Error;
 use crate::syscall;
-use crate::types::{IoUringFilesUpdate, IoUringRsrcUpdate, IoVec, RawFd, RegisterOp};
+use crate::types::{
+    CancelOutcome, IoUringFilesUpdate, IoUringRsrcUpdate, IoVec, RawFd, RawSyncCancelReg,
+    RegisterOp, SyncCancelReg,
+};
 
 impl IoUring {
     /// Register buffers for zero-copy I/O with `read_fixed`/`write_fixed`.
@@ -216,5 +219,39 @@ impl IoUring {
     pub fn enable_rings(&mut self) -> Result<(), Error> {
         syscall::io_uring_register(self.fd, RegisterOp::RegisterEnableRings.into(), 0, 0)?;
         Ok(())
+    }
+
+    /// Cancel a request synchronously, blocking the calling thread until
+    /// it is cancelled (or already too late) rather than requiring a
+    /// separate `IORING_OP_ASYNC_CANCEL` submission and a poll for its
+    /// completion.
+    ///
+    /// The kernel keeps retrying internally while a match is found but
+    /// already completing (`-EALREADY`) until it either succeeds or
+    /// [`SyncCancelReg::timeout`] elapses, so this call itself may block
+    /// for that whole duration; `-ENOENT` and outright rejection still
+    /// return immediately.
+    ///
+    /// # Errors
+    ///
+    /// Never returns [`Error::Syscall`] directly for the ordinary racy
+    /// outcomes — `-ENOENT`, `-EALREADY` (surfaced as `-ETIME` once a
+    /// timeout is set and elapses), and a plain kernel rejection are all
+    /// folded into [`CancelOutcome`] instead, the same treatment the
+    /// submitted `IORING_OP_ASYNC_CANCEL` path gives them. This can still
+    /// return an error if the register syscall itself cannot be issued
+    /// (e.g. an invalid fd).
+    pub fn sync_cancel(&mut self, reg: SyncCancelReg) -> Result<CancelOutcome, Error> {
+        let mut raw: RawSyncCancelReg = reg.as_raw();
+        match syscall::io_uring_register(
+            self.fd,
+            RegisterOp::RegisterSyncCancel.into(),
+            core::ptr::from_mut(&mut raw) as usize,
+            1,
+        ) {
+            #[allow(clippy::cast_possible_truncation)]
+            Ok(n) => Ok(CancelOutcome::Applied(n as u32)),
+            Err(errno) => Ok(CancelOutcome::from_raw(-errno.raw())),
+        }
     }
 }

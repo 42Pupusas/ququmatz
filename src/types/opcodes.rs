@@ -96,6 +96,10 @@ pub enum RegisterOp {
     RegisterPbufRing = 22,
     /// Unregister a provided-buffer ring.
     UnregisterPbufRing = 23,
+    /// Synchronous cancel-and-wait: cancels a request and blocks the
+    /// calling thread until either it is cancelled or a timeout elapses,
+    /// with no separate submit/poll round trip (kernel 6.0+).
+    RegisterSyncCancel = 24,
 }
 
 impl From<RegisterOp> for u32 {
