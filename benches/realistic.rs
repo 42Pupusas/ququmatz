@@ -10,7 +10,7 @@
 //! Gated to `x86_64` for the same reason as `comparison.rs`: the `io-uring`
 //! crate ships prebuilt ABI bindings only for that architecture.
 //!
-//! Two workloads:
+//! Three workloads:
 //!
 //! - `echo_roundtrip`: a TCP client writes a small request, a loopback
 //!   "server" ring receives it and echoes it back, the client reads the
@@ -21,6 +21,14 @@
 //!   This is the shape of an append-only log or WAL writer: durability
 //!   requires all four steps every time, so benchmarking `write` alone
 //!   would understate the real cost.
+//! - `echo_roundtrip_concurrent`: the same echo shape, but K connections in
+//!   flight per iteration instead of one. This is the case `io_uring`
+//!   actually exists for — one ring batching K recvs into one syscall,
+//!   then K sends into another — compared against K OS threads each
+//!   blocking on its own socket. The first two workloads above never
+//!   submit more than one operation at a time, so they cannot show this;
+//!   this one dials K up (1/8/32/128) to see where, if anywhere, batching
+//!   pays for its own complexity.
 
 #[cfg(target_arch = "x86_64")]
 mod workloads {
@@ -64,6 +72,11 @@ mod workloads {
 
     pub const fn as_rawfd(fd: i32) -> RawFd {
         RawFd::from_raw(fd as usize)
+    }
+
+    /// `k` connected loopback pairs, for the concurrent-workload benchmarks.
+    pub fn connected_pairs(k: usize) -> Vec<(TcpStream, i32)> {
+        (0..k).map(|_| connected_pair()).collect()
     }
 }
 
@@ -172,6 +185,123 @@ mod echo_roundtrip {
             client.read_exact(&mut reply_buf[..n]).unwrap();
             divan::black_box(n);
             assert_eq!(&reply_buf[..n], REQUEST);
+        });
+    }
+}
+
+/// The same echo shape as [`echo_roundtrip`], but `K` connections are
+/// driven per iteration instead of one. This is what `io_uring` is for:
+/// one ring batches `K` recvs into a single `enter` syscall and `K` sends
+/// into another, where a thread-per-connection design pays `K` blocking
+/// syscalls (and `K` thread wakeups) for the same work.
+///
+/// `K` sweeps 1/8/32/128 so the crossover point, if any, is visible rather
+/// than asserted.
+#[cfg(target_arch = "x86_64")]
+mod echo_roundtrip_concurrent {
+    use super::workloads::{REQUEST, as_rawfd, connected_pairs};
+    use ququmatz::types::MsgFlags;
+    use ququmatz::{IoUring, Sqe};
+    use std::io::{Read as _, Write as _};
+    use std::thread;
+
+    const CONCURRENCY: [usize; 4] = [1, 8, 32, 128];
+
+    /// One ring driving `k` connections: push `k` recvs, submit once, drain
+    /// `k` completions by `user_data`, then the same for `k` sends. This is
+    /// the batching `io_uring` exists to provide -- never realized when only
+    /// one operation is ever in flight, as in [`super::echo_roundtrip`].
+    #[divan::bench(args = CONCURRENCY)]
+    fn ququmatz(bencher: divan::Bencher, k: usize) {
+        let mut pairs = connected_pairs(k);
+        let mut ring = IoUring::new((k * 2).max(8) as u32).expect("setup");
+        let mut recv_bufs = vec![[0u8; 256]; k];
+        let mut reply_bufs = vec![[0u8; 256]; k];
+
+        bencher.bench_local(|| {
+            for (client, _) in &mut pairs {
+                client.write_all(REQUEST).unwrap();
+            }
+
+            for (i, ((_, server_fd), recv_buf)) in pairs.iter().zip(&mut recv_bufs).enumerate() {
+                let fd = as_rawfd(*server_fd);
+                ring.push(
+                    unsafe {
+                        Sqe::recv_ptr(
+                            fd,
+                            recv_buf.as_mut_ptr(),
+                            recv_buf.len() as u32,
+                            MsgFlags::default(),
+                        )
+                    }
+                    .user_data(i as u64),
+                )
+                .unwrap();
+            }
+            ring.submit_and_wait(k as u32).unwrap();
+            let mut lens = vec![0usize; k];
+            for c in ring.completions() {
+                lens[c.user_data as usize] = c.into_result().unwrap() as usize;
+            }
+
+            for (i, ((_, server_fd), recv_buf)) in pairs.iter().zip(&recv_bufs).enumerate() {
+                let fd = as_rawfd(*server_fd);
+                ring.push(
+                    unsafe {
+                        Sqe::send_ptr(fd, recv_buf.as_ptr(), lens[i] as u32, MsgFlags::default())
+                    }
+                    .user_data(i as u64),
+                )
+                .unwrap();
+            }
+            ring.submit_and_wait(k as u32).unwrap();
+            for c in ring.completions() {
+                divan::black_box(c.into_result().unwrap());
+            }
+
+            for (i, (client, _)) in pairs.iter_mut().enumerate() {
+                let n = lens[i];
+                client.read_exact(&mut reply_bufs[i][..n]).unwrap();
+                assert_eq!(&reply_bufs[i][..n], REQUEST);
+            }
+        });
+    }
+
+    /// `k` OS threads, each blocking on its own connection with plain
+    /// `read`/`write` -- no `io_uring` anywhere. The baseline a batching
+    /// ring has to beat once there is enough concurrency for thread
+    /// overhead and scheduler contention to show up.
+    #[divan::bench(args = CONCURRENCY)]
+    fn std_blocking_threads(bencher: divan::Bencher, k: usize) {
+        use std::os::fd::FromRawFd as _;
+        let mut clients = Vec::with_capacity(k);
+        let mut servers = Vec::with_capacity(k);
+        for (client, server_fd) in connected_pairs(k) {
+            clients.push(client);
+            servers.push(unsafe { std::net::TcpStream::from_raw_fd(server_fd) });
+        }
+
+        bencher.bench_local(|| {
+            for client in &mut clients {
+                client.write_all(REQUEST).unwrap();
+            }
+
+            thread::scope(|scope| {
+                for server in &mut servers {
+                    scope.spawn(move || {
+                        let mut recv_buf = [0u8; 256];
+                        let n = server.read(&mut recv_buf).unwrap();
+                        server.write_all(&recv_buf[..n]).unwrap();
+                        n
+                    });
+                }
+            });
+
+            for client in &mut clients {
+                let mut reply_buf = [0u8; 256];
+                client.read_exact(&mut reply_buf[..REQUEST.len()]).unwrap();
+                assert_eq!(&reply_buf[..REQUEST.len()], REQUEST);
+            }
         });
     }
 }

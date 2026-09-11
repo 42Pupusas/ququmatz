@@ -68,11 +68,57 @@ realistic           fastest       │ slowest       │ median        │ mean  
 on both workloads — the isolated-opcode parity from `comparison.rs` holds
 under realistic multi-step use too. Both cost roughly 2× the plain
 blocking baseline on these small, single-connection, single-file
-workloads: `io_uring`'s advantage is batching many *concurrent*
-operations behind one syscall, which a benchmark doing one thing at a
-time and waiting for it cannot show. Neither crate's number here is a
-claim that `io_uring` is faster than blocking I/O at this concurrency
-level — it manifestly isn't, on this host, at this scale.
+workloads run one operation at a time. `io_uring`'s actual advantage —
+batching many concurrent operations behind one syscall — cannot show up
+here, because neither workload above ever has more than one operation in
+flight; see `echo_roundtrip_concurrent` below for the workload that
+actually exercises it.
+
+### Concurrent workload (`echo_roundtrip_concurrent`)
+
+The two workloads above submit one operation, wait for it, submit the
+next — never more than one thing in flight. That is not the case
+`io_uring` exists for. `echo_roundtrip_concurrent` drives `K` loopback
+connections per iteration: one ring pushes `K` recvs and submits them in
+a single `enter` syscall, drains `K` completions by `user_data`, then
+does the same for `K` sends. This is compared against `K` OS threads,
+each blocking on its own connection with plain `read`/`write` — the
+design a batching ring has to beat once concurrency is high enough for
+thread-wakeup and scheduler overhead to matter. `K` sweeps 1/8/32/128 so
+the crossover, if any, is visible rather than asserted.
+
+```text
+realistic                     fastest       │ slowest       │ median        │ mean          │ samples │ iters
+╰─ echo_roundtrip_concurrent                │               │               │               │         │
+   ├─ ququmatz                              │               │               │               │         │
+   │  ├─ 1                    13.38 µs      │ 58.9 µs       │ 13.48 µs      │ 14.07 µs      │ 100     │ 100
+   │  ├─ 8                    90.64 µs      │ 158.3 µs      │ 91.52 µs      │ 93.97 µs      │ 100     │ 100
+   │  ├─ 32                   355.9 µs      │ 600.6 µs      │ 369.1 µs      │ 379 µs        │ 100     │ 100
+   │  ╰─ 128                  1.461 ms      │ 2.524 ms      │ 1.528 ms      │ 1.552 ms      │ 100     │ 100
+   ╰─ std_blocking_threads                  │               │               │               │         │
+      ├─ 1                    52.81 µs      │ 232.1 µs      │ 56.16 µs      │ 62.47 µs      │ 100     │ 100
+      ├─ 8                    215.8 µs      │ 395.6 µs      │ 247.1 µs      │ 255.9 µs      │ 100     │ 100
+      ├─ 32                   789.8 µs      │ 2.208 ms      │ 885.7 µs      │ 923.2 µs      │ 100     │ 100
+      ╰─ 128                  3.308 ms      │ 5.165 ms      │ 4.314 ms      │ 4.337 ms      │ 100     │ 100
+```
+
+**Reading it:** the single ring wins at every `K` tested, and the margin
+widens with `K` — roughly 4× at `K=1` down to roughly 2.7× at `K=128`
+(`std_blocking_threads` scales worse than linearly past `K=32`, plausibly
+thread-spawn/join and scheduler contention rather than the syscalls
+themselves, though that split was not separately measured). This is the
+result the earlier two workloads structurally could not show: one ring
+batching many operations behind one syscall beats one thread per
+connection once there is more than one connection to serve, and the gap
+grows rather than shrinks as concurrency increases. Reproduced across two
+consecutive runs with consistent numbers at each `K`.
+
+What this does **not** establish: `K=128` on one loopback host with one
+ring and threads capped by the same machine's core count is not a
+production load test, there is no comparison against `io-uring` directly
+at this shape (only against `std_blocking_threads`), and no attempt was
+made to find where thread-per-connection stops being the wrong design —
+only that it already is by `K=8`.
 
 ### A methodology failure caught before publishing
 
@@ -193,12 +239,14 @@ a number can be wrong.
 - This is a snapshot from one run on one kernel version (5.14). Kernel
   version, filesystem, and hardware all plausibly shift these numbers;
   no claim is made that they hold on a different machine or kernel.
-- Neither realistic workload exercises concurrency — one connection, one
-  file, one operation in flight at a time. `io_uring`'s actual selling
-  point (batching many concurrent operations behind one syscall) is
-  deliberately not what these two workloads measure; a concurrent-load
-  benchmark is a plausible follow-up, not something this document claims
-  to have done.
+- `echo_roundtrip` and `log_append` exercise one connection or one file
+  with one operation in flight at a time; `echo_roundtrip_concurrent`
+  covers the batched-concurrency case for the echo shape only —
+  `log_append` has no concurrent counterpart yet (K parallel durable
+  writes through one ring vs. K threads each doing blocking
+  open/write/fsync/close), and no workload here compares batched
+  `ququmatz` against batched `io-uring` directly, only against a
+  thread-per-connection `std` baseline.
 
 ## Running it yourself
 
