@@ -733,6 +733,46 @@ fn a_real_sync_cancel_with_no_match_reports_not_found() {
 }
 
 #[test]
+fn io_uring_file_index_range_layout_matches_the_kernel_struct() {
+    use crate::types::IoUringFileIndexRange;
+
+    assert_eq!(mem::size_of::<IoUringFileIndexRange>(), 16);
+    assert_eq!(mem::align_of::<IoUringFileIndexRange>(), 8);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_file_alloc_range_confines_auto_allocation_to_the_reserved_slice() {
+    use crate::types::{AddressFamily, SocketFlags, SocketType};
+
+    let mut ring = IoUring::new(8).expect("setup");
+    // A sparse table with 8 slots, all empty.
+    ring.register_files(&[-1; 8]).expect("register_files");
+    // Confine auto-allocation to slots [4, 8): the low half stays free
+    // for explicit assignment, the high half is where the kernel may pick.
+    ring.register_file_alloc_range(4, 4)
+        .expect("register_file_alloc_range");
+
+    ring.push(Sqe::socket_direct(
+        AddressFamily::Inet,
+        SocketType::Stream,
+        0,
+        SocketFlags::empty(),
+    ))
+    .expect("push socket_direct");
+    ring.submit_and_wait(1).expect("submit");
+    let cqe = ring.complete().expect("completion");
+    assert!(cqe.result >= 0, "socket_direct failed: {}", cqe.result);
+    let slot = cqe.result as u32;
+    assert!(
+        (4..8).contains(&slot),
+        "auto-allocated slot {slot} escaped the reserved range [4, 8)"
+    );
+
+    ring.unregister_files().expect("unregister_files");
+}
+
+#[test]
 fn timespec_from_millis() {
     let ts = Timespec::from_millis(1500);
     assert_eq!(ts.tv_sec(), 1);

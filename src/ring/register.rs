@@ -5,8 +5,8 @@ use super::IoUring;
 use crate::error::Error;
 use crate::syscall;
 use crate::types::{
-    CancelOutcome, IoUringFilesUpdate, IoUringRsrcUpdate, IoVec, RawFd, RawSyncCancelReg,
-    RegisterOp, SyncCancelReg,
+    CancelOutcome, IoUringFileIndexRange, IoUringFilesUpdate, IoUringRsrcUpdate, IoVec, RawFd,
+    RawSyncCancelReg, RegisterOp, SyncCancelReg,
 };
 
 impl IoUring {
@@ -83,6 +83,30 @@ impl IoUring {
             RegisterOp::RegisterFilesUpdate.into(),
             core::ptr::addr_of!(arg) as usize,
             fds.len() as u32,
+        )?;
+        Ok(())
+    }
+
+    /// Restrict fixed-file-index auto-allocation (`IORING_FILE_INDEX_ALLOC`,
+    /// e.g. [`Sqe::socket_direct`](crate::Sqe::socket_direct)'s
+    /// allocate-for-me form) to the slice `[off, off + len)` of the
+    /// registered-file table.
+    ///
+    /// Without this, the kernel is free to hand back any free slot; setting
+    /// a range makes auto-allocation predictable — useful when the rest of
+    /// the table is reserved for slots the caller assigns explicitly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no file table is registered or the range doesn't
+    /// fit within it.
+    pub fn register_file_alloc_range(&mut self, off: u32, len: u32) -> Result<(), Error> {
+        let arg = IoUringFileIndexRange { off, len, resv: 0 };
+        syscall::io_uring_register(
+            self.fd,
+            RegisterOp::RegisterFileAllocRange.into(),
+            core::ptr::addr_of!(arg) as usize,
+            0,
         )?;
         Ok(())
     }

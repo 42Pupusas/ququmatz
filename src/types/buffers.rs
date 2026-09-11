@@ -168,3 +168,13 @@ pub struct IoUringRsrcUpdate {
     pub resv: u32,
     pub data: u64,
 }
+
+/// Argument for `IORING_REGISTER_FILE_ALLOC_RANGE`
+/// (`struct io_uring_file_index_range`).
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct IoUringFileIndexRange {
+    pub off: u32,
+    pub len: u32,
+    pub resv: u64,
+}

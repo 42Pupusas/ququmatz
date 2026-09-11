@@ -100,6 +100,10 @@ pub enum RegisterOp {
     /// calling thread until either it is cancelled or a timeout elapses,
     /// with no separate submit/poll round trip (kernel 6.0+).
     RegisterSyncCancel = 24,
+    /// Set the allowable range for fixed-file-index auto-allocation
+    /// (`IORING_FILE_INDEX_ALLOC`) so newly instantiated direct descriptors
+    /// land in a caller-chosen slice of the file table (kernel 6.0+).
+    RegisterFileAllocRange = 25,
 }
 
 impl From<RegisterOp> for u32 {
