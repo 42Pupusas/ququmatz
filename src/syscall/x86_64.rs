@@ -15,6 +15,7 @@ pub const SYS_BIND: usize = 49;
 pub const SYS_LISTEN: usize = 50;
 pub const SYS_GETSOCKNAME: usize = 51;
 pub const SYS_SETSOCKOPT: usize = 54;
+pub const SYS_PIPE2: usize = 293;
 pub const SYS_EVENTFD2: usize = 290;
 pub const SYS_INOTIFY_INIT1: usize = 294;
 pub const SYS_INOTIFY_ADD_WATCH: usize = 254;

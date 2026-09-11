@@ -243,6 +243,14 @@ pub fn eventfd2(initval: u32, flags: i32) -> Result<RawFd, Errno> {
     check(unsafe { syscall2(SYS_EVENTFD2, initval as usize, flags as usize) }).map(RawFd::from_raw)
 }
 
+/// `pipe2(2)`. Only the tests reach for this, but it lives here so it
+/// picks up the per-architecture syscall number like every other call
+/// rather than hard-coding `x86_64`'s in the test module.
+pub fn pipe2(fds: *mut i32, flags: i32) -> Result<(), Errno> {
+    check(unsafe { syscall2(SYS_PIPE2, fds as usize, flags as usize) })?;
+    Ok(())
+}
+
 pub fn inotify_init1(flags: i32) -> Result<RawFd, Errno> {
     check(unsafe { syscall1(SYS_INOTIFY_INIT1, flags as usize) }).map(RawFd::from_raw)
 }

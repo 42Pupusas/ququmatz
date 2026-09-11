@@ -85,8 +85,11 @@ fn params_layout() {
 
 #[test]
 fn iovec_layout() {
-    assert_eq!(mem::size_of::<IoVec>(), 16);
-    assert_eq!(mem::align_of::<IoVec>(), 8);
+    // struct iovec is a pointer plus a size_t, so it tracks the target's
+    // pointer width rather than being 16 bytes everywhere.
+    let ptr = mem::size_of::<*mut u8>();
+    assert_eq!(mem::size_of::<IoVec>(), 2 * ptr);
+    assert_eq!(mem::align_of::<IoVec>(), mem::align_of::<*mut u8>());
 }
 
 #[test]
@@ -1831,10 +1834,21 @@ fn open_how_layout() {
 #[test]
 fn epoll_event_layout() {
     use crate::types::EpollEvent;
-    // Kernel struct is `packed`: 4 bytes events + 8 bytes data = 12 bytes, align 1.
-    assert_eq!(mem::size_of::<EpollEvent>(), 12);
     assert_eq!(mem::offset_of!(EpollEvent, events), 0);
-    assert_eq!(mem::offset_of!(EpollEvent, data), 4);
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        assert_eq!(mem::size_of::<EpollEvent>(), 12);
+        assert_eq!(mem::align_of::<EpollEvent>(), 1);
+        assert_eq!(mem::offset_of!(EpollEvent, data), 4);
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        assert_eq!(mem::size_of::<EpollEvent>(), 16);
+        assert_eq!(mem::align_of::<EpollEvent>(), 8);
+        assert_eq!(mem::offset_of!(EpollEvent, data), 8);
+    }
 }
 
 #[test]
@@ -2721,10 +2735,8 @@ fn split_allows_default_flags() {
 #[test]
 fn splice_pipe_roundtrip() {
     use crate::types::SpliceFlags;
-    // pipe2(2) via /proc/self/fd to avoid direct syscall
     let mut pipe_fds = [0i32; 2];
-    let ret = unsafe { libc_pipe2(pipe_fds.as_mut_ptr(), 0) };
-    assert_eq!(ret, 0, "pipe2 failed");
+    crate::syscall::pipe2(pipe_fds.as_mut_ptr(), 0).expect("pipe2");
     let [read_end, write_end] = pipe_fds;
 
     let mut ring = IoUring::new(8).expect("setup");
@@ -3272,22 +3284,4 @@ fn split_submit_return_value_tracks_actual_consumption_across_rounds() {
         "leftover user_data values never completed: {expected:?}"
     );
     assert!(comp.complete().is_none());
-}
-
-/// Thin shim over `pipe2(2)` — only used in tests, so we call the
-/// raw syscall number rather than pulling in libc.
-#[cfg(not(miri))]
-unsafe fn libc_pipe2(fds: *mut i32, flags: i32) -> i32 {
-    let ret: i64;
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            in("rax") 293i64, // SYS_pipe2
-            in("rdi") fds,
-            in("rsi") i64::from(flags),
-            lateout("rax") ret,
-            options(nostack),
-        );
-    }
-    if ret < 0 { -(ret as i32) } else { ret as i32 }
 }

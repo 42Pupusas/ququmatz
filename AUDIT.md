@@ -981,23 +981,56 @@ The fields are gone; `repr(C)` inserts the right padding per target.
 The size assertion is now pointer-width relative, and a new test checks
 every field offset rather than the total size.
 
-**A verification limit worth stating.** Neither the offset test nor a
-`const` size assertion can catch this class of error on x86_64: a
-declared `u32` sitting where the ABI would have put four padding bytes
-produces a byte-identical struct. Reinstating `_pad1` was tried as a
-sabotage and every check still passed. The bug is only observable on a
-32-bit target, and no 32-bit std is installed here, so the fix is
-reasoned from the ABI rule rather than demonstrated. The tests added
-alongside it will detect the regression the moment the suite is run on
-`armv7-unknown-linux-gnueabihf`.
+`EpollEvent` is fixed the same way. The kernel defines `EPOLL_PACKED` in
+`include/uapi/linux/eventpoll.h` as `__attribute__((packed))` under
+`#ifdef __x86_64__` and as nothing otherwise, so that the 64-bit struct
+keeps the 32-bit struct's alignment. This crate packed it on every
+target, which puts `data` at offset 4 on aarch64, riscv64 and arm where
+the kernel reads it from offset 8. The `repr` is now gated on
+`target_arch`.
 
-Still open under Q-09: the epoll structs remain hard-coded to the x86_64
-layout, several layout tests still assert 64-bit sizes unconditionally,
-and an x86_64 asm helper in the test module breaks `--all-targets` on
-aarch64. Those need per-target layouts and execution on real hardware,
-not another gate. The available machines (`arrakis`, `miniforum`) are
-both x86_64 with no cross-runner installed, so no non-x86_64 execution
-has been performed for any claim in this document.
+The test-module `pipe2` helper hard-coded x86_64's `syscall`
+instruction and syscall number 293, so `cargo check --all-targets`
+failed on any other architecture. `pipe2` now lives in `src/syscall/`
+like every other call, with its number taken per-architecture from the
+kernel tables (293 x86_64, 59 aarch64/riscv64, 359 arm).
+`--all-targets` now passes for aarch64.
+
+`iovec_layout` asserted 16 bytes unconditionally; `struct iovec` is a
+pointer plus a `size_t`, so it is now asserted relative to pointer
+width. `timespec_layout` was checked and left alone: `__kernel_timespec`
+is two `__s64` and is 16 bytes on every target.
+
+### How these are verified
+
+The layout invariants are module-level `const _: () = assert!(...)`,
+not `const` items inside an `impl`. This distinction was found by
+sabotage: an associated const referenced only from a function body is
+**not** evaluated by `cargo check`, so the first version of the epoll
+assertion passed a cross-check with the struct deliberately mispacked.
+At module level it is always evaluated, and the same sabotage then
+failed the aarch64 build as it should.
+
+That makes the 32-bit claims checkable after all.
+`wasm32-unknown-unknown` is a 32-bit target whose `core` is installed
+here, and building against it evaluates every layout assertion.
+Reinstating `MsgHdr::_pad1` fails that build on both the size and the
+`msg_iov` offset assertion. The `compile_error!` platform gates also
+fire there, so the target is only a layout oracle, not a supported one,
+but the ABI claims are now demonstrated rather than reasoned.
+
+Verified this round: 460 lib tests (default and `--no-default-features`),
+20 compile-fail fixtures, 5 doctests, clippy `-D warnings --all-targets`
+in both feature modes, `cargo check --all-targets` for aarch64, and the
+wasm32 layout cross-check. **Miri was not run: the component is not
+installed for either toolchain on this machine.** The `owned::miri`
+tests ran as ordinary tests, which does not exercise the aliasing model.
+
+Still open under Q-09: no non-x86_64 *execution* has occurred. The
+available machines (`arrakis`, `miniforum`) are both x86_64 with no
+cross-runner installed, and `rust-std` is absent for armv7, riscv64 and
+i686. Layout and syscall numbers are checked at compile time against the
+kernel's own headers and tables; nothing has run on the hardware.
 
 ### Q-10 — Setup allocation failure leaks a separately mapped CQ
 

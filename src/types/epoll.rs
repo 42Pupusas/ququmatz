@@ -27,11 +27,27 @@ bitflags! {
     const ONESHOT = 1 << 30;
 }
 
-/// Kernel `epoll_event` struct (packed: 4-byte events + 8-byte data).
+/// Kernel `struct epoll_event`.
+///
+/// The kernel packs this on `x86_64` only. `include/uapi/linux/eventpoll.h`
+/// defines `EPOLL_PACKED` as `__attribute__((packed))` under `#ifdef
+/// __x86_64__` and as nothing otherwise, so that the 64-bit struct keeps
+/// the same alignment as the 32-bit one and 32-bit emulation stays easy.
+/// Everywhere else `data` sits at its natural 8-byte alignment, leaving a
+/// four-byte gap after `events`. Packing unconditionally would put `data`
+/// at offset 4 on aarch64, riscv64 and arm, where the kernel reads it
+/// from offset 8.
 #[derive(Debug, Clone, Copy, Default)]
-#[repr(C, packed)]
+#[cfg_attr(target_arch = "x86_64", repr(C, packed))]
+#[cfg_attr(not(target_arch = "x86_64"), repr(C))]
 pub struct EpollEvent {
     pub events: u32,
     /// User data associated with this event (fd, pointer, etc.).
     pub data: u64,
 }
+
+const _: () = assert!(
+    core::mem::offset_of!(EpollEvent, data) == if cfg!(target_arch = "x86_64") { 4 } else { 8 },
+    "epoll_event.data is packed to offset 4 only on x86_64; every other architecture leaves it at its natural 8-byte alignment"
+);
+

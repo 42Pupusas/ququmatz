@@ -203,16 +203,18 @@ pub struct MsgHdr {
     pub msg_flags: i32,
 }
 
-impl MsgHdr {
-    const LAYOUT_IS_ABI_EXACT: () = assert!(
-        core::mem::size_of::<Self>() == 7 * core::mem::size_of::<*mut u8>(),
-        "MsgHdr must occupy exactly seven pointer-widths: four pointer-sized members, and three 32-bit members each padded out to a pointer. A padding field declared by hand breaks this on 32-bit targets, where the gap it claims to fill does not exist."
-    );
-}
+const _: () = assert!(
+    core::mem::size_of::<MsgHdr>() == 7 * core::mem::size_of::<*mut u8>(),
+    "MsgHdr must occupy exactly seven pointer-widths: four pointer-sized members, and three 32-bit members each padded out to a pointer. A padding field declared by hand breaks this on 32-bit targets, where the gap it claims to fill does not exist."
+);
+
+const _: () = assert!(
+    core::mem::offset_of!(MsgHdr, msg_iov) == 2 * core::mem::size_of::<*mut u8>(),
+    "msg_iov must sit exactly two pointer-widths in. A hand-declared padding field before it is invisible in the total size on 64-bit targets but displaces this offset on 32-bit ones."
+);
 
 impl Default for MsgHdr {
     fn default() -> Self {
-        let () = Self::LAYOUT_IS_ABI_EXACT;
         // Safety: all fields are integer or pointer types; zero is valid.
         unsafe { core::mem::zeroed() }
     }
