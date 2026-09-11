@@ -1805,6 +1805,79 @@ fn provided_buffer_ring_recv() {
     let _ = syscall::close(RawFd::from_raw(listener as usize));
 }
 
+#[cfg(not(miri))]
+#[test]
+fn io_uring_buf_status_layout_matches_the_kernel_struct() {
+    use crate::types::IoUringBufStatus;
+
+    assert_eq!(mem::size_of::<IoUringBufStatus>(), 40);
+    assert_eq!(mem::align_of::<IoUringBufStatus>(), 4);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_pbuf_status_reports_the_head_the_kernel_advances() {
+    let mut ring = IoUring::new(8).expect("setup");
+    let mut pbuf = ring
+        .register_provided_buffers(7, 4, 64)
+        .expect("register_provided_buffers");
+
+    // Freshly registered and fully stocked: nothing has been consumed yet.
+    assert_eq!(pbuf.status().expect("status"), 0);
+
+    // A TCP handshake, then a send/recv over it, drives exactly one buffer
+    // through the pool.
+    let (listener, port) = setup_tcp_listener();
+    let client = syscall::socket(types::AF_INET, types::SOCK_STREAM | types::SOCK_NONBLOCK, 0)
+        .expect("client socket")
+        .as_i32();
+    let server_fd = tcp_handshake(&mut ring, listener, client, port);
+
+    let msg = b"pbuf status";
+    ring.push(
+        unsafe { Sqe::send(RawFd::from_raw(client as usize), msg, MsgFlags::default()) }
+            .user_data(2),
+    )
+    .expect("push send");
+
+    let recv_sqe = unsafe {
+        Sqe::recv_ptr(
+            RawFd::from_raw(server_fd as usize),
+            core::ptr::null_mut(),
+            0,
+            MsgFlags::default(),
+        )
+    }
+    .buffer_select(7)
+    .user_data(3);
+    ring.push(recv_sqe).expect("push recv");
+    ring.submit_and_wait(2).expect("submit send+recv");
+
+    let mut recv_result = None;
+    for _ in 0..2 {
+        let cqe = ring.complete().expect("cqe");
+        if cqe.user_data == 3 {
+            recv_result = Some(cqe);
+        }
+    }
+    let recv_cqe = recv_result.expect("recv completion");
+    assert!(recv_cqe.result >= 0, "recv failed: {}", recv_cqe.result);
+    let buf_id = recv_cqe.buffer_id().expect("buffer_id present");
+
+    // Consumed but not yet recycled: the kernel's head has advanced past
+    // the buffer it handed out.
+    assert_eq!(pbuf.status().expect("status"), 1);
+
+    pbuf.recycle_and_commit(buf_id);
+    // Recycling publishes a fresh buffer at the tail; it does not move the
+    // kernel's consumer head backwards.
+    assert_eq!(pbuf.status().expect("status"), 1);
+
+    let _ = syscall::close(RawFd::from_raw(server_fd as usize));
+    let _ = syscall::close(RawFd::from_raw(client as usize));
+    let _ = syscall::close(RawFd::from_raw(listener as usize));
+}
+
 /// Two-thread mirror of [`provided_buffer_ring_recv`]: register the pool from
 /// the `Submitter` after `split()`, hand its `BufferConsumer` to a separate
 /// completion thread, and recv several messages so the kernel recycles buffer

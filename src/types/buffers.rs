@@ -178,3 +178,16 @@ pub struct IoUringFileIndexRange {
     pub len: u32,
     pub resv: u64,
 }
+
+/// Argument for `IORING_REGISTER_PBUF_STATUS` (`struct io_uring_buf_status`).
+///
+/// `buf_group` is the input (which buffer group to query); `head` is the
+/// kernel's output, the ring's current consumer head — how far the kernel
+/// has advanced into the buffers the application published.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct IoUringBufStatus {
+    pub buf_group: u32,
+    pub head: u32,
+    pub resv: [u32; 8],
+}

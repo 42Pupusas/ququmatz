@@ -104,6 +104,8 @@ pub enum RegisterOp {
     /// (`IORING_FILE_INDEX_ALLOC`) so newly instantiated direct descriptors
     /// land in a caller-chosen slice of the file table (kernel 6.0+).
     RegisterFileAllocRange = 25,
+    /// Query a provided-buffer ring's current consumer head (kernel 6.8+).
+    RegisterPbufStatus = 26,
 }
 
 impl From<RegisterOp> for u32 {

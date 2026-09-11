@@ -4,7 +4,8 @@ use super::{IoUring, Submitter};
 use crate::error::{Error, InvalidArgKind, SetupError};
 use crate::syscall;
 use crate::types::{
-    IoUringBuf, IoUringBufReg, MapFlags, Prot, RawFd, RecvmsgOut, RecvmsgParts, RegisterOp,
+    IoUringBuf, IoUringBufReg, IoUringBufStatus, MapFlags, Prot, RawFd, RecvmsgOut, RecvmsgParts,
+    RegisterOp,
 };
 
 /// Kernel-enforced limit for `IORING_REGISTER_PBUF_RING`: the ring must be
@@ -292,6 +293,37 @@ impl ProvidedBufferRing {
         self.buf_size
     }
 
+    /// Query the kernel's current consumer head for this buffer group
+    /// (`IORING_REGISTER_PBUF_STATUS`, kernel 6.8+).
+    ///
+    /// The head is how far the kernel has advanced into the buffers this
+    /// pool published, mod its entry count — the same value this crate
+    /// tracks locally as it recycles buffers, but read straight from the
+    /// kernel's side of the ring rather than inferred from completions.
+    /// Useful for diagnosing whether the application and kernel agree on
+    /// how many buffers are outstanding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `bgid` does not name a registered buffer *ring*
+    /// (as opposed to a classic linked-list buffer group, which this API
+    /// does not support).
+    pub fn status(&self) -> Result<u32, Error> {
+        let mut arg = IoUringBufStatus {
+            buf_group: u32::from(self.bgid),
+            head: 0,
+            resv: [0; 8],
+        };
+        syscall::io_uring_register(
+            self.fd,
+            RegisterOp::RegisterPbufStatus.into(),
+            core::ptr::addr_of_mut!(arg) as usize,
+            1,
+        )
+        .map_err(SetupError::Syscall)?;
+        Ok(arg.head)
+    }
+
     /// Borrow the contents of a completed buffer.
     ///
     /// `len` should be the CQE `result` (byte count) for the completion
@@ -559,6 +591,17 @@ impl BufferConsumer {
     #[must_use]
     pub const fn buf_size(&self) -> u32 {
         self.inner.buf_size
+    }
+
+    /// Query the kernel's current consumer head for this buffer group. See
+    /// [`ProvidedBufferRing::status`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the registration was lost (should not happen for
+    /// a live pool).
+    pub fn status(&self) -> Result<u32, Error> {
+        self.inner.status()
     }
 
     /// Borrow the bytes the kernel wrote into buffer `buf_id`.

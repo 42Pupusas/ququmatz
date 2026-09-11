@@ -114,8 +114,8 @@ mod timeout;
 mod waitid;
 
 pub use buffers::{
-    IoCqringOffsets, IoSqringOffsets, IoUringBuf, IoUringBufReg, IoUringFileIndexRange,
-    IoUringFilesUpdate, IoUringRsrcUpdate, IoVec, RawFd,
+    IoCqringOffsets, IoSqringOffsets, IoUringBuf, IoUringBufReg, IoUringBufStatus,
+    IoUringFileIndexRange, IoUringFilesUpdate, IoUringRsrcUpdate, IoVec, RawFd,
 };
 pub use cancel::{CancelFlags, CancelOutcome, SyncCancelReg};
 pub(crate) use cancel::RawSyncCancelReg;
