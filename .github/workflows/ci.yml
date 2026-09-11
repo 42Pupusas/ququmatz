@@ -46,13 +46,33 @@ jobs:
           - aarch64-unknown-linux-gnu
           - riscv64gc-unknown-linux-gnu
           - armv7-unknown-linux-gnueabihf
-          - i686-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - run: cargo check --all-targets --target ${{ matrix.target }}
+
+  unsupported_target_is_refused:
+    name: i686 is rejected, not miscompiled
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-unknown-linux-gnu
+      - name: Building for an unlisted arch must fail with our compile_error
+        run: |
+          if cargo check --lib --target i686-unknown-linux-gnu 2>err.log; then
+            echo "::error::i686 built successfully; it has no verified syscall table"
+            exit 1
+          fi
+          grep -q "no syscall table for this architecture" err.log || {
+            echo "::error::i686 failed for an unexpected reason:"
+            cat err.log
+            exit 1
+          }
+          echo "i686 correctly refused by the crate's own compile_error"
 
   cross_execute:
     name: execute layout+ABI on ${{ matrix.target }}
@@ -64,7 +84,6 @@ jobs:
           - aarch64-unknown-linux-gnu
           - riscv64gc-unknown-linux-gnu
           - armv7-unknown-linux-gnueabihf
-          - i686-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -46,8 +46,12 @@ pub struct EpollEvent {
     pub data: u64,
 }
 
-const _: () = assert!(
-    core::mem::offset_of!(EpollEvent, data) == if cfg!(target_arch = "x86_64") { 4 } else { 8 },
-    "epoll_event.data is packed to offset 4 only on x86_64; every other architecture leaves it at its natural 8-byte alignment"
-);
+#[cfg(target_arch = "x86_64")]
+const EXPECTED_DATA_OFFSET: usize = 4;
+#[cfg(not(target_arch = "x86_64"))]
+const EXPECTED_DATA_OFFSET: usize = 8;
 
+const _: () = assert!(
+    core::mem::offset_of!(EpollEvent, data) == EXPECTED_DATA_OFFSET,
+    "epoll_event.data is packed to offset 4 on x86_64 only"
+);
