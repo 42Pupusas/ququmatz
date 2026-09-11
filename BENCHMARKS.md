@@ -81,38 +81,56 @@ next — never more than one thing in flight. That is not the case
 `io_uring` exists for. `echo_roundtrip_concurrent` drives `K` loopback
 connections per iteration: one ring pushes `K` recvs and submits them in
 a single `enter` syscall, drains `K` completions by `user_data`, then
-does the same for `K` sends. Both `ququmatz` and `io-uring` implement
-that exact batching shape, and both are compared against `K` OS threads,
-each blocking on its own connection with plain `read`/`write` — the
-design a batching ring has to beat once concurrency is high enough for
-thread-wakeup and scheduler overhead to matter. `K` sweeps 1/8/32/128 so
-the crossover, if any, is visible rather than asserted.
+does the same for `K` sends. `ququmatz`, `io-uring`, and a third variant,
+`ququmatz_split`, all implement that exact batching shape, and all three
+are compared against `K` OS threads, each blocking on its own connection
+with plain `read`/`write` — the design a batching ring has to beat once
+concurrency is high enough for thread-wakeup and scheduler overhead to
+matter. `K` sweeps 1/8/32/128 so the crossover, if any, is visible rather
+than asserted.
+
+`ququmatz_split` is `ququmatz`'s `IoUring::split()` driven by two
+persistent OS threads instead of one: a submission thread holds the
+`Submitter` and pushes/submits each phase's SQEs, a completion thread
+holds the `Completer` and reaps that phase's CQEs, and the two
+communicate through a `quetzalcoatl` SPSC ring carrying a small "ticket"
+(which phase, how many completions to wait for) plus a `std::sync::mpsc`
+channel carrying the recv byte counts the send phase needs. This is
+genuinely cross-thread for the whole benchmark, not per call — unlike
+`ququmatz_split` in `benches/comparison.rs`, which calls `Submitter`/
+`Completer` from a single thread and only exercises the split API's
+shape, not its cross-thread cost.
 
 ```text
 realistic                     fastest       │ slowest       │ median        │ mean          │ samples │ iters
 ╰─ echo_roundtrip_concurrent                │               │               │               │         │
    ├─ io_uring                              │               │               │               │         │
-   │  ├─ 1                    10.68 µs      │ 44.02 µs      │ 10.77 µs      │ 11.76 µs      │ 100     │ 100
-   │  ├─ 8                    72.34 µs      │ 155.9 µs      │ 73.13 µs      │ 78.44 µs      │ 100     │ 100
-   │  ├─ 32                   286.4 µs      │ 493.3 µs      │ 294.2 µs      │ 298.3 µs      │ 100     │ 100
-   │  ╰─ 128                  1.191 ms      │ 1.967 ms      │ 1.232 ms      │ 1.263 ms      │ 100     │ 100
+   │  ├─ 1                    9.116 µs      │ 33.74 µs      │ 9.196 µs      │ 9.586 µs      │ 100     │ 100
+   │  ├─ 8                    61.73 µs      │ 108.2 µs      │ 62.16 µs      │ 63.21 µs      │ 100     │ 100
+   │  ├─ 32                   243.3 µs      │ 421.1 µs      │ 247.8 µs      │ 252.4 µs      │ 100     │ 100
+   │  ╰─ 128                  995.4 µs      │ 1.612 ms      │ 1.02 ms       │ 1.034 ms      │ 100     │ 100
    ├─ ququmatz                              │               │               │               │         │
-   │  ├─ 1                    10.67 µs      │ 26.67 µs      │ 10.83 µs      │ 11.07 µs      │ 100     │ 100
-   │  ├─ 8                    72.45 µs      │ 131.4 µs      │ 73.32 µs      │ 75.04 µs      │ 100     │ 100
-   │  ├─ 32                   283.8 µs      │ 480.6 µs      │ 293 µs        │ 300.8 µs      │ 100     │ 100
-   │  ╰─ 128                  1.184 ms      │ 1.943 ms      │ 1.237 ms      │ 1.26 ms       │ 100     │ 100
+   │  ├─ 1                    9.086 µs      │ 22.67 µs      │ 9.166 µs      │ 9.397 µs      │ 100     │ 100
+   │  ├─ 8                    60.42 µs      │ 105.9 µs      │ 62.26 µs      │ 63.26 µs      │ 100     │ 100
+   │  ├─ 32                   237.8 µs      │ 394.3 µs      │ 246.1 µs      │ 251.6 µs      │ 100     │ 100
+   │  ╰─ 128                  988 µs        │ 1.589 ms      │ 1.021 ms      │ 1.033 ms      │ 100     │ 100
+   ├─ ququmatz_split                        │               │               │               │         │
+   │  ├─ 1                    24.24 µs      │ 208.8 µs      │ 24.86 µs      │ 32.77 µs      │ 100     │ 100
+   │  ├─ 8                    82.25 µs      │ 235.4 µs      │ 83.29 µs      │ 88.99 µs      │ 100     │ 100
+   │  ├─ 32                   273.4 µs      │ 528.3 µs      │ 286.7 µs      │ 298.8 µs      │ 100     │ 100
+   │  ╰─ 128                  1.053 ms      │ 1.912 ms      │ 1.092 ms      │ 1.133 ms      │ 100     │ 100
    ╰─ std_blocking_threads                  │               │               │               │         │
-      ├─ 1                    42.51 µs      │ 201.1 µs      │ 45.32 µs      │ 59.62 µs      │ 100     │ 100
-      ├─ 8                    163 µs        │ 357.5 µs      │ 188.8 µs      │ 200.9 µs      │ 100     │ 100
-      ├─ 32                   572.3 µs      │ 2.746 ms      │ 665.8 µs      │ 710.3 µs      │ 100     │ 100
-      ╰─ 128                  2.569 ms      │ 4.468 ms      │ 3.368 ms      │ 3.357 ms      │ 100     │ 100
+      ├─ 1                    37.27 µs      │ 100.3 µs      │ 47.2 µs       │ 51.83 µs      │ 100     │ 100
+      ├─ 8                    141.4 µs      │ 263.7 µs      │ 156.9 µs      │ 162.5 µs      │ 100     │ 100
+      ├─ 32                   504 µs        │ 934 µs        │ 594.1 µs      │ 602.9 µs      │ 100     │ 100
+      ╰─ 128                  2.133 ms      │ 3.033 ms      │ 2.564 ms      │ 2.555 ms      │ 100     │ 100
 ```
 
 **Reading it:** `ququmatz` and `io-uring` land within noise of each other
 at every `K` — the batching-path parity holds here the same way the
 single-operation parity did on `echo_roundtrip` above. Both beat
 `std_blocking_threads` at every `K` tested, and the margin widens as `K`
-grows — roughly 4× at `K=1` down to roughly 2.7× at `K=128`
+grows — roughly 4× at `K=1` down to roughly 2.5× at `K=128`
 (`std_blocking_threads` scales worse than linearly past `K=32`, plausibly
 thread-spawn/join and scheduler contention rather than the syscalls
 themselves, though that split was not separately measured). This is the
@@ -120,6 +138,21 @@ result the earlier two workloads structurally could not show: one ring
 batching many operations behind one syscall beats one thread per
 connection once there is more than one connection to serve, and
 `ququmatz` gets the same batching win `io-uring` gets, not a smaller one.
+
+`ququmatz_split` sits between the single-ring variants and
+`std_blocking_threads`: it still beats `std_blocking_threads` at every
+`K` (roughly 1.5× at `K=1`, narrowing to roughly 1.9× at `K=128`), but it
+is consistently slower than the single-threaded `ququmatz`/`io-uring`
+runs — most visibly at `K=1`, where its median is nearly 3× the
+single-ring median. That gap is the cross-thread handoff cost this
+variant pays on every iteration: two `quetzalcoatl` SPSC pushes/pops and
+two `std::sync::mpsc` round trips per phase pair, none of which the
+single-threaded split-ring benchmark in `comparison.rs` pays, and none of
+which a single-threaded ring pays at all. The gap narrows as `K` grows
+because the fixed per-iteration handoff cost is amortized over more
+recv/send work per phase, the same shape `io_uring` batching itself
+relies on.
+
 Reproduced across two consecutive runs with consistent numbers at each
 `K`.
 
@@ -127,7 +160,13 @@ What this does **not** establish: `K=128` on one loopback host with one
 ring and threads capped by the same machine's core count is not a
 production load test, and no attempt was made to find where
 thread-per-connection stops being the wrong design — only that it
-already is by `K=8`.
+already is by `K=8`. Nor does it establish that a submit/complete thread
+split is never worth it: this workload's per-iteration submit-wait-recv
+round trip is exactly the shape that punishes an extra thread handoff
+most, since the completion thread cannot do useful work while the
+submission thread blocks on it (and vice versa) — a workload where the
+submission and completion sides have independent, overlapping work would
+show a different trade.
 
 ### A methodology failure caught before publishing
 

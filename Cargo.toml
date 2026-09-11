@@ -23,6 +23,7 @@ dhat = { version = "0.3", optional = true }
 [dev-dependencies]
 divan = "0.1"
 trybuild = "1"
+quetzalcoatl = "0.15"
 
 # io-uring ships a prebuilt sys.rs valid only for x86_64 and refuses to
 # compile elsewhere. It backs benches/comparison only.
