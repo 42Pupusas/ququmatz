@@ -2145,6 +2145,200 @@ fn sqe_builder_socket_direct_sets_file_index_alloc() {
     assert_eq!(inner.splice_fd_in, -1);
 }
 
+#[test]
+fn sqe_builder_bind_places_the_length_in_addr2() {
+    use crate::types::Opcode;
+    let addr = [0u8; 16];
+    let sqe = unsafe { Sqe::bind(RawFd::from_raw(7), &addr) };
+    let inner = sqe.0;
+    assert_eq!(Opcode::Bind, inner.opcode);
+    assert_eq!(inner.fd, 7);
+    assert_eq!(inner.addr, addr.as_ptr() as u64);
+    // The kernel reads the length from addr2 (aliased by `off`), and
+    // rejects the request outright if any of these carry a value.
+    assert_eq!(inner.off, 16);
+    assert_eq!(inner.len, 0);
+    assert_eq!(inner.op_flags, 0);
+    assert_eq!(inner.buf_index, 0);
+    assert_eq!(inner.splice_fd_in, 0);
+}
+
+#[test]
+fn sqe_builder_listen_carries_only_a_backlog() {
+    use crate::types::Opcode;
+    let sqe = Sqe::listen(RawFd::from_raw(7), 128);
+    let inner = sqe.0;
+    assert_eq!(Opcode::Listen, inner.opcode);
+    assert_eq!(inner.fd, 7);
+    assert_eq!(inner.len, 128);
+    // `listen` reads no caller memory; a stray addr is an EINVAL.
+    assert_eq!(inner.addr, 0);
+    assert_eq!(inner.off, 0);
+    assert_eq!(inner.op_flags, 0);
+    assert_eq!(inner.buf_index, 0);
+    assert_eq!(inner.splice_fd_in, 0);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_bound_listener_accepts_a_real_connection() {
+    use crate::types::{AddressFamily, SocketFlags, SocketType};
+    // Asserting the CQE is 0 proves only that the kernel accepted the
+    // encoding. A bind to the wrong address, or a listen the kernel
+    // ignored, would report 0 just the same. The effect worth checking is
+    // that the socket is reachable at the port we asked for, so this
+    // reads the bound address back and connects to it.
+    let mut ring = crate::IoUring::new(8).expect("ring");
+    let listener = crate::net::Socket::with_typed_flags(
+        AddressFamily::Inet,
+        SocketType::Stream,
+        0,
+        SocketFlags::default(),
+    )
+    .expect("socket");
+
+    let addr = SockAddrIn {
+        sin_family: types::AF_INET as u16,
+        sin_port: 0,
+        sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+        sin_zero: [0; 8],
+    }
+    .to_bytes();
+
+    ring.push(unsafe { Sqe::bind(listener.fd(), &addr) }.user_data(1))
+        .expect("push bind");
+    ring.submit_and_wait(1).expect("submit");
+    assert_eq!(ring.complete().expect("cqe").result, 0, "bind");
+
+    ring.push(Sqe::listen(listener.fd(), 8).user_data(2))
+        .expect("push listen");
+    ring.submit_and_wait(1).expect("submit");
+    assert_eq!(ring.complete().expect("cqe").result, 0, "listen");
+
+    let port = u16::from_be(listener.local_addr().expect("getsockname").sin_port);
+    assert_ne!(port, 0, "bind must have assigned an ephemeral port");
+
+    let client = syscall::socket(types::AF_INET, types::SOCK_STREAM | types::SOCK_NONBLOCK, 0)
+        .expect("client socket")
+        .as_i32();
+    let server = tcp_handshake(&mut ring, listener.fd().as_i32(), client, port);
+
+    let _ = syscall::close(RawFd::from_raw(server as usize));
+    let _ = syscall::close(RawFd::from_raw(client as usize));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_listen_backlog_the_kernel_clamps_is_not_an_error() {
+    use crate::types::{AddressFamily, SocketFlags, SocketType};
+    // Both ends of the range are silently clamped rather than rejected,
+    // so neither needs guarding at construction.
+    let mut ring = crate::IoUring::new(8).expect("ring");
+    for backlog in [0, u32::MAX] {
+        let sock = crate::net::Socket::with_typed_flags(
+            AddressFamily::Inet,
+            SocketType::Stream,
+            0,
+            SocketFlags::default(),
+        )
+        .expect("socket");
+        ring.push(Sqe::listen(sock.fd(), backlog).user_data(1))
+            .expect("push");
+        ring.submit_and_wait(1).expect("submit");
+        let res = ring.complete().expect("cqe").result;
+        assert_eq!(res, 0, "listen({backlog}) should be clamped, not rejected");
+    }
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_second_bind_and_a_taken_port_report_different_errors() {
+    use crate::types::{AddressFamily, SocketFlags, SocketType};
+    // Rebinding a socket that is already bound is EINVAL; binding a port
+    // another socket holds is EADDRINUSE. Collapsing the two would tell a
+    // caller to retry a different port when the real fault is their own
+    // duplicate bind.
+    let mut ring = crate::IoUring::new(8).expect("ring");
+    let make = || {
+        crate::net::Socket::with_typed_flags(
+            AddressFamily::Inet,
+            SocketType::Stream,
+            0,
+            SocketFlags::default(),
+        )
+        .expect("socket")
+    };
+    let bind = |ring: &mut crate::IoUring, fd, bytes: &[u8; 16]| {
+        ring.push(unsafe { Sqe::bind(fd, bytes) }.user_data(1))
+            .expect("push");
+        ring.submit_and_wait(1).expect("submit");
+        ring.complete().expect("cqe").result
+    };
+
+    let first = make();
+    let addr = SockAddrIn {
+        sin_family: types::AF_INET as u16,
+        sin_port: 0,
+        sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+        sin_zero: [0; 8],
+    }
+    .to_bytes();
+    assert_eq!(bind(&mut ring, first.fd(), &addr), 0);
+
+    assert_eq!(
+        bind(&mut ring, first.fd(), &addr),
+        -22,
+        "rebinding a bound socket is EINVAL"
+    );
+
+    let taken = SockAddrIn {
+        sin_family: types::AF_INET as u16,
+        sin_port: first.local_addr().expect("getsockname").sin_port,
+        sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+        sin_zero: [0; 8],
+    }
+    .to_bytes();
+    let second = make();
+    assert_eq!(
+        bind(&mut ring, second.fd(), &taken),
+        -98,
+        "a port another socket holds is EADDRINUSE"
+    );
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_malformed_bind_address_is_refused_by_the_kernel() {
+    use crate::types::{AddressFamily, SocketFlags, SocketType};
+    let mut ring = crate::IoUring::new(8).expect("ring");
+    let sock = crate::net::Socket::with_typed_flags(
+        AddressFamily::Inet,
+        SocketType::Stream,
+        0,
+        SocketFlags::default(),
+    )
+    .expect("socket");
+    let addr = [0u8; 16];
+
+    ring.push(unsafe { Sqe::bind_ptr(sock.fd(), addr.as_ptr(), 0) }.user_data(1))
+        .expect("push");
+    ring.submit_and_wait(1).expect("submit");
+    assert_eq!(
+        ring.complete().expect("cqe").result,
+        -22,
+        "a zero-length address is EINVAL"
+    );
+
+    ring.push(unsafe { Sqe::bind_ptr(sock.fd(), core::ptr::null(), 16) }.user_data(2))
+        .expect("push");
+    ring.submit_and_wait(1).expect("submit");
+    assert_eq!(
+        ring.complete().expect("cqe").result,
+        -14,
+        "a null address is EFAULT"
+    );
+}
+
 #[cfg(not(miri))]
 #[test]
 fn a_socket_sqe_with_flags_is_accepted_by_the_kernel() {

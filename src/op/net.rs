@@ -94,6 +94,56 @@ impl Sqe {
         Self(sqe)
     }
 
+    /// Prepare a bind operation.
+    ///
+    /// The CQE result is `0` on success. `backlog` is not part of this
+    /// operation — follow it with [`listen`](Self::listen).
+    ///
+    /// # Safety
+    ///
+    /// `addr` is borrowed only for this call — the returned `Sqe` stores a
+    /// raw pointer derived from it, not the borrow itself. The caller must
+    /// ensure the memory `addr` points to remains valid until the kernel
+    /// posts the completion for this operation.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub unsafe fn bind(fd: RawFd, addr: &[u8]) -> Self {
+        unsafe { Self::bind_ptr(fd, addr.as_ptr(), addr.len() as u32) }
+    }
+
+    /// Prepare a bind operation from raw pointers.
+    ///
+    /// The address length rides in `addr2`, and the kernel rejects a
+    /// non-zero `len`, `buf_index`, `rw_flags`, or `splice_fd_in`.
+    ///
+    /// # Safety
+    ///
+    /// `addr` must point to a valid socket address of `addrlen` bytes that
+    /// remains valid until the operation completes.
+    #[must_use]
+    pub unsafe fn bind_ptr(fd: RawFd, addr: *const u8, addrlen: u32) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Bind.into();
+        sqe.fd = fd.as_i32();
+        sqe.addr = addr as u64;
+        sqe.off = u64::from(addrlen);
+        Self(sqe)
+    }
+
+    /// Prepare a listen operation.
+    ///
+    /// `backlog` is the pending-connection queue depth, carried in `len`.
+    /// The CQE result is `0` on success. This operation reads no caller
+    /// memory, so unlike [`bind`](Self::bind) it is a safe `fn`.
+    #[must_use]
+    pub fn listen(fd: RawFd, backlog: u32) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Listen.into();
+        sqe.fd = fd.as_i32();
+        sqe.len = backlog;
+        Self(sqe)
+    }
+
     /// Prepare a connect operation.
     ///
     /// # Safety

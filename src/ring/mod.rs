@@ -18,10 +18,12 @@ use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 mod builder;
 mod ops;
 mod pbuf;
+mod probe;
 mod register;
 
 pub use builder::IoUringBuilder;
 pub use pbuf::{BufferConsumer, ProvidedBufferRing};
+pub use probe::Probe;
 
 // ---------------------------------------------------------------------------
 // Shared ring resources — refcounted without alloc

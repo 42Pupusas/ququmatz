@@ -25,7 +25,7 @@ pub use net::Socket;
 pub use op::Sqe;
 pub use owned::{MmapBuffer, OwnedCompleter, OwnedSubmitter, Pending, Prepared};
 pub use ring::{
-    BufferConsumer, Completer, Completion, Completions, IoUring, IoUringBuilder,
+    BufferConsumer, Completer, Completion, Completions, IoUring, IoUringBuilder, Probe,
     ProvidedBufferRing, SplitCompletions, Submitter,
 };
 pub use types::{

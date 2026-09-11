@@ -742,14 +742,86 @@ discarded cannot be written. The storage is still owned for a `Del`,
 because nothing in the SQE distinguishes an address that will not be read
 from one that has not been read yet.
 
+## Measuring the coverage rather than asserting it
+
+Every earlier revision of this section described the scope in prose, and
+twice that prose was wrong. The coverage is now a measurement: a
+throwaway probe using `IORING_REGISTER_PROBE` asked the running kernel
+what it supports and cross-referenced the answer against this crate's
+constructors.
+
+On Linux 7.1.5 the kernel reports 65 supported opcodes. This crate builds
+SQEs for 42 of them, and 20 of those have owned wrappers. The 23 with no
+constructor at all are, with two exceptions, newer than the `Opcode`
+enum, which stopped at `SEND_ZC = 47` and so could not name them: the
+four xattr operations, `MSG_RING`, `SYMLINKAT`, `LINKAT`,
+`SYNC_FILE_RANGE`, `SENDMSG_ZC`, `READ_MULTISHOT`, `WAITID`, the three
+futex operations, `FIXED_FD_INSTALL`, `FTRUNCATE`, `RECV_ZC`,
+`EPOLL_WAIT`, `READV_FIXED`, `WRITEV_FIXED`, `PIPE`, `NOP128`, and one
+opcode newer than the published header this crate was checked against.
+
+The census also corrected a claim made here one revision ago. `send` was
+listed among the owned operations; it is not. Grepping the owned module
+for `Sqe::` call sites — one per wrapper — shows no `send_ptr`, and
+`recv` and `accept` are owned only in their multishot forms. The
+pointer-bearing claim still holds, because a caller reaching for an owned
+send has `sendmsg` and `send_zc`, but the count was 19 rather than 20
+until `bind` made it 20.
+
+Because this kind of drift is the recurring failure, [`IoUring::probe`]
+is now part of the API rather than a throwaway. It is also what a caller
+needs: opcode numbers here are compile-time constants, and a kernel older
+than the build target rejects the unknown ones with `EINVAL` at
+completion — indistinguishable from a malformed request. Asking first is
+the only way to tell those apart.
+
+## `bind` and `listen`
+
+The census turned up one gap that was not about newness: this crate had
+`socket`, `connect`, `accept`, and `shutdown`, but neither `bind` nor
+`listen`. The server half of the socket lifecycle was missing, so no
+server could be written without dropping to raw syscalls for two steps in
+the middle.
+
+They are asymmetric, and the asymmetry decides the API. `bind` reads a
+socket address from caller memory; `listen` reads nothing at all — the
+kernel takes the backlog from `len` and rejects a request carrying an
+address. So `Sqe::listen` is a safe `fn` with no owned counterpart, and
+`bind` gets the full owned treatment.
+
+`bind` copies its address in *prep*, inside `io_uring_enter`: an address
+overwritten with `0xFF` after `submit` returned still binds the port
+originally staged, while overwriting it between `push` and `submit`
+fails with `EAFNOSUPPORT`. That locates the read precisely, and it is the
+same situation as the timeout's `Timespec` — including the same reason it
+is not enough for a borrow. Under SQPOLL no call's return proves the copy
+happened, so the storage is owned.
+
+`PreparedBind` takes a typed `SockAddrIn` rather than raw bytes, which
+makes one failure unrepresentable and matters more than it looks: the
+kernel spends `EINVAL` on both a malformed address *and* a socket that is
+already bound. With malformed addresses ruled out at construction,
+`EINVAL` has exactly one reading left. `BindOutcome` then separates
+`AlreadyBound` (`EINVAL`) from `AddressInUse` (`EADDRINUSE`) and
+`PermissionDenied` (`EACCES`) — measured values, and worth keeping apart
+because retrying a different port fixes the second and loops forever on
+the first.
+
 **Scope limits.** The owned layer now covers every `io_uring` operation
 this crate exposes that takes a pointer into caller memory: read/write,
 vectored I/O, zero-copy send, `sendmsg`, `recvmsg`, multishot recv and
 accept, `openat`, `openat2`, direct open, direct accept, direct socket,
-`statx`, `renameat`, `unlinkat`, `mkdirat`, `timeout`, `files_update`, and
-`epoll_ctl`. The `unsafe` `Sqe` surface remains for lock-free users and
-for the pointer-free control operations (`nop`, `cancel`, `poll_add`,
-`timeout_remove`), which own nothing and so have nothing to model.
+`statx`, `renameat`, `unlinkat`, `mkdirat`, `timeout`, `files_update`,
+`epoll_ctl`, and `bind`. The `unsafe` `Sqe` surface remains for
+lock-free users and for the pointer-free operations (`nop`, `cancel`,
+`poll_add`, `timeout_remove`, `listen`), which own nothing and so have
+nothing to model.
+
+`connect` is the one pointer-bearing operation still reachable only
+through the raw surface. It takes a caller `sockaddr` on exactly the
+terms `bind` does, so the wrapper would be `PreparedBind` with a
+different opcode and a different outcome enum; it is listed here as a
+known gap rather than a decision.
 
 Two things are deliberately still raw because they need more than a
 request type. Multishot `recvmsg` prepends an `io_uring_recvmsg_out` to

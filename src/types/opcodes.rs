@@ -45,6 +45,8 @@ pub enum Opcode {
     Socket = 45,
     UringCmd = 46,
     SendZc = 47,
+    Bind = 56,
+    Listen = 57,
 }
 
 impl PartialEq<u8> for Opcode {
@@ -71,6 +73,8 @@ pub enum RegisterOp {
     UnregisterEventFd = 5,
     RegisterFilesUpdate = 6,
     RegisterEventFdAsync = 7,
+    /// Ask the kernel which SQE opcodes it supports.
+    RegisterProbe = 8,
     RegisterRestrictions = 11,
     RegisterBuffersUpdate = 16,
     RegisterIowqMaxWorkers = 19,

@@ -196,6 +196,18 @@ fn an_in_flight_fd_array_hides_both_its_entries_and_its_outcome() {
     t.compile_fail("tests/ui/a_files_update_ticket_must_be_kept.rs");
 }
 
+/// A `bind` borrows the socket and owns only the address. The kernel
+/// copies that address during `io_uring_enter`, but under SQPOLL no
+/// call's return proves the copy has happened, so the storage stays
+/// unreachable in flight — and the outcome is unreadable early because
+/// "address in use" is a real answer rather than a bug.
+#[test]
+fn an_in_flight_sock_addr_hides_both_its_bytes_and_its_outcome() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/an_in_flight_sock_addr_is_unreachable.rs");
+    t.compile_fail("tests/ui/a_bind_ticket_must_be_kept.rs");
+}
+
 /// An `epoll_ctl` borrows both descriptors and owns only the event the
 /// kernel reads — and for a `Del` it reads none at all. The storage is
 /// still unreachable in flight, because nothing in the SQE distinguishes

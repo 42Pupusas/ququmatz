@@ -18,6 +18,7 @@ use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::boxed::Box;
 use std::vec::Vec;
 
+use super::bind::{BindOutcome, PendingBind, PreparedBind};
 use super::direct::{PendingDirectOpen, PreparedDirectOpen};
 use super::epoll::{EpollChange, EpollOutcome, PendingEpollCtl, PreparedEpollCtl};
 use super::event::PartialReceipt;
@@ -392,6 +393,14 @@ impl Lifecycle {
         let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
         (FakeKernel::holding(sqe), pending)
     }
+
+    fn submit_bind<S: StableBufferMut>(
+        &self,
+        prepared: PreparedBind<S>,
+    ) -> (FakeKernel, PendingBind<S>) {
+        let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
+        (FakeKernel::holding(sqe), pending)
+    }
 }
 
 impl FakeKernel {
@@ -414,6 +423,25 @@ impl FakeKernel {
     /// The operation code the SQE carries in `len`.
     const fn published_epoll_op(&self) -> u32 {
         self.sqe.0.len
+    }
+
+    /// Read the socket address a `bind` publishes at `addr`.
+    ///
+    /// Copied bytewise for the same reason the kernel does it that way:
+    /// the address is staged as bytes and carries no alignment promise.
+    fn read_sock_addr(&self) -> [u8; 16] {
+        let base = self.published_ptr();
+        let mut out = [0u8; 16];
+        // SAFETY: the live `PendingBind` owns storage checked to hold a
+        // whole socket address and written before submission, and keeps
+        // it allocated until redeemed.
+        unsafe { core::ptr::copy_nonoverlapping(base, out.as_mut_ptr(), out.len()) }
+        out
+    }
+
+    /// The address length the SQE carries in `addr2`.
+    const fn published_addr_len(&self) -> u64 {
+        self.sqe.0.off
     }
 }
 
@@ -2760,6 +2788,103 @@ fn reclaiming_an_unpublished_epoll_ctl_returns_the_storage_and_its_change() {
     let (events, data) = (seen.events, seen.data);
     assert_eq!(events, EpollEvents::HUP.bits());
     assert_eq!(data, 321);
+    drop(prepared.into_store());
+}
+
+/// Storage for one socket address.
+fn bind_addr_store() -> HeapBuffer {
+    HeapBuffer::with_capacity(core::mem::size_of::<SockAddrIn>())
+}
+
+/// A loopback address on `port`, in the byte order the kernel expects.
+fn miri_loopback(port: u16) -> SockAddrIn {
+    SockAddrIn {
+        sin_family: 2,
+        sin_port: port.to_be(),
+        sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+        sin_zero: [0; 8],
+    }
+}
+
+#[test]
+fn the_kernel_reads_a_sock_addr_from_storage_the_ticket_owns() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedBind::new(RawFd::from_raw(3), miri_loopback(8080), bind_addr_store())
+        .ok()
+        .expect("storage fits");
+    let (kernel, pending) = cycle.submit_bind(prepared);
+
+    assert_eq!(kernel.read_sock_addr(), miri_loopback(8080).to_bytes());
+    // The length travels in the SQE rather than in caller memory.
+    assert_eq!(
+        kernel.published_addr_len(),
+        core::mem::size_of::<SockAddrIn>() as u64
+    );
+
+    let receipt = kernel.post_status(cycle.ring, 0);
+    let done = pending.redeem(receipt).ok().expect("receipt matches");
+    assert_eq!(done.outcome(), BindOutcome::Bound);
+    drop(done.into_store());
+}
+
+#[test]
+fn an_addresss_storage_survives_the_ticket_moving_between_owners() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedBind::new(RawFd::from_raw(3), miri_loopback(443), bind_addr_store())
+        .ok()
+        .expect("storage fits");
+    let (kernel, pending) = cycle.submit_bind(prepared);
+
+    // Moving the ticket is the hazard: an inline address would relocate
+    // the exact bytes the kernel is about to read.
+    let pending = Box::new(pending);
+    let pending = core::hint::black_box(pending);
+    let pending = *pending;
+
+    assert_eq!(kernel.read_sock_addr(), miri_loopback(443).to_bytes());
+
+    let receipt = kernel.post_status(cycle.ring, 0);
+    let done = pending.redeem(receipt).ok().expect("receipt matches");
+    drop(done.into_store());
+}
+
+#[test]
+fn abandoning_a_bind_leaks_rather_than_freeing_the_address() {
+    let cycle = Lifecycle::new();
+    let store = bind_addr_store();
+    let addr = store.stable_ptr();
+    let prepared = PreparedBind::new(RawFd::from_raw(3), miri_loopback(9999), store)
+        .ok()
+        .expect("storage fits");
+    let (kernel, pending) = cycle.submit_bind(prepared);
+
+    // Dropping an in-flight ticket must not free an address the kernel
+    // may still be reading.
+    drop(pending);
+    assert_eq!(kernel.read_sock_addr(), miri_loopback(9999).to_bytes());
+
+    // SAFETY: the leak above is deliberate; the stand-in kernel has
+    // finished and nothing else references this allocation.
+    unsafe {
+        HeapBuffer::reclaim_leaked(addr.cast_mut(), core::mem::size_of::<SockAddrIn>());
+    }
+}
+
+#[test]
+fn reclaiming_an_unpublished_bind_returns_the_storage_and_its_address() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedBind::new(RawFd::from_raw(3), miri_loopback(1234), bind_addr_store())
+        .ok()
+        .expect("storage fits");
+    let (_kernel, pending) = cycle.submit_bind(prepared);
+
+    // SAFETY: this stands in for a rejected push, so the SQE was built but
+    // never made visible to any kernel and the storage is unreferenced.
+    let prepared = unsafe { pending.reclaim_unsubmitted() };
+    // A retry must issue the same request, so the address and its
+    // published bytes both have to survive.
+    assert_eq!(prepared.addr(), miri_loopback(1234));
+    assert_eq!(prepared.published(), miri_loopback(1234).to_bytes());
     drop(prepared.into_store());
 }
 

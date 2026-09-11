@@ -1,6 +1,7 @@
 //! Split submission/completion halves for owned requests.
 
 use super::accept::{MultishotAccept, PreparedAccept};
+use super::bind::{PendingBind, PreparedBind};
 use super::buffer::{StableBuffer, StableBufferMut};
 use super::direct::{PendingDirectOpen, PreparedDirectOpen};
 use super::direct_accept::{DirectAccept, PreparedDirectAccept};
@@ -454,6 +455,44 @@ impl OwnedSubmitter {
 
     /// Undo an `epoll_ctl` push that the kernel never observed.
     fn reclaim_epoll_ctl<S: StableBufferMut>(pending: PendingEpollCtl<S>) -> PreparedEpollCtl<S> {
+        // SAFETY: only reached when `Submitter::push` reported the queue was
+        // full, which happens before the SQE is written or the tail is
+        // advanced. No kernel-visible pointer to the storage exists.
+        unsafe { pending.reclaim_unsubmitted() }
+    }
+
+    /// Queue a `bind`, taking ownership of its address storage.
+    ///
+    /// The kernel copies the address during `io_uring_enter` rather than
+    /// re-reading it later — but under SQPOLL the submitting thread never
+    /// enters the kernel, so no call's return proves the copy has
+    /// happened. The storage is therefore owned until the completion like
+    /// every other request.
+    ///
+    /// There is no `push_listen` twin: `listen` reads no caller memory, so
+    /// it owns nothing and goes through the safe
+    /// [`Sqe::listen`](crate::Sqe::listen).
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact,
+    /// still owning its storage.
+    pub fn push_bind<S: StableBufferMut>(
+        &mut self,
+        request: PreparedBind<S>,
+    ) -> Result<PendingBind<S>, (PreparedBind<S>, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            // The SQE never became kernel-visible, so the kernel never saw
+            // the address pointer and reclaiming the storage is sound.
+            Err(e) => Err((Self::reclaim_bind(pending), e)),
+        }
+    }
+
+    /// Undo a `bind` push that the kernel never observed.
+    fn reclaim_bind<S: StableBufferMut>(pending: PendingBind<S>) -> PreparedBind<S> {
         // SAFETY: only reached when `Submitter::push` reported the queue was
         // full, which happens before the SQE is written or the tail is
         // advanced. No kernel-visible pointer to the storage exists.

@@ -3,11 +3,11 @@
 extern crate std;
 
 use super::{
-    Arrival, Completed, Count, Delivery, DirectIncoming, DirectOpenError, DirectSlot,
-    DirectSocketError, Direction, EpollChange, EpollError, EpollOutcome, Event, Expiry,
+    Arrival, BindError, BindOutcome, Completed, Count, Delivery, DirectIncoming, DirectOpenError,
+    DirectSlot, DirectSocketError, Direction, EpollChange, EpollError, EpollOutcome, Event, Expiry,
     FilesUpdateError, Incoming, MmapBuffer, MsgRegionError, Openat2Error, Openat2Mode, OwnedPath,
     PathError, PeerWanted, Pending, PendingStatx, PendingZc, Prepared, PreparedAccept,
-    PreparedDirectAccept, PreparedDirectOpen, PreparedDirectSocket, PreparedEpollCtl,
+    PreparedBind, PreparedDirectAccept, PreparedDirectOpen, PreparedDirectSocket, PreparedEpollCtl,
     PreparedFilesUpdate, PreparedMultishot, PreparedOpen, PreparedOpenat2, PreparedPathOp,
     PreparedRecvmsg, PreparedRename, PreparedSendmsg, PreparedStatx, PreparedTimeout,
     PreparedVectored, PreparedZc, Receipt, RenameMode, RingId, SendTarget, SlotIndex, SlotTarget,
@@ -5512,6 +5512,276 @@ fn a_files_update_ticket_survives_moving_to_another_thread_before_completion() {
     });
     let (update, store) = handle.join().expect("thread");
     assert_eq!(update, Update::All { count: 1 });
+    assert_eq!(store.stable_ptr(), addr);
+}
+
+// ---------------------------------------------------------------
+// bind
+// ---------------------------------------------------------------
+
+/// Storage for one socket address.
+fn bind_store() -> MmapBuffer {
+    MmapBuffer::with_capacity(core::mem::size_of::<SockAddrIn>()).expect("map")
+}
+
+/// A loopback address on `port`, in the byte order the kernel expects.
+fn loopback(port: u16) -> SockAddrIn {
+    SockAddrIn {
+        sin_family: 2,
+        sin_port: port.to_be(),
+        sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+        sin_zero: [0; 8],
+    }
+}
+
+#[test]
+fn a_bind_publishes_its_address_before_any_sqe_names_it() {
+    let prepared = PreparedBind::new(RawFd::from_raw(3), loopback(8080), bind_store())
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    // The bytes must be in place at construction, not at submission.
+    assert_eq!(prepared.published(), loopback(8080).to_bytes());
+    assert_eq!(prepared.addr(), loopback(8080));
+}
+
+#[test]
+fn storage_too_small_for_an_address_is_rejected_with_it_handed_back() {
+    let store = MmapBuffer::with_capacity(core::mem::size_of::<SockAddrIn>() - 1).expect("map");
+    let addr = store.stable_ptr();
+    let Err((returned, e)) = PreparedBind::new(RawFd::from_raw(3), loopback(0), store) else {
+        panic!("short storage must be refused");
+    };
+    assert_eq!(
+        e,
+        BindError::StoreTooSmall {
+            needed: core::mem::size_of::<SockAddrIn>(),
+            got: core::mem::size_of::<SockAddrIn>() - 1,
+        }
+    );
+    assert_eq!(returned.stable_ptr(), addr);
+}
+
+#[test]
+fn each_bind_failure_is_named_rather_than_left_as_an_errno() {
+    // A retry on another port fixes AddressInUse and never fixes
+    // AlreadyBound, so collapsing the two would send a caller into a loop.
+    assert_eq!(
+        BindOutcome::from_raw_for_test(-98),
+        BindOutcome::AddressInUse
+    );
+    assert_eq!(
+        BindOutcome::from_raw_for_test(-22),
+        BindOutcome::AlreadyBound
+    );
+    assert_eq!(
+        BindOutcome::from_raw_for_test(-13),
+        BindOutcome::PermissionDenied
+    );
+    assert_eq!(BindOutcome::from_raw_for_test(0), BindOutcome::Bound);
+    assert!(BindOutcome::from_raw_for_test(0).is_bound());
+    assert!(!BindOutcome::from_raw_for_test(-98).is_bound());
+    assert!(matches!(
+        BindOutcome::from_raw_for_test(-101),
+        BindOutcome::Failed(_)
+    ));
+}
+
+#[test]
+fn a_bind_receipt_for_another_request_is_rejected() {
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut make = || {
+        let prepared = PreparedBind::new(RawFd::from_raw(3), loopback(0), bind_store())
+            .unwrap_or_else(|(_, e)| panic!("{e}"));
+        sub.push_bind(prepared)
+            .unwrap_or_else(|(_, e)| panic!("{e}"))
+    };
+    let first = make();
+    let second = make();
+
+    let foreign = Receipt {
+        ring: second.ring(),
+        id: second.id(),
+        result: 0,
+        flags: crate::types::CqeFlags::default(),
+    };
+    assert!(!first.matches(&foreign));
+    let Err((first, _)) = first.redeem(foreign) else {
+        panic!("a foreign receipt must not redeem");
+    };
+    drop((first, second));
+}
+
+#[test]
+fn a_bind_push_that_does_not_fit_hands_the_address_back() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let mut tickets = alloc_tickets(&mut sub);
+
+    let store = bind_store();
+    let addr = store.stable_ptr();
+    let prepared = PreparedBind::new(RawFd::from_raw(3), loopback(8080), store)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let Err((returned, e)) = sub.push_bind(prepared) else {
+        panic!("a full queue must reject the push");
+    };
+    assert_eq!(e, Error::Submit(SubmitError::QueueFull));
+    // A retry must issue the same request, so the staged address survives.
+    assert_eq!(returned.published(), loopback(8080).to_bytes());
+    assert_eq!(returned.into_store().stable_ptr(), addr);
+    tickets.clear();
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_bind_makes_the_socket_reachable_at_the_port_it_named() {
+    // Asserting the outcome is `Bound` proves only that the kernel liked
+    // the encoding. An address staged wrong, or read from the wrong
+    // offset, could still report success while binding somewhere else.
+    // The effect worth checking is that the port the caller asked for is
+    // the port the socket answers on, so this binds an explicit port and
+    // reads it back.
+    let sock = Socket::with_typed_flags(
+        AddressFamily::Inet,
+        SocketType::Stream,
+        0,
+        SocketFlags::default(),
+    )
+    .expect("socket");
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    // Bind port 0 first to have the kernel pick a free one, then rebind a
+    // fresh socket to exactly that port so the assertion names a value
+    // the test chose rather than one it read back.
+    let probe = PreparedBind::new(sock.fd(), loopback(0), bind_store())
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub.push_bind(probe).unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit");
+    let done = ticket
+        .redeem(comp.wait_one().expect("completion"))
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(done.outcome(), BindOutcome::Bound);
+    let chosen = u16::from_be(sock.local_addr().expect("getsockname").sin_port);
+    assert_ne!(chosen, 0, "binding port 0 must assign a real port");
+    drop(sock);
+
+    let second = Socket::with_typed_flags(
+        AddressFamily::Inet,
+        SocketType::Stream,
+        0,
+        SocketFlags::default(),
+    )
+    .expect("socket");
+    let prepared = PreparedBind::new(second.fd(), loopback(chosen), done.into_store())
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_bind(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit");
+    let done = ticket
+        .redeem(comp.wait_one().expect("completion"))
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(done.outcome(), BindOutcome::Bound);
+
+    let got = u16::from_be(second.local_addr().expect("getsockname").sin_port);
+    assert_eq!(
+        got, chosen,
+        "the socket must answer on the port the caller staged"
+    );
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_port_another_socket_holds_is_told_apart_from_a_second_bind() {
+    // Both come back as a plain negative result; only the named outcomes
+    // say which retry, if any, could succeed.
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let make = || {
+        Socket::with_typed_flags(
+            AddressFamily::Inet,
+            SocketType::Stream,
+            0,
+            SocketFlags::default(),
+        )
+        .expect("socket")
+    };
+
+    let held = make();
+    let prepared = PreparedBind::new(held.fd(), loopback(0), bind_store())
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_bind(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit");
+    let done = ticket
+        .redeem(comp.wait_one().expect("completion"))
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(done.outcome(), BindOutcome::Bound);
+    let port = u16::from_be(held.local_addr().expect("getsockname").sin_port);
+
+    let again = PreparedBind::new(held.fd(), loopback(port), done.into_store())
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub.push_bind(again).unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit");
+    let done = ticket
+        .redeem(comp.wait_one().expect("completion"))
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(
+        done.outcome(),
+        BindOutcome::AlreadyBound,
+        "rebinding a bound socket is not a busy port"
+    );
+
+    let other = make();
+    let clash = PreparedBind::new(other.fd(), loopback(port), done.into_store())
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub.push_bind(clash).unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit");
+    let done = ticket
+        .redeem(comp.wait_one().expect("completion"))
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(
+        done.outcome(),
+        BindOutcome::AddressInUse,
+        "a port another socket holds is not a double bind"
+    );
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_bind_ticket_survives_moving_to_another_thread_before_completion() {
+    let sock = Socket::with_typed_flags(
+        AddressFamily::Inet,
+        SocketType::Stream,
+        0,
+        SocketFlags::default(),
+    )
+    .expect("socket");
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let store = bind_store();
+    let addr = store.stable_ptr();
+    let prepared =
+        PreparedBind::new(sock.fd(), loopback(0), store).unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_bind(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit");
+
+    // The kernel may still be reading the address when the ticket moves.
+    let handle = std::thread::spawn(move || {
+        let receipt = comp.wait_one().expect("completion");
+        let done = ticket
+            .redeem(receipt)
+            .unwrap_or_else(|_| panic!("mismatch"));
+        done.into_parts()
+    });
+    let (outcome, store) = handle.join().expect("thread");
+    assert_eq!(outcome, BindOutcome::Bound);
     assert_eq!(store.stable_ptr(), addr);
 }
 

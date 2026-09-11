@@ -348,6 +348,7 @@
 //! ```
 
 mod accept;
+mod bind;
 mod buffer;
 mod direct;
 mod direct_accept;
@@ -384,6 +385,7 @@ mod event_tests;
 mod miri;
 
 pub use accept::{AcceptFinished, Incoming, MultishotAccept, PreparedAccept};
+pub use bind::{BindDone, BindError, BindOutcome, PendingBind, PreparedBind};
 pub use buffer::{MmapBuffer, StableBuffer, StableBufferMut};
 pub use direct::{DirectOpenError, DirectOpened, PendingDirectOpen, PreparedDirectOpen};
 pub use direct_accept::{DirectAccept, DirectAcceptFinished, DirectIncoming, PreparedDirectAccept};
