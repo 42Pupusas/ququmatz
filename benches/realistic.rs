@@ -267,6 +267,67 @@ mod echo_roundtrip_concurrent {
         });
     }
 
+    /// The same batching shape as [`ququmatz`] above, built on the
+    /// `io-uring` crate directly: push `k` recvs, submit once, drain `k`
+    /// completions by `user_data`, then the same for `k` sends. Needed
+    /// because "ququmatz batches well" is only half a claim if it is only
+    /// ever checked against a thread-per-connection baseline and never
+    /// against the other `io_uring` binding doing the same batching.
+    #[divan::bench(args = CONCURRENCY)]
+    fn io_uring(bencher: divan::Bencher, k: usize) {
+        let mut pairs = connected_pairs(k);
+        let mut ring = io_uring::IoUring::new((k * 2).max(8) as u32).expect("setup");
+        let mut recv_bufs = vec![[0u8; 256]; k];
+        let mut reply_bufs = vec![[0u8; 256]; k];
+
+        bencher.bench_local(|| {
+            for (client, _) in &mut pairs {
+                client.write_all(REQUEST).unwrap();
+            }
+
+            for (i, ((_, server_fd), recv_buf)) in pairs.iter().zip(&mut recv_bufs).enumerate() {
+                let recv_e = io_uring::opcode::Recv::new(
+                    io_uring::types::Fd(*server_fd),
+                    recv_buf.as_mut_ptr(),
+                    recv_buf.len() as u32,
+                )
+                .build()
+                .user_data(i as u64);
+                unsafe { ring.submission().push(&recv_e).unwrap() };
+            }
+            ring.submit_and_wait(k).unwrap();
+            let mut lens = vec![0usize; k];
+            for cqe in ring.completion() {
+                let n = cqe.result();
+                assert!(n >= 0);
+                lens[cqe.user_data() as usize] = n as usize;
+            }
+
+            for (i, ((_, server_fd), recv_buf)) in pairs.iter().zip(&recv_bufs).enumerate() {
+                let send_e = io_uring::opcode::Send::new(
+                    io_uring::types::Fd(*server_fd),
+                    recv_buf.as_ptr(),
+                    lens[i] as u32,
+                )
+                .build()
+                .user_data(i as u64);
+                unsafe { ring.submission().push(&send_e).unwrap() };
+            }
+            ring.submit_and_wait(k).unwrap();
+            for cqe in ring.completion() {
+                let n = cqe.result();
+                assert!(n >= 0);
+                divan::black_box(n);
+            }
+
+            for (i, (client, _)) in pairs.iter_mut().enumerate() {
+                let n = lens[i];
+                client.read_exact(&mut reply_bufs[i][..n]).unwrap();
+                assert_eq!(&reply_bufs[i][..n], REQUEST);
+            }
+        });
+    }
+
     /// `k` OS threads, each blocking on its own connection with plain
     /// `read`/`write` -- no `io_uring` anywhere. The baseline a batching
     /// ring has to beat once there is enough concurrency for thread

@@ -81,7 +81,8 @@ next — never more than one thing in flight. That is not the case
 `io_uring` exists for. `echo_roundtrip_concurrent` drives `K` loopback
 connections per iteration: one ring pushes `K` recvs and submits them in
 a single `enter` syscall, drains `K` completions by `user_data`, then
-does the same for `K` sends. This is compared against `K` OS threads,
+does the same for `K` sends. Both `ququmatz` and `io-uring` implement
+that exact batching shape, and both are compared against `K` OS threads,
 each blocking on its own connection with plain `read`/`write` — the
 design a batching ring has to beat once concurrency is high enough for
 thread-wakeup and scheduler overhead to matter. `K` sweeps 1/8/32/128 so
@@ -90,35 +91,43 @@ the crossover, if any, is visible rather than asserted.
 ```text
 realistic                     fastest       │ slowest       │ median        │ mean          │ samples │ iters
 ╰─ echo_roundtrip_concurrent                │               │               │               │         │
+   ├─ io_uring                              │               │               │               │         │
+   │  ├─ 1                    10.68 µs      │ 44.02 µs      │ 10.77 µs      │ 11.76 µs      │ 100     │ 100
+   │  ├─ 8                    72.34 µs      │ 155.9 µs      │ 73.13 µs      │ 78.44 µs      │ 100     │ 100
+   │  ├─ 32                   286.4 µs      │ 493.3 µs      │ 294.2 µs      │ 298.3 µs      │ 100     │ 100
+   │  ╰─ 128                  1.191 ms      │ 1.967 ms      │ 1.232 ms      │ 1.263 ms      │ 100     │ 100
    ├─ ququmatz                              │               │               │               │         │
-   │  ├─ 1                    13.38 µs      │ 58.9 µs       │ 13.48 µs      │ 14.07 µs      │ 100     │ 100
-   │  ├─ 8                    90.64 µs      │ 158.3 µs      │ 91.52 µs      │ 93.97 µs      │ 100     │ 100
-   │  ├─ 32                   355.9 µs      │ 600.6 µs      │ 369.1 µs      │ 379 µs        │ 100     │ 100
-   │  ╰─ 128                  1.461 ms      │ 2.524 ms      │ 1.528 ms      │ 1.552 ms      │ 100     │ 100
+   │  ├─ 1                    10.67 µs      │ 26.67 µs      │ 10.83 µs      │ 11.07 µs      │ 100     │ 100
+   │  ├─ 8                    72.45 µs      │ 131.4 µs      │ 73.32 µs      │ 75.04 µs      │ 100     │ 100
+   │  ├─ 32                   283.8 µs      │ 480.6 µs      │ 293 µs        │ 300.8 µs      │ 100     │ 100
+   │  ╰─ 128                  1.184 ms      │ 1.943 ms      │ 1.237 ms      │ 1.26 ms       │ 100     │ 100
    ╰─ std_blocking_threads                  │               │               │               │         │
-      ├─ 1                    52.81 µs      │ 232.1 µs      │ 56.16 µs      │ 62.47 µs      │ 100     │ 100
-      ├─ 8                    215.8 µs      │ 395.6 µs      │ 247.1 µs      │ 255.9 µs      │ 100     │ 100
-      ├─ 32                   789.8 µs      │ 2.208 ms      │ 885.7 µs      │ 923.2 µs      │ 100     │ 100
-      ╰─ 128                  3.308 ms      │ 5.165 ms      │ 4.314 ms      │ 4.337 ms      │ 100     │ 100
+      ├─ 1                    42.51 µs      │ 201.1 µs      │ 45.32 µs      │ 59.62 µs      │ 100     │ 100
+      ├─ 8                    163 µs        │ 357.5 µs      │ 188.8 µs      │ 200.9 µs      │ 100     │ 100
+      ├─ 32                   572.3 µs      │ 2.746 ms      │ 665.8 µs      │ 710.3 µs      │ 100     │ 100
+      ╰─ 128                  2.569 ms      │ 4.468 ms      │ 3.368 ms      │ 3.357 ms      │ 100     │ 100
 ```
 
-**Reading it:** the single ring wins at every `K` tested, and the margin
-widens with `K` — roughly 4× at `K=1` down to roughly 2.7× at `K=128`
+**Reading it:** `ququmatz` and `io-uring` land within noise of each other
+at every `K` — the batching-path parity holds here the same way the
+single-operation parity did on `echo_roundtrip` above. Both beat
+`std_blocking_threads` at every `K` tested, and the margin widens as `K`
+grows — roughly 4× at `K=1` down to roughly 2.7× at `K=128`
 (`std_blocking_threads` scales worse than linearly past `K=32`, plausibly
 thread-spawn/join and scheduler contention rather than the syscalls
 themselves, though that split was not separately measured). This is the
 result the earlier two workloads structurally could not show: one ring
 batching many operations behind one syscall beats one thread per
-connection once there is more than one connection to serve, and the gap
-grows rather than shrinks as concurrency increases. Reproduced across two
-consecutive runs with consistent numbers at each `K`.
+connection once there is more than one connection to serve, and
+`ququmatz` gets the same batching win `io-uring` gets, not a smaller one.
+Reproduced across two consecutive runs with consistent numbers at each
+`K`.
 
 What this does **not** establish: `K=128` on one loopback host with one
 ring and threads capped by the same machine's core count is not a
-production load test, there is no comparison against `io-uring` directly
-at this shape (only against `std_blocking_threads`), and no attempt was
-made to find where thread-per-connection stops being the wrong design —
-only that it already is by `K=8`.
+production load test, and no attempt was made to find where
+thread-per-connection stops being the wrong design — only that it
+already is by `K=8`.
 
 ### A methodology failure caught before publishing
 
@@ -241,12 +250,11 @@ a number can be wrong.
   no claim is made that they hold on a different machine or kernel.
 - `echo_roundtrip` and `log_append` exercise one connection or one file
   with one operation in flight at a time; `echo_roundtrip_concurrent`
-  covers the batched-concurrency case for the echo shape only —
+  covers the batched-concurrency case, against both `io-uring` and a
+  thread-per-connection `std` baseline, for the echo shape only —
   `log_append` has no concurrent counterpart yet (K parallel durable
   writes through one ring vs. K threads each doing blocking
-  open/write/fsync/close), and no workload here compares batched
-  `ququmatz` against batched `io-uring` directly, only against a
-  thread-per-connection `std` baseline.
+  open/write/fsync/close).
 
 ## Running it yourself
 
