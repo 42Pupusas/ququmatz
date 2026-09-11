@@ -9,7 +9,11 @@ fn read_a_path_in_flight(ticket: PendingRename<MmapBuffer, MmapBuffer>) {
     // Both paths are behind the ticket while the kernel scans them. A
     // rename publishes two addresses, so exposing either would be a read
     // of storage the kernel is using.
-    let _ = ticket.from();
+    //
+    // Probed as a field rather than as `from()`: the call form collides with
+    // `From::from` and drags a `core` snippet into the expected stderr, which
+    // only renders where the `rust-src` component is installed.
+    let _ = ticket.from;
 }
 
 fn take_a_path_in_flight(ticket: PendingRename<MmapBuffer, MmapBuffer>) {

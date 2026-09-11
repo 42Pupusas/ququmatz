@@ -1,32 +1,17 @@
-error[E0599]: no method named `from` found for struct `PendingRename<F, T>` in the current scope
-  --> tests/ui/an_in_flight_rename_path_is_unreachable.rs:12:20
+error[E0616]: field `from` of struct `PendingRename` is private
+  --> tests/ui/an_in_flight_rename_path_is_unreachable.rs:16:20
    |
-12 |     let _ = ticket.from();
-   |                    ^^^^
-   |                    |
-   |                    this is an associated function, not a method
-   |                    private field, not a method
-   |
-   = note: found the following associated functions; to be used as methods, functions must have a `self` parameter
-note: the candidate is defined in the trait `From`
-  --> $RUST/core/src/convert/mod.rs
-   |
-   |     fn from(value: T) -> Self;
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
-help: use associated function syntax instead
-   |
-12 -     let _ = ticket.from();
-12 +     let _ = PendingRename<MmapBuffer, MmapBuffer>::from();
-   |
+16 |     let _ = ticket.from;
+   |                    ^^^^ private field
 
 error[E0599]: no method named `into_paths` found for struct `PendingRename<F, T>` in the current scope
-  --> tests/ui/an_in_flight_rename_path_is_unreachable.rs:18:20
+  --> tests/ui/an_in_flight_rename_path_is_unreachable.rs:22:20
    |
-18 |     let _ = ticket.into_paths();
+22 |     let _ = ticket.into_paths();
    |                    ^^^^^^^^^^ method not found in `PendingRename<MmapBuffer, MmapBuffer>`
 
 error[E0599]: no method named `as_mut_slice` found for struct `OwnedPath<S>` in the current scope
-  --> tests/ui/an_in_flight_rename_path_is_unreachable.rs:25:10
+  --> tests/ui/an_in_flight_rename_path_is_unreachable.rs:29:10
    |
-25 |     path.as_mut_slice();
+29 |     path.as_mut_slice();
    |          ^^^^^^^^^^^^ method not found in `OwnedPath<MmapBuffer>`
