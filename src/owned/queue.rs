@@ -5,7 +5,9 @@ use super::buffer::{StableBuffer, StableBufferMut};
 use super::direct::{PendingDirectOpen, PreparedDirectOpen};
 use super::direct_accept::{DirectAccept, PreparedDirectAccept};
 use super::direct_socket::{PendingDirectSocket, PreparedDirectSocket};
+use super::epoll::{PendingEpollCtl, PreparedEpollCtl};
 use super::event::{Event, PartialReceipt};
+use super::filesupdate::{PendingFilesUpdate, PreparedFilesUpdate};
 use super::identity::{RequestIdSource, RingId};
 use super::multishot::{MultishotRecv, PreparedMultishot};
 use super::open::{PendingOpen, PreparedOpen};
@@ -423,6 +425,79 @@ impl OwnedSubmitter {
             // either pointer and reclaiming both storages is sound.
             Err(e) => Err((Self::reclaim_statx(pending), e)),
         }
+    }
+
+    /// Queue an `epoll_ctl`, taking ownership of the event storage.
+    ///
+    /// Neither descriptor is taken: `epoll_ctl` borrows the epoll set and
+    /// its target for the call. Only the event the kernel reads is owned,
+    /// and a [`Del`](super::EpollChange::Del) publishes a zeroed one
+    /// because the kernel reads nothing for it.
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact,
+    /// still owning its storage.
+    pub fn push_epoll_ctl<S: StableBufferMut>(
+        &mut self,
+        request: PreparedEpollCtl<S>,
+    ) -> Result<PendingEpollCtl<S>, (PreparedEpollCtl<S>, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            // The SQE never became kernel-visible, so the kernel never saw
+            // the event pointer and reclaiming the storage is sound.
+            Err(e) => Err((Self::reclaim_epoll_ctl(pending), e)),
+        }
+    }
+
+    /// Undo an `epoll_ctl` push that the kernel never observed.
+    fn reclaim_epoll_ctl<S: StableBufferMut>(pending: PendingEpollCtl<S>) -> PreparedEpollCtl<S> {
+        // SAFETY: only reached when `Submitter::push` reported the queue was
+        // full, which happens before the SQE is written or the tail is
+        // advanced. No kernel-visible pointer to the storage exists.
+        unsafe { pending.reclaim_unsubmitted() }
+    }
+
+    /// Queue a `files_update`, taking ownership of the descriptor array.
+    ///
+    /// The kernel **duplicates** the descriptors it installs, so this
+    /// takes none of them: the caller's handles stay valid and may be
+    /// closed afterwards without disturbing the table. Only the array
+    /// naming them is owned, because the kernel reads it after
+    /// submission.
+    ///
+    /// The completion reports [`Update`](super::Update) rather than a
+    /// count, because the kernel can stop part-way and report a positive
+    /// number that the usual reading would call a success.
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact,
+    /// still owning its storage.
+    pub fn push_files_update<S: StableBufferMut, const N: usize>(
+        &mut self,
+        request: PreparedFilesUpdate<S, N>,
+    ) -> Result<PendingFilesUpdate<S, N>, (PreparedFilesUpdate<S, N>, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            // The SQE never became kernel-visible, so the kernel never saw
+            // the array pointer and reclaiming the storage is sound.
+            Err(e) => Err((Self::reclaim_files_update(pending), e)),
+        }
+    }
+
+    /// Undo a `files_update` push that the kernel never observed.
+    fn reclaim_files_update<S: StableBufferMut, const N: usize>(
+        pending: PendingFilesUpdate<S, N>,
+    ) -> PreparedFilesUpdate<S, N> {
+        // SAFETY: only reached when `Submitter::push` reported the queue was
+        // full, which happens before the SQE is written or the tail is
+        // advanced. No kernel-visible pointer to the storage exists.
+        unsafe { pending.reclaim_unsubmitted() }
     }
 
     /// Queue a timeout, taking ownership of its `Timespec` storage.

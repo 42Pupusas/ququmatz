@@ -182,6 +182,33 @@ fn an_in_flight_timeout_hides_the_duration_the_kernel_may_be_copying() {
     t.compile_fail("tests/ui/a_timeout_ticket_must_be_kept.rs");
 }
 
+/// A `files_update` owns its descriptor array but *not* the descriptors
+/// in it: the kernel duplicates what it installs, so the caller's handles
+/// stay valid and stay the caller's responsibility. The array is the part
+/// the kernel walks after submission, so it is unreachable in flight and
+/// unreclaimable without a receipt like every other staged region — and
+/// the outcome cannot be read early either, since a `files_update` can
+/// install only part of what was asked.
+#[test]
+fn an_in_flight_fd_array_hides_both_its_entries_and_its_outcome() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/an_in_flight_fd_array_is_unreachable.rs");
+    t.compile_fail("tests/ui/a_files_update_ticket_must_be_kept.rs");
+}
+
+/// An `epoll_ctl` borrows both descriptors and owns only the event the
+/// kernel reads — and for a `Del` it reads none at all. The storage is
+/// still unreachable in flight, because nothing in the SQE distinguishes
+/// "will not be read" from "has not been read yet", and the outcome is
+/// unreadable early because "already registered" is a real answer rather
+/// than a bug.
+#[test]
+fn an_in_flight_epoll_event_is_hidden_even_when_unread() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/an_in_flight_epoll_event_is_unreachable.rs");
+    t.compile_fail("tests/ui/an_epoll_ticket_must_be_kept.rs");
+}
+
 /// An accepted connection is owned rather than borrowed, so the compiler
 /// cannot tie it to a pool the way it does an arrival. What it can do is
 /// refuse to let the result be thrown away unread, which is the failure

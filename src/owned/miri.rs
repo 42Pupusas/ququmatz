@@ -19,7 +19,9 @@ use std::boxed::Box;
 use std::vec::Vec;
 
 use super::direct::{PendingDirectOpen, PreparedDirectOpen};
+use super::epoll::{EpollChange, EpollOutcome, PendingEpollCtl, PreparedEpollCtl};
 use super::event::PartialReceipt;
+use super::filesupdate::{PendingFilesUpdate, PreparedFilesUpdate, TableEntry, Update};
 use super::identity::{RequestId, RequestIdSource, RingId};
 use super::open::{PendingOpen, PreparedOpen};
 use super::openat2::{PendingOpenat2, PreparedOpenat2};
@@ -28,6 +30,7 @@ use super::pathop::{PendingPathOp, PreparedPathOp};
 use super::recvmsg::{PeerWanted, PendingRecvmsg, PreparedRecvmsg};
 use super::rename::{PendingRename, PreparedRename};
 use super::sendmsg::{PendingSendmsg, PreparedSendmsg, SendTarget};
+use super::slot::SlotIndex;
 use super::slot::SlotTarget;
 use super::statx::{PendingStatx, PreparedStatx};
 use super::timeout::{Count, PendingTimeout, PreparedTimeout};
@@ -39,8 +42,8 @@ use super::{
 };
 use crate::op::Sqe;
 use crate::types::{
-    CqeFlags, FileMode, IoVec, MsgFlags, MsgHdr, OpenFlags, OpenHow, RawFd, ResolveFlags,
-    SockAddrIn, Statx, StatxFlags, StatxMask, Timespec,
+    CqeFlags, EpollEvent, EpollEvents, FileMode, IoVec, MsgFlags, MsgHdr, OpenFlags, OpenHow,
+    RawFd, ResolveFlags, SockAddrIn, Statx, StatxFlags, StatxMask, Timespec,
 };
 
 /// Heap storage standing in for an `MmapBuffer`.
@@ -372,6 +375,74 @@ impl Lifecycle {
     ) -> (FakeKernel, PendingTimeout<S>) {
         let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
         (FakeKernel::holding(sqe), pending)
+    }
+
+    fn submit_files_update<S: StableBufferMut, const N: usize>(
+        &self,
+        prepared: PreparedFilesUpdate<S, N>,
+    ) -> (FakeKernel, PendingFilesUpdate<S, N>) {
+        let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
+        (FakeKernel::holding(sqe), pending)
+    }
+
+    fn submit_epoll_ctl<S: StableBufferMut>(
+        &self,
+        prepared: PreparedEpollCtl<S>,
+    ) -> (FakeKernel, PendingEpollCtl<S>) {
+        let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
+        (FakeKernel::holding(sqe), pending)
+    }
+}
+
+impl FakeKernel {
+    /// Read the `epoll_event` an `epoll_ctl` publishes at `addr`.
+    ///
+    /// The kernel reads this for an `Add` or a `Mod` and ignores it for a
+    /// `Del`, but the storage has to be live either way — nothing in the
+    /// SQE distinguishes "will not be read" from "has not been read yet".
+    fn read_epoll_event(&self) -> EpollEvent {
+        // `PreparedEpollCtl` rejected storage that was not aligned for an
+        // `EpollEvent`, so this address is aligned.
+        #[allow(clippy::cast_ptr_alignment)]
+        let base = self.published_ptr().cast::<EpollEvent>();
+        // SAFETY: the live `PendingEpollCtl` owns storage checked for size
+        // and alignment against `EpollEvent` and written before
+        // submission, and keeps it allocated until redeemed.
+        unsafe { base.read() }
+    }
+
+    /// The operation code the SQE carries in `len`.
+    const fn published_epoll_op(&self) -> u32 {
+        self.sqe.0.len
+    }
+}
+
+impl FakeKernel {
+    /// Read the descriptor array a `files_update` publishes at `addr`.
+    ///
+    /// The kernel walks `len` entries from this address, so the array is
+    /// the region whose lifetime has to outlast the ticket's travels — the
+    /// descriptors it names are duplicated and belong to whoever opened
+    /// them.
+    fn read_fd_array(&self) -> Vec<i32> {
+        // `PreparedFilesUpdate` rejected storage that was not aligned for
+        // an `i32`, so this address is aligned.
+        #[allow(clippy::cast_ptr_alignment)]
+        let base = self.published_ptr().cast::<i32>();
+        let mut seen = Vec::new();
+        for i in 0..self.len() {
+            // SAFETY: the live `PendingFilesUpdate` owns storage checked to
+            // hold `len` aligned `i32`s and written before submission, and
+            // keeps it allocated until redeemed.
+            seen.push(unsafe { base.add(i).read() });
+        }
+        seen
+    }
+
+    /// The table offset the SQE carries, which the kernel reads from `off`
+    /// rather than from the caller's memory.
+    const fn published_offset(&self) -> u64 {
+        self.sqe.0.off
     }
 }
 
@@ -2415,6 +2486,280 @@ fn reclaiming_an_unpublished_timeout_returns_the_storage_and_its_count() {
     assert_eq!(prepared.published().tv_nsec(), 500);
     assert_eq!(prepared.count(), Count::Completions(2));
     assert!(prepared.is_absolute());
+    drop(prepared.into_store());
+}
+
+/// Storage for a descriptor array, aligned as the real one requires.
+fn fd_array_store<const N: usize>() -> HeapBuffer {
+    HeapBuffer::with_alignment(core::mem::size_of::<i32>() * N, align_of::<i32>())
+}
+
+/// A table index well below the reserved sentinels.
+fn slot_index(index: u32) -> SlotIndex {
+    SlotIndex::new(index).expect("a small index is representable")
+}
+
+#[test]
+fn the_kernel_walks_the_fd_array_inside_storage_the_ticket_owns() {
+    let cycle = Lifecycle::new();
+    // Distinct values: an array of three identical entries would pass even
+    // if every read returned the first.
+    let prepared = PreparedFilesUpdate::at(
+        slot_index(4),
+        [
+            TableEntry::Install(RawFd::from_raw(11)),
+            TableEntry::Clear,
+            TableEntry::Install(RawFd::from_raw(13)),
+        ],
+        fd_array_store::<3>(),
+    )
+    .ok()
+    .expect("aligned storage fits");
+    let (kernel, pending) = cycle.submit_files_update(prepared);
+
+    assert_eq!(kernel.read_fd_array(), std::vec![11, -1, 13]);
+    // The offset travels in the SQE rather than in caller memory.
+    assert_eq!(kernel.published_offset(), 4);
+
+    let receipt = kernel.post_status(cycle.ring, 3);
+    let done = pending.redeem(receipt).ok().expect("receipt matches");
+    assert_eq!(done.update(), Update::All { count: 3 });
+    drop(done.into_store());
+}
+
+#[test]
+fn an_arrays_storage_survives_the_ticket_moving_between_owners() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedFilesUpdate::at(
+        slot_index(0),
+        [TableEntry::Install(RawFd::from_raw(21)), TableEntry::Clear],
+        fd_array_store::<2>(),
+    )
+    .ok()
+    .expect("aligned storage fits");
+    let (kernel, pending) = cycle.submit_files_update(prepared);
+
+    // Moving the ticket is the hazard: an inline array would relocate the
+    // exact bytes the kernel is about to walk.
+    let pending = Box::new(pending);
+    let pending = core::hint::black_box(pending);
+    let pending = *pending;
+
+    assert_eq!(kernel.read_fd_array(), std::vec![21, -1]);
+
+    let receipt = kernel.post_status(cycle.ring, 2);
+    let done = pending.redeem(receipt).ok().expect("receipt matches");
+    drop(done.into_store());
+}
+
+#[test]
+fn abandoning_a_files_update_leaks_rather_than_freeing_the_array() {
+    let cycle = Lifecycle::new();
+    let store = fd_array_store::<2>();
+    let addr = store.stable_ptr();
+    let prepared = PreparedFilesUpdate::at(
+        slot_index(0),
+        [TableEntry::Install(RawFd::from_raw(31)), TableEntry::Clear],
+        store,
+    )
+    .ok()
+    .expect("aligned storage fits");
+    let (kernel, pending) = cycle.submit_files_update(prepared);
+
+    // Dropping an in-flight ticket must not free an array the kernel may
+    // still be walking.
+    drop(pending);
+    assert_eq!(kernel.read_fd_array(), std::vec![31, -1]);
+
+    // SAFETY: the leak above is deliberate; the stand-in kernel has
+    // finished and nothing else references this allocation.
+    unsafe {
+        HeapBuffer::reclaim_aligned(
+            addr.cast_mut(),
+            core::mem::size_of::<i32>() * 2,
+            align_of::<i32>(),
+        );
+    }
+}
+
+#[test]
+fn reclaiming_an_unpublished_files_update_returns_the_array_and_its_offset() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedFilesUpdate::at(
+        slot_index(6),
+        [TableEntry::Install(RawFd::from_raw(41))],
+        fd_array_store::<1>(),
+    )
+    .ok()
+    .expect("aligned storage fits");
+    let (_kernel, pending) = cycle.submit_files_update(prepared);
+
+    // SAFETY: this stands in for a rejected push, so the SQE was built but
+    // never made visible to any kernel and the storage is unreferenced.
+    let prepared = unsafe { pending.reclaim_unsubmitted() };
+    // A retry must issue the same request, so the published array and the
+    // offset both have to survive.
+    assert_eq!(prepared.published(), [41]);
+    assert_eq!(prepared.offset().get(), 6);
+    drop(prepared.into_store());
+}
+
+/// Storage for one `EpollEvent`, aligned as the real one requires.
+fn epoll_event_store() -> HeapBuffer {
+    HeapBuffer::with_alignment(core::mem::size_of::<EpollEvent>(), align_of::<EpollEvent>())
+}
+
+#[test]
+fn the_kernel_reads_an_epoll_event_from_storage_the_ticket_owns() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedEpollCtl::new(
+        RawFd::from_raw(3),
+        RawFd::from_raw(9),
+        EpollChange::Add {
+            events: EpollEvents::IN,
+            data: 0x1234_5678,
+        },
+        epoll_event_store(),
+    )
+    .ok()
+    .expect("aligned storage fits");
+    let (kernel, pending) = cycle.submit_epoll_ctl(prepared);
+
+    let seen = kernel.read_epoll_event();
+    let (events, data) = (seen.events, seen.data);
+    assert_eq!(events, EpollEvents::IN.bits());
+    assert_eq!(data, 0x1234_5678);
+    // The operation travels in the SQE rather than in caller memory.
+    assert_eq!(kernel.published_epoll_op(), 1);
+
+    let receipt = kernel.post_status(cycle.ring, 0);
+    let done = pending.redeem(receipt).ok().expect("receipt matches");
+    assert_eq!(done.outcome(), EpollOutcome::Applied);
+    drop(done.into_store());
+}
+
+#[test]
+fn a_dels_storage_is_live_even_though_the_kernel_reads_nothing() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedEpollCtl::new(
+        RawFd::from_raw(3),
+        RawFd::from_raw(9),
+        EpollChange::Del,
+        epoll_event_store(),
+    )
+    .ok()
+    .expect("aligned storage fits");
+    let (kernel, pending) = cycle.submit_epoll_ctl(prepared);
+
+    // Nothing in the SQE says "this address will not be read", so the
+    // storage has to be as live as any other request's — a kernel that
+    // did read it must find initialised bytes rather than a dangling
+    // pointer.
+    let seen = kernel.read_epoll_event();
+    let events = seen.events;
+    assert_eq!(events, 0);
+    assert_eq!(kernel.published_epoll_op(), 2);
+
+    let receipt = kernel.post_status(cycle.ring, 0);
+    let done = pending.redeem(receipt).ok().expect("receipt matches");
+    drop(done.into_store());
+}
+
+#[test]
+fn an_events_storage_survives_the_ticket_moving_between_owners() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedEpollCtl::new(
+        RawFd::from_raw(3),
+        RawFd::from_raw(9),
+        EpollChange::Mod {
+            events: EpollEvents::OUT,
+            data: 77,
+        },
+        epoll_event_store(),
+    )
+    .ok()
+    .expect("aligned storage fits");
+    let (kernel, pending) = cycle.submit_epoll_ctl(prepared);
+
+    // Moving the ticket is the hazard: an inline event would relocate the
+    // exact bytes the kernel is about to read.
+    let pending = Box::new(pending);
+    let pending = core::hint::black_box(pending);
+    let pending = *pending;
+
+    let seen = kernel.read_epoll_event();
+    let (events, data) = (seen.events, seen.data);
+    assert_eq!(events, EpollEvents::OUT.bits());
+    assert_eq!(data, 77);
+
+    let receipt = kernel.post_status(cycle.ring, 0);
+    let done = pending.redeem(receipt).ok().expect("receipt matches");
+    drop(done.into_store());
+}
+
+#[test]
+fn abandoning_an_epoll_ctl_leaks_rather_than_freeing_the_event() {
+    let cycle = Lifecycle::new();
+    let store = epoll_event_store();
+    let addr = store.stable_ptr();
+    let prepared = PreparedEpollCtl::new(
+        RawFd::from_raw(3),
+        RawFd::from_raw(9),
+        EpollChange::Add {
+            events: EpollEvents::IN,
+            data: 5,
+        },
+        store,
+    )
+    .ok()
+    .expect("aligned storage fits");
+    let (kernel, pending) = cycle.submit_epoll_ctl(prepared);
+
+    // Dropping an in-flight ticket must not free an event the kernel may
+    // still be reading.
+    drop(pending);
+    let seen = kernel.read_epoll_event();
+    let data = seen.data;
+    assert_eq!(data, 5);
+
+    // SAFETY: the leak above is deliberate; the stand-in kernel has
+    // finished and nothing else references this allocation.
+    unsafe {
+        HeapBuffer::reclaim_aligned(
+            addr.cast_mut(),
+            core::mem::size_of::<EpollEvent>(),
+            align_of::<EpollEvent>(),
+        );
+    }
+}
+
+#[test]
+fn reclaiming_an_unpublished_epoll_ctl_returns_the_storage_and_its_change() {
+    let cycle = Lifecycle::new();
+    let change = EpollChange::Mod {
+        events: EpollEvents::HUP,
+        data: 321,
+    };
+    let prepared = PreparedEpollCtl::new(
+        RawFd::from_raw(3),
+        RawFd::from_raw(9),
+        change,
+        epoll_event_store(),
+    )
+    .ok()
+    .expect("aligned storage fits");
+    let (_kernel, pending) = cycle.submit_epoll_ctl(prepared);
+
+    // SAFETY: this stands in for a rejected push, so the SQE was built but
+    // never made visible to any kernel and the storage is unreferenced.
+    let prepared = unsafe { pending.reclaim_unsubmitted() };
+    // A retry must issue the same request, so the change and the published
+    // event both have to survive.
+    assert_eq!(prepared.change(), change);
+    let seen = prepared.published();
+    let (events, data) = (seen.events, seen.data);
+    assert_eq!(events, EpollEvents::HUP.bits());
+    assert_eq!(data, 321);
     drop(prepared.into_store());
 }
 

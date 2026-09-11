@@ -288,6 +288,39 @@
 //! submitted *immediately after* the operation they cancel, and nothing
 //! here expresses "these two SQEs are adjacent and in this order".
 //!
+//! # A table update can succeed halfway
+//!
+//! [`PreparedFilesUpdate`] is the only request whose result is a **count**
+//! rather than a status, and the count can come back short: an array of
+//! `[good, bad, good]` returns `1`, having installed the first entry and
+//! abandoned the rest. That number is positive, so the usual reading of a
+//! non-negative result calls it a success while two of the three slots
+//! still hold whatever they held before. [`Update`] separates
+//! [`All`](Update::All) from [`Partial`](Update::Partial) so the case
+//! cannot be missed; a bad descriptor in *first* position reports `-EBADF`
+//! instead, so `Partial` always means at least one slot changed.
+//!
+//! What it does **not** own is the descriptors. Measured on a live ring,
+//! the kernel duplicates each one: the caller's handle stays open and
+//! usable afterwards, and closing it leaves the table's copy working. That
+//! is what lets [`TableEntry::Install`] take a plain
+//! [`RawFd`](crate::types::RawFd) rather than an owning handle — a request
+//! that *consumed* descriptors would have to, or risk a double close.
+//!
+//! # `epoll_ctl` reads nothing for one of its three operations
+//!
+//! A `Del` with a null event pointer returns `0` against a real kernel, so
+//! the struct is genuinely unread there. [`EpollChange`] carries the event
+//! in the two variants that use it and omits it from the one that does
+//! not, which makes a discarded mask unwritable rather than merely
+//! discouraged. The storage is still owned for a `Del`, because nothing in
+//! the SQE distinguishes an address that will not be read from one that
+//! has not been read yet.
+//!
+//! [`EpollOutcome`] names `EEXIST` and `ENOENT` rather than folding them
+//! into a generic failure: both are ordinary results of another thread
+//! having touched the same epoll set, not programming errors.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -319,7 +352,9 @@ mod buffer;
 mod direct;
 mod direct_accept;
 mod direct_socket;
+mod epoll;
 mod event;
+mod filesupdate;
 mod identity;
 mod msgregion;
 mod multishot;
@@ -355,7 +390,13 @@ pub use direct_accept::{DirectAccept, DirectAcceptFinished, DirectIncoming, Prep
 pub use direct_socket::{
     DirectSocketCreated, DirectSocketError, PendingDirectSocket, PreparedDirectSocket,
 };
+pub use epoll::{
+    EpollChange, EpollCtlDone, EpollError, EpollOutcome, PendingEpollCtl, PreparedEpollCtl,
+};
 pub use event::{Event, PartialReceipt};
+pub use filesupdate::{
+    FilesUpdateError, FilesUpdated, PendingFilesUpdate, PreparedFilesUpdate, TableEntry, Update,
+};
 pub use identity::{RequestId, RingId};
 pub use msgregion::{MAX_IOV, MsgRegionError};
 pub use multishot::{Armed, Arrival, Delivery, Finished, MultishotRecv, PreparedMultishot};

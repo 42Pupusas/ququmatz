@@ -716,19 +716,51 @@ SQ thread consumed the entry tens of microseconds *after* `submit`
 returned. No call's return proves the copy has happened, so the borrow has
 nowhere safe to end and the storage is owned like everything else.
 
-**Scope limits.** The owned layer now covers read/write, vectored I/O,
-zero-copy send, `sendmsg`, `recvmsg`, multishot recv and accept, `openat`,
-`openat2`, direct open, direct accept, direct socket, `statx`, `renameat`,
-`unlinkat`, `mkdirat`, and `timeout` — every pointer-bearing family the
-finding's acceptance criteria name. `epoll_ctl` and `files_update` still
-go through the `unsafe` `Sqe` surface, which remains for lock-free users;
-both carry only fixed-size scalar or struct arguments, so neither
-introduces a shape the owned layer has not already modelled. Two things
-are deliberately still raw because they need more than a request type:
-multishot `recvmsg`, which prepends an `io_uring_recvmsg_out` to each
-provided buffer, and linked timeouts, which must be submitted
-*immediately after* the operation they cancel — nothing in a per-request
-`push` API expresses "these two SQEs are adjacent and in this order".
+The last two requests were written off in an earlier revision of this
+section as "fixed-size scalar or struct arguments, no new shape". Probing
+them before wrapping them found a shape in each.
+
+`files_update` is the only request whose result is a **count** rather than
+a status, and the count can come back short. An array of
+`[good, bad, good]` returns `1`: the first entry installed, the rest
+abandoned. The number is positive, so the usual reading of a non-negative
+result calls that a success while two of three slots still hold whatever
+they held before. `Update` separates `All` from `Partial` so the case
+cannot be missed; a bad descriptor in *first* position reports `-EBADF`
+instead, so `Partial` always means at least one slot changed. It also does
+not own the descriptors it installs — the kernel duplicates each one,
+verified by reading through the caller's handle afterwards and by closing
+it and still reaching the file through the table. That is what lets
+`TableEntry::Install` take a plain `RawFd` rather than an owning handle; a
+request that consumed descriptors would have to, or risk a double close.
+
+`epoll_ctl` reads its `epoll_event` for an `Add` or a `Mod` and **not at
+all** for a `Del` — a `Del` with a null pointer returns `0` against a real
+kernel. `EpollChange` therefore carries the event in the two variants that
+use it and omits it from the third, so a mask that would be silently
+discarded cannot be written. The storage is still owned for a `Del`,
+because nothing in the SQE distinguishes an address that will not be read
+from one that has not been read yet.
+
+**Scope limits.** The owned layer now covers every `io_uring` operation
+this crate exposes that takes a pointer into caller memory: read/write,
+vectored I/O, zero-copy send, `sendmsg`, `recvmsg`, multishot recv and
+accept, `openat`, `openat2`, direct open, direct accept, direct socket,
+`statx`, `renameat`, `unlinkat`, `mkdirat`, `timeout`, `files_update`, and
+`epoll_ctl`. The `unsafe` `Sqe` surface remains for lock-free users and
+for the pointer-free control operations (`nop`, `cancel`, `poll_add`,
+`timeout_remove`), which own nothing and so have nothing to model.
+
+Two things are deliberately still raw because they need more than a
+request type. Multishot `recvmsg` prepends an `io_uring_recvmsg_out` to
+each provided buffer, so the completion must parse a header out of pool
+storage rather than out of a region the ticket owns. Linked timeouts must
+be submitted *immediately after* the operation they cancel, and nothing in
+a per-request `push` API expresses "these two SQEs are adjacent, in this
+order, or neither goes" — each push can fail on its own and leave the link
+half-formed. Both want a request *pair*, which is a different shape from
+anything here.
+
 Neither direct accept nor direct socket has Miri coverage: neither owns
 userspace storage, so there is no pointer lifetime to model.
 

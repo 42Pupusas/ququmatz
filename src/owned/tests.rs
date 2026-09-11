@@ -4,13 +4,14 @@ extern crate std;
 
 use super::{
     Arrival, Completed, Count, Delivery, DirectIncoming, DirectOpenError, DirectSlot,
-    DirectSocketError, Direction, Event, Expiry, Incoming, MmapBuffer, MsgRegionError,
-    Openat2Error, Openat2Mode, OwnedPath, PathError, PeerWanted, Pending, PendingStatx, PendingZc,
-    Prepared, PreparedAccept, PreparedDirectAccept, PreparedDirectOpen, PreparedDirectSocket,
-    PreparedMultishot, PreparedOpen, PreparedOpenat2, PreparedPathOp, PreparedRecvmsg,
-    PreparedRename, PreparedSendmsg, PreparedStatx, PreparedTimeout, PreparedVectored, PreparedZc,
-    Receipt, RenameMode, RingId, SendTarget, SlotIndex, SlotTarget, StableBuffer, StatxError,
-    TimeoutError, VectoredError, ZcCompleted,
+    DirectSocketError, Direction, EpollChange, EpollError, EpollOutcome, Event, Expiry,
+    FilesUpdateError, Incoming, MmapBuffer, MsgRegionError, Openat2Error, Openat2Mode, OwnedPath,
+    PathError, PeerWanted, Pending, PendingStatx, PendingZc, Prepared, PreparedAccept,
+    PreparedDirectAccept, PreparedDirectOpen, PreparedDirectSocket, PreparedEpollCtl,
+    PreparedFilesUpdate, PreparedMultishot, PreparedOpen, PreparedOpenat2, PreparedPathOp,
+    PreparedRecvmsg, PreparedRename, PreparedSendmsg, PreparedStatx, PreparedTimeout,
+    PreparedVectored, PreparedZc, Receipt, RenameMode, RingId, SendTarget, SlotIndex, SlotTarget,
+    StableBuffer, StatxError, TableEntry, TimeoutError, Update, VectoredError, ZcCompleted,
 };
 /// Only the kernel-backed tests name a path-op kind or inspect a peer
 /// address, and those are gated.
@@ -19,8 +20,9 @@ use super::{PathOpKind, PeerAddress};
 use crate::error::{Error, SubmitError};
 use crate::net::Socket;
 use crate::types::{
-    AcceptFlags, AddressFamily, DirFd, FileMode, MsgFlags, OpenFlags, RawFd, ResolveFlags,
-    SockAddrIn, SocketFlags, SocketType, Statx, StatxFlags, StatxMask, Timespec,
+    AcceptFlags, AddressFamily, DirFd, EpollEvent, EpollEvents, FileMode, MsgFlags, OpenFlags,
+    RawFd, ResolveFlags, SockAddrIn, SocketFlags, SocketType, Statx, StatxFlags, StatxMask,
+    Timespec,
 };
 
 /// Static proof that a ticket crosses a thread boundary. The whole design
@@ -5021,5 +5023,892 @@ fn a_timeout_ticket_survives_moving_to_another_thread_before_completion() {
     let (expiry, store) = handle.join().expect("thread");
     assert_eq!(expiry, Expiry::Expired);
     // The storage came back at the same address it was staged at.
+    assert_eq!(store.stable_ptr(), addr);
+}
+
+// ---------------------------------------------------------------
+// files_update
+// ---------------------------------------------------------------
+
+/// Storage for a descriptor array of `N` entries.
+fn fd_array_store<const N: usize>() -> MmapBuffer {
+    MmapBuffer::with_capacity(core::mem::size_of::<i32>() * N).expect("map")
+}
+
+/// A table index that is nowhere near the reserved sentinels.
+fn slot(index: u32) -> SlotIndex {
+    SlotIndex::new(index).expect("a small index is representable")
+}
+
+/// A scratch file holding `bytes`, removed when the guard drops.
+#[cfg(not(miri))]
+struct ScratchFile {
+    path: std::path::PathBuf,
+    file: std::fs::File,
+}
+
+#[cfg(not(miri))]
+impl ScratchFile {
+    fn with(name: &str, bytes: &[u8]) -> Self {
+        use std::io::{Seek, Write};
+        let path = std::env::temp_dir().join(name);
+        let mut file = std::fs::File::options()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open scratch");
+        file.write_all(bytes).expect("write scratch");
+        file.seek(std::io::SeekFrom::Start(0)).expect("rewind");
+        Self { path, file }
+    }
+
+    fn fd(&self) -> RawFd {
+        use std::os::fd::AsRawFd;
+        RawFd::from_raw(self.file.as_raw_fd() as usize)
+    }
+
+    /// Read the first bytes back through the caller's own handle.
+    fn read_through_our_own_handle(&self, into: &mut [u8]) -> std::io::Result<()> {
+        use std::io::{Read, Seek};
+        let mut held = &self.file;
+        held.seek(std::io::SeekFrom::Start(0))?;
+        held.read_exact(into)
+    }
+}
+
+#[cfg(not(miri))]
+impl Drop for ScratchFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[test]
+fn a_files_update_publishes_its_array_before_any_sqe_names_it() {
+    let prepared = PreparedFilesUpdate::at(
+        slot(2),
+        [
+            TableEntry::Install(RawFd::from_raw(7)),
+            TableEntry::Clear,
+            TableEntry::Install(RawFd::from_raw(9)),
+        ],
+        fd_array_store::<3>(),
+    )
+    .unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    // Clearing is encoded as the kernel's -1 rather than left to a caller.
+    assert_eq!(prepared.published(), [7, -1, 9]);
+    assert_eq!(prepared.offset().get(), 2);
+    assert_eq!(prepared.slots(), 3);
+}
+
+#[test]
+fn an_empty_update_is_refused_because_the_kernel_rejects_one() {
+    let store = fd_array_store::<1>();
+    let addr = store.stable_ptr();
+    let Err((returned, e)) = PreparedFilesUpdate::at(slot(0), [], store) else {
+        panic!("an empty update must be refused");
+    };
+    assert_eq!(e, FilesUpdateError::Empty);
+    assert_eq!(returned.stable_ptr(), addr);
+}
+
+#[test]
+fn storage_too_small_for_the_array_is_rejected_with_it_handed_back() {
+    // Room for three descriptors, but four are named.
+    let store = MmapBuffer::with_capacity(core::mem::size_of::<i32>() * 3).expect("map");
+    let addr = store.stable_ptr();
+    let Err((returned, e)) = PreparedFilesUpdate::at(slot(0), [TableEntry::Clear; 4], store) else {
+        panic!("short storage must be refused");
+    };
+    assert_eq!(
+        e,
+        FilesUpdateError::StoreTooSmall {
+            needed: core::mem::size_of::<i32>() * 4,
+            got: core::mem::size_of::<i32>() * 3,
+        }
+    );
+    assert_eq!(returned.stable_ptr(), addr);
+}
+
+#[test]
+fn misaligned_array_storage_is_rejected_rather_than_written_through() {
+    // `MmapBuffer` is page-aligned and can never exercise this.
+    let store = MisalignedVecs::with_capacity(core::mem::size_of::<i32>() * 4);
+    let Err((_returned, e)) = PreparedFilesUpdate::at(slot(0), [TableEntry::Clear; 2], store)
+    else {
+        panic!("misaligned storage must be refused");
+    };
+    assert_eq!(
+        e,
+        FilesUpdateError::StoreMisaligned {
+            needed: core::mem::align_of::<i32>(),
+        }
+    );
+}
+
+#[test]
+fn a_short_count_is_not_read_as_success() {
+    // The case a plain `is_ok()` gets wrong: positive, but most of the
+    // request did not happen.
+    let partial = Update::from_raw_for_test(1, 3);
+    assert_eq!(
+        partial,
+        Update::Partial {
+            installed: 1,
+            requested: 3,
+        }
+    );
+    assert!(!partial.is_complete());
+    assert_eq!(partial.installed(), 1);
+
+    let all = Update::from_raw_for_test(3, 3);
+    assert_eq!(all, Update::All { count: 3 });
+    assert!(all.is_complete());
+
+    // Nothing installed at all is a failure, not a zero-length success.
+    let failed = Update::from_raw_for_test(-9, 3);
+    assert!(matches!(failed, Update::Failed(_)));
+    assert!(!failed.is_complete());
+    assert_eq!(failed.installed(), 0);
+}
+
+#[test]
+fn a_files_update_receipt_for_another_request_is_rejected() {
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut make = || {
+        let prepared = PreparedFilesUpdate::at(slot(0), [TableEntry::Clear], fd_array_store::<1>())
+            .unwrap_or_else(|(_, e)| panic!("{e}"));
+        sub.push_files_update(prepared)
+            .unwrap_or_else(|(_, e)| panic!("{e}"))
+    };
+    let first = make();
+    let second = make();
+
+    let foreign = Receipt {
+        ring: second.ring(),
+        id: second.id(),
+        result: 1,
+        flags: crate::types::CqeFlags::default(),
+    };
+    assert!(!first.matches(&foreign));
+    let Err((first, _)) = first.redeem(foreign) else {
+        panic!("a foreign receipt must not redeem");
+    };
+    drop((first, second));
+}
+
+#[test]
+fn a_files_update_push_that_does_not_fit_hands_the_array_back() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let mut tickets = alloc_tickets(&mut sub);
+
+    let store = fd_array_store::<2>();
+    let addr = store.stable_ptr();
+    let prepared = PreparedFilesUpdate::at(
+        slot(3),
+        [TableEntry::Install(RawFd::from_raw(5)), TableEntry::Clear],
+        store,
+    )
+    .unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let Err((returned, e)) = sub.push_files_update(prepared) else {
+        panic!("a full queue must reject the push");
+    };
+    assert_eq!(e, Error::Submit(SubmitError::QueueFull));
+    // A retry must issue the same request, so the array and the offset
+    // both have to survive.
+    assert_eq!(returned.published(), [5, -1]);
+    assert_eq!(returned.offset().get(), 3);
+    assert_eq!(returned.into_store().stable_ptr(), addr);
+    tickets.clear();
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_update_installs_a_file_the_table_can_reach() {
+    let ring = ring_with_table(8, 2);
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let scratch = ScratchFile::with("qq_owned_update", b"installed");
+
+    let prepared = PreparedFilesUpdate::at(
+        slot(0),
+        [TableEntry::Install(scratch.fd())],
+        fd_array_store::<1>(),
+    )
+    .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_files_update(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(done.update(), Update::All { count: 1 });
+
+    // The slot is real: reading through it only resolves because
+    // `fixed_file` makes the kernel read `fd` as a table index.
+    let mut buf = MmapBuffer::with_capacity(16).expect("map");
+    let read = sub.raw().push(
+        unsafe { crate::Sqe::read_ptr(RawFd::from_raw(0), buf.as_mut_slice().as_mut_ptr(), 9, 0) }
+            .fixed_file()
+            .user_data(77),
+    );
+    read.expect("push read");
+    sub.submit_and_wait(1).expect("submit");
+    let done = comp.wait_one().expect("completion");
+    assert_eq!(done.raw_result(), 9);
+    assert_eq!(&buf.as_slice()[..9], b"installed");
+}
+
+#[cfg(not(miri))]
+#[test]
+fn the_kernel_duplicates_so_the_callers_descriptor_stays_usable() {
+    let ring = ring_with_table(8, 1);
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let scratch = ScratchFile::with("qq_owned_dup", b"duplicated");
+
+    let prepared = PreparedFilesUpdate::at(
+        slot(0),
+        [TableEntry::Install(scratch.fd())],
+        fd_array_store::<1>(),
+    )
+    .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_files_update(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert!(done.update().is_complete());
+
+    // This is what lets the API take a borrowed `RawFd` rather than an
+    // owning handle: the kernel took a reference of its own, so the
+    // caller's descriptor is untouched and closing it is still the
+    // caller's job.
+    let mut check = [0u8; 10];
+    scratch
+        .read_through_our_own_handle(&mut check)
+        .expect("the caller's descriptor must still be open");
+    assert_eq!(&check, b"duplicated");
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_bad_descriptor_part_way_through_reports_a_partial_update() {
+    let ring = ring_with_table(8, 3);
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let first = ScratchFile::with("qq_owned_part_a", b"first");
+    let third = ScratchFile::with("qq_owned_part_c", b"third");
+
+    // 9999 is not an open descriptor. The kernel installs the first entry,
+    // hits the bad one, and stops — reporting 1, which is positive.
+    let prepared = PreparedFilesUpdate::at(
+        slot(0),
+        [
+            TableEntry::Install(first.fd()),
+            TableEntry::Install(RawFd::from_raw(9999)),
+            TableEntry::Install(third.fd()),
+        ],
+        fd_array_store::<3>(),
+    )
+    .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_files_update(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+
+    // The raw result is positive, which the usual reading calls success.
+    assert!(done.raw_result() > 0, "expected a positive short count");
+    assert_eq!(
+        done.update(),
+        Update::Partial {
+            installed: 1,
+            requested: 3,
+        }
+    );
+    // The whole point: this is not a success.
+    assert!(!done.update().is_complete());
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_bad_descriptor_in_first_position_installs_nothing() {
+    let ring = ring_with_table(8, 2);
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let good = ScratchFile::with("qq_owned_part_first", b"good");
+
+    let prepared = PreparedFilesUpdate::at(
+        slot(0),
+        [
+            TableEntry::Install(RawFd::from_raw(9999)),
+            TableEntry::Install(good.fd()),
+        ],
+        fd_array_store::<2>(),
+    )
+    .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_files_update(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    // Failing on the very first entry is an errno rather than a count of
+    // zero, so `Partial` always means at least one slot changed.
+    assert_eq!(done.raw_result(), -9);
+    assert!(matches!(done.update(), Update::Failed(_)));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn an_update_running_past_the_table_installs_nothing() {
+    let ring = ring_with_table(8, 2);
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    // Two entries starting at slot 1 in a table of 2 leaves the table.
+    let prepared = PreparedFilesUpdate::at(
+        slot(1),
+        [TableEntry::Clear, TableEntry::Clear],
+        fd_array_store::<2>(),
+    )
+    .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_files_update(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(done.raw_result(), -22);
+    assert!(matches!(done.update(), Update::Failed(_)));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn an_update_without_a_registered_table_fails_rather_than_installing() {
+    let ring = crate::IoUring::new(8).expect("ring with no table");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let prepared = PreparedFilesUpdate::at(slot(0), [TableEntry::Clear], fd_array_store::<1>())
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_files_update(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(done.raw_result(), -6);
+    assert!(matches!(done.update(), Update::Failed(_)));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn clearing_a_slot_releases_what_the_table_held() {
+    let ring = ring_with_table(8, 1);
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let scratch = ScratchFile::with("qq_owned_clear", b"transient");
+
+    let install = PreparedFilesUpdate::at(
+        slot(0),
+        [TableEntry::Install(scratch.fd())],
+        fd_array_store::<1>(),
+    )
+    .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_files_update(install)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert!(done.update().is_complete());
+    let store = done.into_store();
+
+    // Clearing reuses the same storage the install came back with.
+    let clear = PreparedFilesUpdate::at(slot(0), [TableEntry::Clear], store)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    assert_eq!(clear.published(), [-1]);
+    let ticket = sub
+        .push_files_update(clear)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert!(done.update().is_complete());
+
+    // The slot is empty now, so an operation through it finds no file.
+    let mut buf = MmapBuffer::with_capacity(16).expect("map");
+    sub.raw()
+        .push(
+            unsafe {
+                crate::Sqe::read_ptr(RawFd::from_raw(0), buf.as_mut_slice().as_mut_ptr(), 9, 0)
+            }
+            .fixed_file()
+            .user_data(88),
+        )
+        .expect("push read");
+    sub.submit_and_wait(1).expect("submit");
+    let done = comp.wait_one().expect("completion");
+    assert!(
+        done.raw_result() < 0,
+        "a cleared slot must not still resolve to a file"
+    );
+
+    // Clearing the table's reference left the caller's handle alone.
+    let mut check = [0u8; 9];
+    scratch
+        .read_through_our_own_handle(&mut check)
+        .expect("the caller's descriptor is unaffected by a clear");
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_files_update_ticket_survives_moving_to_another_thread_before_completion() {
+    let ring = ring_with_table(8, 1);
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let scratch = ScratchFile::with("qq_owned_update_move", b"crossing");
+
+    let store = fd_array_store::<1>();
+    let addr = store.stable_ptr();
+    let prepared = PreparedFilesUpdate::at(slot(0), [TableEntry::Install(scratch.fd())], store)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_files_update(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit");
+
+    // The kernel may still be reading the array when the ticket moves.
+    let handle = std::thread::spawn(move || {
+        let receipt = comp.wait_one().expect("completion");
+        let done = ticket
+            .redeem(receipt)
+            .unwrap_or_else(|_| panic!("mismatch"));
+        done.into_parts()
+    });
+    let (update, store) = handle.join().expect("thread");
+    assert_eq!(update, Update::All { count: 1 });
+    assert_eq!(store.stable_ptr(), addr);
+}
+
+// ---------------------------------------------------------------
+// epoll_ctl
+// ---------------------------------------------------------------
+
+/// Storage for one `EpollEvent`.
+fn epoll_store() -> MmapBuffer {
+    MmapBuffer::with_capacity(core::mem::size_of::<EpollEvent>()).expect("map")
+}
+
+/// An epoll set, closed when the guard drops.
+#[cfg(not(miri))]
+struct EpollSet {
+    fd: RawFd,
+}
+
+#[cfg(not(miri))]
+impl EpollSet {
+    fn new() -> Self {
+        // SAFETY: a plain syscall with no pointer arguments.
+        let raw = unsafe { epoll_create1(0) };
+        assert!(raw >= 0, "epoll_create1 failed");
+        Self {
+            fd: RawFd::from_raw(raw.unsigned_abs() as usize),
+        }
+    }
+}
+
+#[cfg(not(miri))]
+impl Drop for EpollSet {
+    fn drop(&mut self) {
+        // SAFETY: this descriptor was created here and is closed once.
+        unsafe { close_fd(self.fd.as_i32()) };
+    }
+}
+
+#[cfg(not(miri))]
+unsafe extern "C" {
+    #[link_name = "epoll_create1"]
+    fn epoll_create1(flags: i32) -> i32;
+    #[link_name = "close"]
+    fn close_fd(fd: i32) -> i32;
+    #[link_name = "epoll_wait"]
+    fn epoll_wait(epfd: i32, events: *mut EpollEvent, maxevents: i32, timeout: i32) -> i32;
+}
+
+#[cfg(not(miri))]
+impl EpollSet {
+    /// Wait briefly for one event, returning what the kernel reported.
+    ///
+    /// This is what proves the staged mask and data actually reached the
+    /// kernel: a registration with a zeroed event still succeeds, so a
+    /// test that only checks the `Applied` outcome cannot tell a real
+    /// mask from a lost one.
+    fn wait_one(&self, timeout_ms: i32) -> Option<EpollEvent> {
+        let mut out = [EpollEvent::default(); 1];
+        // SAFETY: `out` is a live array of one `EpollEvent` and the count
+        // passed matches it.
+        let n = unsafe { epoll_wait(self.fd.as_i32(), out.as_mut_ptr(), 1, timeout_ms) };
+        (n > 0).then(|| out[0])
+    }
+}
+
+#[test]
+fn an_add_publishes_the_mask_and_data_the_kernel_reads() {
+    let prepared = PreparedEpollCtl::new(
+        RawFd::from_raw(3),
+        RawFd::from_raw(7),
+        EpollChange::Add {
+            events: EpollEvents::IN | EpollEvents::ET,
+            data: 0xDEAD_BEEF,
+        },
+        epoll_store(),
+    )
+    .unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    // `EpollEvent` is `repr(C, packed)`, so its fields are copied out
+    // rather than borrowed.
+    let published = prepared.published();
+    let (events, data) = (published.events, published.data);
+    assert_eq!(events, (EpollEvents::IN | EpollEvents::ET).bits());
+    assert_eq!(data, 0xDEAD_BEEF);
+}
+
+#[test]
+fn a_del_publishes_a_zeroed_event_because_the_kernel_reads_none() {
+    let prepared = PreparedEpollCtl::new(
+        RawFd::from_raw(3),
+        RawFd::from_raw(7),
+        EpollChange::Del,
+        epoll_store(),
+    )
+    .unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    // A `Del` with a null pointer succeeds against a real kernel, so there
+    // is nothing meaningful to stage — and `EpollChange::Del` carries no
+    // mask to stage, which is the point of splitting the enum.
+    let published = prepared.published();
+    let (events, data) = (published.events, published.data);
+    assert_eq!(events, 0);
+    assert_eq!(data, 0);
+}
+
+#[test]
+fn storage_too_small_for_an_event_is_rejected_with_it_handed_back() {
+    let store = MmapBuffer::with_capacity(core::mem::size_of::<EpollEvent>() - 1).expect("map");
+    let addr = store.stable_ptr();
+    let Err((returned, e)) = PreparedEpollCtl::new(
+        RawFd::from_raw(3),
+        RawFd::from_raw(7),
+        EpollChange::Del,
+        store,
+    ) else {
+        panic!("short storage must be refused");
+    };
+    assert_eq!(
+        e,
+        EpollError::StoreTooSmall {
+            needed: core::mem::size_of::<EpollEvent>(),
+            got: core::mem::size_of::<EpollEvent>() - 1,
+        }
+    );
+    assert_eq!(returned.stable_ptr(), addr);
+}
+
+#[test]
+fn each_registration_failure_is_named_rather_than_left_as_an_errno() {
+    // Both are ordinary outcomes of racing another thread on the same set,
+    // not programming errors, so neither is folded into a generic failure.
+    assert_eq!(
+        EpollOutcome::from_raw_for_test(-17),
+        EpollOutcome::AlreadyRegistered
+    );
+    assert_eq!(
+        EpollOutcome::from_raw_for_test(-2),
+        EpollOutcome::NotRegistered
+    );
+    assert_eq!(EpollOutcome::from_raw_for_test(0), EpollOutcome::Applied);
+    assert!(EpollOutcome::from_raw_for_test(0).is_applied());
+    assert!(!EpollOutcome::from_raw_for_test(-17).is_applied());
+    let failed = EpollOutcome::from_raw_for_test(-22);
+    assert!(matches!(failed, EpollOutcome::Failed(_)));
+}
+
+#[test]
+fn an_epoll_receipt_for_another_request_is_rejected() {
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut make = || {
+        let prepared = PreparedEpollCtl::new(
+            RawFd::from_raw(3),
+            RawFd::from_raw(7),
+            EpollChange::Del,
+            epoll_store(),
+        )
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+        sub.push_epoll_ctl(prepared)
+            .unwrap_or_else(|(_, e)| panic!("{e}"))
+    };
+    let first = make();
+    let second = make();
+
+    let foreign = Receipt {
+        ring: second.ring(),
+        id: second.id(),
+        result: 0,
+        flags: crate::types::CqeFlags::default(),
+    };
+    assert!(!first.matches(&foreign));
+    let Err((first, _)) = first.redeem(foreign) else {
+        panic!("a foreign receipt must not redeem");
+    };
+    drop((first, second));
+}
+
+#[test]
+fn an_epoll_push_that_does_not_fit_hands_the_storage_back() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let mut tickets = alloc_tickets(&mut sub);
+
+    let store = epoll_store();
+    let addr = store.stable_ptr();
+    let prepared = PreparedEpollCtl::new(
+        RawFd::from_raw(3),
+        RawFd::from_raw(7),
+        EpollChange::Add {
+            events: EpollEvents::OUT,
+            data: 99,
+        },
+        store,
+    )
+    .unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let Err((returned, e)) = sub.push_epoll_ctl(prepared) else {
+        panic!("a full queue must reject the push");
+    };
+    assert_eq!(e, Error::Submit(SubmitError::QueueFull));
+    // A retry must issue the same request, so the staged event survives.
+    let published = returned.published();
+    let (events, data) = (published.events, published.data);
+    assert_eq!(events, EpollEvents::OUT.bits());
+    assert_eq!(data, 99);
+    assert_eq!(returned.into_store().stable_ptr(), addr);
+    tickets.clear();
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_add_registers_and_a_second_one_reports_the_clash() {
+    let set = EpollSet::new();
+    let pair = SocketPair::connected();
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut run = |change| {
+        let prepared = PreparedEpollCtl::new(set.fd, pair.server, change, epoll_store())
+            .unwrap_or_else(|(_, e)| panic!("{e}"));
+        let ticket = sub
+            .push_epoll_ctl(prepared)
+            .unwrap_or_else(|(_, e)| panic!("{e}"));
+        sub.submit_and_wait(1).expect("submit");
+        let receipt = comp.wait_one().expect("completion");
+        ticket
+            .redeem(receipt)
+            .unwrap_or_else(|_| panic!("mismatch"))
+            .outcome()
+    };
+
+    let added = run(EpollChange::Add {
+        events: EpollEvents::IN,
+        data: 1,
+    });
+    assert_eq!(added, EpollOutcome::Applied);
+
+    // The second add proves the first one actually took effect, which a
+    // lone success could not.
+    let again = run(EpollChange::Add {
+        events: EpollEvents::IN,
+        data: 1,
+    });
+    assert_eq!(again, EpollOutcome::AlreadyRegistered);
+    assert!(!again.is_applied());
+}
+
+#[cfg(not(miri))]
+#[test]
+fn the_staged_mask_and_data_are_what_the_kernel_reports_back() {
+    let set = EpollSet::new();
+    let pair = SocketPair::connected();
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    // A registration with a zeroed event still reports `Applied`, so only
+    // watching the event fire distinguishes a mask that travelled from one
+    // that was dropped on the way.
+    let prepared = PreparedEpollCtl::new(
+        set.fd,
+        pair.server,
+        EpollChange::Add {
+            events: EpollEvents::IN,
+            data: 0x0BAD_F00D,
+        },
+        epoll_store(),
+    )
+    .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_epoll_ctl(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(done.outcome(), EpollOutcome::Applied);
+
+    // Nothing readable yet, so the mask has nothing to fire on.
+    assert!(
+        set.wait_one(0).is_none(),
+        "an idle socket must not be reported readable"
+    );
+
+    pair.write_client(b"wake");
+    let fired = set.wait_one(1_000).expect("the registration must fire");
+    let (events, data) = (fired.events, fired.data);
+    // The mask reached the kernel: it woke on readability specifically.
+    assert_ne!(events & EpollEvents::IN.bits(), 0);
+    // And so did the caller's own token, which is the only way to tell
+    // which registration this event belongs to.
+    assert_eq!(data, 0x0BAD_F00D);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_mod_of_an_unregistered_descriptor_is_told_apart_from_a_clash() {
+    let set = EpollSet::new();
+    let pair = SocketPair::connected();
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let prepared = PreparedEpollCtl::new(
+        set.fd,
+        pair.server,
+        EpollChange::Mod {
+            events: EpollEvents::OUT,
+            data: 5,
+        },
+        epoll_store(),
+    )
+    .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_epoll_ctl(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(done.raw_result(), -2);
+    assert_eq!(done.outcome(), EpollOutcome::NotRegistered);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_del_succeeds_without_the_kernel_reading_the_staged_event() {
+    let set = EpollSet::new();
+    let pair = SocketPair::connected();
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut run = |change| {
+        let prepared = PreparedEpollCtl::new(set.fd, pair.server, change, epoll_store())
+            .unwrap_or_else(|(_, e)| panic!("{e}"));
+        let ticket = sub
+            .push_epoll_ctl(prepared)
+            .unwrap_or_else(|(_, e)| panic!("{e}"));
+        sub.submit_and_wait(1).expect("submit");
+        let receipt = comp.wait_one().expect("completion");
+        ticket
+            .redeem(receipt)
+            .unwrap_or_else(|_| panic!("mismatch"))
+            .outcome()
+    };
+
+    assert_eq!(
+        run(EpollChange::Add {
+            events: EpollEvents::IN,
+            data: 1,
+        }),
+        EpollOutcome::Applied
+    );
+    // The `Del` stages a zeroed event and still works, which is why the
+    // enum does not ask for a mask here.
+    assert_eq!(run(EpollChange::Del), EpollOutcome::Applied);
+    // And now the descriptor really is gone, so a second Del cannot find
+    // it — proof the first one did something.
+    assert_eq!(run(EpollChange::Del), EpollOutcome::NotRegistered);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn an_epoll_ticket_survives_moving_to_another_thread_before_completion() {
+    let set = EpollSet::new();
+    let pair = SocketPair::connected();
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let store = epoll_store();
+    let addr = store.stable_ptr();
+    let prepared = PreparedEpollCtl::new(
+        set.fd,
+        pair.server,
+        EpollChange::Add {
+            events: EpollEvents::IN,
+            data: 0xABCD,
+        },
+        store,
+    )
+    .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_epoll_ctl(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit");
+
+    // The kernel may still be reading the event when the ticket moves.
+    let handle = std::thread::spawn(move || {
+        let receipt = comp.wait_one().expect("completion");
+        let done = ticket
+            .redeem(receipt)
+            .unwrap_or_else(|_| panic!("mismatch"));
+        done.into_parts()
+    });
+    let (outcome, store) = handle.join().expect("thread");
+    assert_eq!(outcome, EpollOutcome::Applied);
     assert_eq!(store.stable_ptr(), addr);
 }
