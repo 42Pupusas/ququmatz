@@ -1004,6 +1004,53 @@ The graph's back-edges include IoUring→builder/iterator, Completer→iterator,
 
 **Acceptance:** CI checks declared MSRV and supported kernels/targets; README snippets use the intended release series and are compiled; documentation agrees with trait assertions and safety tests.
 
+## Owned layer coverage
+
+The `owned` module implements the Phase 2 safe layer: a request takes
+ownership of the memory the kernel will touch, so no borrow has to outlive
+a call. Coverage below is measured, not inferred.
+
+Opcode totals come from `IORING_REGISTER_PROBE` on the development host
+(kernel 7.1.5): 65 opcodes supported, 43 reachable through `Sqe`
+constructors, 21 with owned wrappers.
+
+| Family | Owned type | Storage the request owns |
+|---|---|---|
+| read/write | `Prepared` | one buffer |
+| vectored | `PreparedVectored` | descriptor array plus buffers |
+| zero-copy send | `PreparedZeroCopy` | buffer held past the send CQE |
+| sendmsg/recvmsg | `PreparedSendmsg`, `PreparedRecvmsg` | header, descriptors, address |
+| openat/openat2 | `PreparedOpen`, `PreparedOpenat2` | path, `open_how` |
+| statx | `PreparedStatx` | path and destination struct |
+| unlink/mkdir/rename | `PreparedPathOp`, `PreparedRename` | one or two paths |
+| timeout | `PreparedTimeout` | `Timespec` |
+| epoll_ctl | `PreparedEpollCtl` | `EpollEvent` |
+| files_update | `PreparedFilesUpdate` | descriptor array |
+| bind/connect | `PreparedBind`, `PreparedConnect` | socket address |
+| accept, direct accept/open/socket | `PreparedAccept` and siblings | nothing; they yield fds or slots |
+
+`listen` has no owned twin because it reads no caller memory: the kernel
+takes the backlog from `len` and rejects a request carrying an address.
+
+### Still raw-only
+
+No pointer-bearing operation reachable through `Sqe` lacks an owned
+wrapper. Two shapes remain unmodelled, and both need a request *pair*
+rather than another request type:
+
+- **Linked timeouts.** `IOSQE_IO_LINK` requires the timeout SQE to be
+  submitted immediately after the operation it bounds. A per-request
+  `push` cannot express "these two are adjacent, in this order, or
+  neither goes"; either can be rejected alone and strand the link.
+- **Multishot `recvmsg`.** The kernel prepends an `io_uring_recvmsg_out`
+  to each provided buffer rather than using a caller header, so the
+  completion parses a header out of storage the ticket does not own.
+
+22 opcodes have no `Sqe` constructor at all; most postdate the `Opcode`
+enum, which stops at `SendZc = 47`. Notable absences: `SENDMSG_ZC`,
+`WAITID`, the `FUTEX_*` family, `EPOLL_WAIT`, `PIPE`, `FTRUNCATE`,
+`MSG_RING`, `SYMLINKAT`, `LINKAT`, and the four xattr operations.
+
 ## Additional investigations before a safety release
 
 These are follow-up review items, not additional demonstrated runtime defects:

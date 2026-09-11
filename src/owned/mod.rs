@@ -350,6 +350,7 @@
 mod accept;
 mod bind;
 mod buffer;
+mod connect;
 mod direct;
 mod direct_accept;
 mod direct_socket;
@@ -387,6 +388,7 @@ mod miri;
 pub use accept::{AcceptFinished, Incoming, MultishotAccept, PreparedAccept};
 pub use bind::{BindDone, BindError, BindOutcome, PendingBind, PreparedBind};
 pub use buffer::{MmapBuffer, StableBuffer, StableBufferMut};
+pub use connect::{ConnectDone, ConnectError, ConnectOutcome, PendingConnect, PreparedConnect};
 pub use direct::{DirectOpenError, DirectOpened, PendingDirectOpen, PreparedDirectOpen};
 pub use direct_accept::{DirectAccept, DirectAcceptFinished, DirectIncoming, PreparedDirectAccept};
 pub use direct_socket::{

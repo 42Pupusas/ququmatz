@@ -3,11 +3,12 @@
 extern crate std;
 
 use super::{
-    Arrival, BindError, BindOutcome, Completed, Count, Delivery, DirectIncoming, DirectOpenError,
-    DirectSlot, DirectSocketError, Direction, EpollChange, EpollError, EpollOutcome, Event, Expiry,
-    FilesUpdateError, Incoming, MmapBuffer, MsgRegionError, Openat2Error, Openat2Mode, OwnedPath,
-    PathError, PeerWanted, Pending, PendingStatx, PendingZc, Prepared, PreparedAccept,
-    PreparedBind, PreparedDirectAccept, PreparedDirectOpen, PreparedDirectSocket, PreparedEpollCtl,
+    Arrival, BindError, BindOutcome, Completed, ConnectError, ConnectOutcome, Count, Delivery,
+    DirectIncoming, DirectOpenError, DirectSlot, DirectSocketError, Direction, EpollChange,
+    EpollError, EpollOutcome, Event, Expiry, FilesUpdateError, Incoming, MmapBuffer,
+    MsgRegionError, Openat2Error, Openat2Mode, OwnedPath, PathError, PeerWanted, Pending,
+    PendingStatx, PendingZc, Prepared, PreparedAccept, PreparedBind, PreparedConnect,
+    PreparedDirectAccept, PreparedDirectOpen, PreparedDirectSocket, PreparedEpollCtl,
     PreparedFilesUpdate, PreparedMultishot, PreparedOpen, PreparedOpenat2, PreparedPathOp,
     PreparedRecvmsg, PreparedRename, PreparedSendmsg, PreparedStatx, PreparedTimeout,
     PreparedVectored, PreparedZc, Receipt, RenameMode, RingId, SendTarget, SlotIndex, SlotTarget,
@@ -377,10 +378,21 @@ struct Listener {
 
 impl Listener {
     fn bound() -> Self {
+        Self::with_type(crate::types::SOCK_STREAM)
+    }
+
+    /// A listener whose `accept` fails with `EAGAIN` instead of blocking
+    /// when nothing is pending, so a test asserting that a connection
+    /// arrived fails rather than hangs when it did not.
+    fn bound_nonblocking() -> Self {
+        Self::with_type(crate::types::SOCK_STREAM | crate::types::SOCK_NONBLOCK)
+    }
+
+    fn with_type(sock_type: i32) -> Self {
         use crate::syscall;
         use crate::types::{self, SockAddrIn};
 
-        let fd = syscall::socket(types::AF_INET, types::SOCK_STREAM, 0).expect("listener");
+        let fd = syscall::socket(types::AF_INET, sock_type, 0).expect("listener");
         let one: i32 = 1;
         syscall::setsockopt(
             fd,
@@ -6180,5 +6192,283 @@ fn an_epoll_ticket_survives_moving_to_another_thread_before_completion() {
     });
     let (outcome, store) = handle.join().expect("thread");
     assert_eq!(outcome, EpollOutcome::Applied);
+    assert_eq!(store.stable_ptr(), addr);
+}
+
+// ---------------------------------------------------------------
+// connect
+// ---------------------------------------------------------------
+
+#[test]
+fn a_connect_publishes_its_address_before_any_sqe_names_it() {
+    let prepared = PreparedConnect::new(RawFd::from_raw(3), loopback(8080), bind_store())
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    assert_eq!(prepared.published(), loopback(8080).to_bytes());
+    assert_eq!(prepared.addr(), loopback(8080));
+}
+
+#[test]
+fn storage_too_small_for_a_connect_address_is_rejected_with_it_handed_back() {
+    let store = MmapBuffer::with_capacity(core::mem::size_of::<SockAddrIn>() - 1).expect("map");
+    let addr = store.stable_ptr();
+    let Err((returned, e)) = PreparedConnect::new(RawFd::from_raw(3), loopback(0), store) else {
+        panic!("short storage must be refused");
+    };
+    assert_eq!(
+        e,
+        ConnectError::StoreTooSmall {
+            needed: core::mem::size_of::<SockAddrIn>(),
+            got: core::mem::size_of::<SockAddrIn>() - 1,
+        }
+    );
+    assert_eq!(returned.stable_ptr(), addr);
+}
+
+#[test]
+fn each_connect_failure_is_named_rather_than_left_as_an_errno() {
+    // Measured against a real kernel; see the module docs for the table.
+    assert_eq!(
+        ConnectOutcome::from_raw_for_test(0),
+        ConnectOutcome::Connected
+    );
+    assert_eq!(
+        ConnectOutcome::from_raw_for_test(-111),
+        ConnectOutcome::ConnectionRefused
+    );
+    assert_eq!(
+        ConnectOutcome::from_raw_for_test(-106),
+        ConnectOutcome::AlreadyConnected
+    );
+    assert_eq!(
+        ConnectOutcome::from_raw_for_test(-110),
+        ConnectOutcome::TimedOut
+    );
+    assert_eq!(
+        ConnectOutcome::from_raw_for_test(-101),
+        ConnectOutcome::NetworkUnreachable
+    );
+    // Anything else keeps its errno rather than being flattened.
+    assert_eq!(
+        ConnectOutcome::from_raw_for_test(-97),
+        ConnectOutcome::Failed(crate::error::Errno::new(97))
+    );
+    assert!(ConnectOutcome::from_raw_for_test(0).is_connected());
+    assert!(!ConnectOutcome::from_raw_for_test(-111).is_connected());
+}
+
+#[test]
+fn a_connect_push_that_does_not_fit_hands_the_address_back() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let mut tickets = alloc_tickets(&mut sub);
+
+    let store = bind_store();
+    let addr = store.stable_ptr();
+    let prepared = PreparedConnect::new(RawFd::from_raw(3), loopback(8080), store)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let Err((returned, e)) = sub.push_connect(prepared) else {
+        panic!("a full queue must reject the push");
+    };
+    assert_eq!(e, Error::Submit(SubmitError::QueueFull));
+    assert_eq!(returned.published(), loopback(8080).to_bytes());
+    assert_eq!(returned.into_store().stable_ptr(), addr);
+    tickets.clear();
+}
+
+#[test]
+fn a_foreign_receipt_cannot_redeem_a_connect_ticket() {
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let mut make = || {
+        let prepared = PreparedConnect::new(RawFd::from_raw(3), loopback(0), bind_store())
+            .unwrap_or_else(|(_, e)| panic!("{e}"));
+        sub.push_connect(prepared)
+            .unwrap_or_else(|(_, e)| panic!("{e}"))
+    };
+    let first = make();
+    let second = make();
+
+    let foreign = Receipt {
+        ring: second.ring(),
+        id: second.id(),
+        result: 0,
+        flags: crate::types::CqeFlags::default(),
+    };
+    assert!(!first.matches(&foreign));
+    let Err((first, _)) = first.redeem(foreign) else {
+        panic!("a foreign receipt must not redeem");
+    };
+    drop((first, second));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_connect_reaches_the_listener_it_named() {
+    // Asserting `Connected` proves only that the kernel liked the
+    // encoding: connecting to the wrong address can succeed too. The
+    // effect worth checking is which listener answered, so this accepts
+    // the connection and exchanges a byte over it. The listener is
+    // non-blocking: if the connect went elsewhere, `accept4` must report
+    // `EAGAIN` rather than wait forever for a connection that never comes.
+    let listener = Listener::bound_nonblocking();
+    let sock = Socket::with_typed_flags(
+        AddressFamily::Inet,
+        SocketType::Stream,
+        0,
+        SocketFlags::default(),
+    )
+    .expect("socket");
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let prepared = PreparedConnect::new(sock.fd(), listener.addr, bind_store())
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_connect(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit");
+    let done = ticket
+        .redeem(comp.wait_one().expect("completion"))
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(done.outcome(), ConnectOutcome::Connected);
+
+    // The listener must have a pending connection, and it must be ours.
+    let accepted =
+        crate::syscall::accept4(listener.fd, core::ptr::null_mut(), core::ptr::null_mut(), 0)
+            .expect("the connect must have reached this listener");
+    let msg = b"nyaa";
+    crate::syscall::write(sock.fd(), msg.as_ptr(), msg.len()).expect("write");
+    let mut got = [0u8; 4];
+    let n = crate::syscall::read(accepted, got.as_mut_ptr(), got.len()).expect("read");
+    assert_eq!(n, 4);
+    assert_eq!(
+        &got, msg,
+        "bytes must arrive at the listener that was named"
+    );
+    crate::syscall::close(accepted).expect("close");
+}
+
+#[cfg(not(miri))]
+#[test]
+fn connecting_a_second_time_is_told_apart_from_a_refused_connection() {
+    // Both are plain negative results; only the named outcomes say which
+    // retry, if any, could succeed.
+    let listener = Listener::bound();
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let sock = Socket::with_typed_flags(
+        AddressFamily::Inet,
+        SocketType::Stream,
+        0,
+        SocketFlags::default(),
+    )
+    .expect("socket");
+
+    let mut run = |fd: RawFd, addr: SockAddrIn| {
+        let prepared =
+            PreparedConnect::new(fd, addr, bind_store()).unwrap_or_else(|(_, e)| panic!("{e}"));
+        let ticket = sub
+            .push_connect(prepared)
+            .unwrap_or_else(|(_, e)| panic!("{e}"));
+        sub.submit().expect("submit");
+        ticket
+            .redeem(comp.wait_one().expect("completion"))
+            .unwrap_or_else(|_| panic!("mismatch"))
+            .outcome()
+    };
+
+    assert_eq!(run(sock.fd(), listener.addr), ConnectOutcome::Connected);
+    assert_eq!(
+        run(sock.fd(), listener.addr),
+        ConnectOutcome::AlreadyConnected,
+        "a second connect reports EISCONN, not EALREADY"
+    );
+
+    // A port nothing listens on is a different story with a different
+    // remedy: retrying can succeed once something binds it.
+    let mut dead = listener.addr;
+    dead.sin_port = 1u16.to_be();
+    let other = Socket::with_typed_flags(
+        AddressFamily::Inet,
+        SocketType::Stream,
+        0,
+        SocketFlags::default(),
+    )
+    .expect("socket");
+    assert_eq!(
+        run(other.fd(), dead),
+        ConnectOutcome::ConnectionRefused,
+        "a dead port reports ECONNREFUSED"
+    );
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_nonblocking_socket_still_reports_a_resolved_connect() {
+    // connect(2) would report EINPROGRESS here and leave the caller to
+    // poll. io_uring arms the poll itself, so the CQE does not arrive
+    // until the handshake resolved. This is why ConnectOutcome has no
+    // InProgress variant.
+    let listener = Listener::bound();
+    let sock = Socket::with_typed_flags(
+        AddressFamily::Inet,
+        SocketType::Stream,
+        0,
+        SocketFlags::NONBLOCK,
+    )
+    .expect("socket");
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let prepared = PreparedConnect::new(sock.fd(), listener.addr, bind_store())
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_connect(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit");
+    let done = ticket
+        .redeem(comp.wait_one().expect("completion"))
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(
+        done.outcome(),
+        ConnectOutcome::Connected,
+        "a nonblocking socket must not surface EINPROGRESS"
+    );
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_connect_ticket_survives_moving_to_another_thread_before_completion() {
+    let listener = Listener::bound();
+    let sock = Socket::with_typed_flags(
+        AddressFamily::Inet,
+        SocketType::Stream,
+        0,
+        SocketFlags::default(),
+    )
+    .expect("socket");
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let store = bind_store();
+    let addr = store.stable_ptr();
+    let prepared = PreparedConnect::new(sock.fd(), listener.addr, store)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_connect(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit");
+
+    // The kernel may still be reading the address when the ticket moves.
+    let handle = std::thread::spawn(move || {
+        let receipt = comp.wait_one().expect("completion");
+        let done = ticket
+            .redeem(receipt)
+            .unwrap_or_else(|_| panic!("mismatch"));
+        done.into_parts()
+    });
+    let (outcome, store) = handle.join().expect("thread");
+    assert_eq!(outcome, ConnectOutcome::Connected);
     assert_eq!(store.stable_ptr(), addr);
 }

@@ -3,6 +3,7 @@
 use super::accept::{MultishotAccept, PreparedAccept};
 use super::bind::{PendingBind, PreparedBind};
 use super::buffer::{StableBuffer, StableBufferMut};
+use super::connect::{PendingConnect, PreparedConnect};
 use super::direct::{PendingDirectOpen, PreparedDirectOpen};
 use super::direct_accept::{DirectAccept, PreparedDirectAccept};
 use super::direct_socket::{PendingDirectSocket, PreparedDirectSocket};
@@ -493,6 +494,43 @@ impl OwnedSubmitter {
 
     /// Undo a `bind` push that the kernel never observed.
     fn reclaim_bind<S: StableBufferMut>(pending: PendingBind<S>) -> PreparedBind<S> {
+        // SAFETY: only reached when `Submitter::push` reported the queue was
+        // full, which happens before the SQE is written or the tail is
+        // advanced. No kernel-visible pointer to the storage exists.
+        unsafe { pending.reclaim_unsubmitted() }
+    }
+
+    /// Queue a `connect`, taking ownership of its address storage.
+    ///
+    /// The kernel copies the address during `io_uring_enter`, but under
+    /// SQPOLL the submitting thread never enters the kernel, so the
+    /// storage is owned until the completion like every other request.
+    ///
+    /// The completion does not arrive until the handshake resolves: a
+    /// socket created with `SOCK_NONBLOCK` reports `0` rather than
+    /// `EINPROGRESS`, and an address nothing answers for keeps the request
+    /// in flight until the kernel gives up.
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact,
+    /// still owning its storage.
+    pub fn push_connect<S: StableBufferMut>(
+        &mut self,
+        request: PreparedConnect<S>,
+    ) -> Result<PendingConnect<S>, (PreparedConnect<S>, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            // The SQE never became kernel-visible, so the kernel never saw
+            // the address pointer and reclaiming the storage is sound.
+            Err(e) => Err((Self::reclaim_connect(pending), e)),
+        }
+    }
+
+    /// Undo a `connect` push that the kernel never observed.
+    fn reclaim_connect<S: StableBufferMut>(pending: PendingConnect<S>) -> PreparedConnect<S> {
         // SAFETY: only reached when `Submitter::push` reported the queue was
         // full, which happens before the SQE is written or the tail is
         // advanced. No kernel-visible pointer to the storage exists.

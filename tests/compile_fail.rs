@@ -208,6 +208,17 @@ fn an_in_flight_sock_addr_hides_both_its_bytes_and_its_outcome() {
     t.compile_fail("tests/ui/a_bind_ticket_must_be_kept.rs");
 }
 
+/// A `connect` borrows the socket and owns only the address, on exactly
+/// `bind`'s terms. The outcome is unreadable early for a sharper reason:
+/// `io_uring` arms a poll and retries internally, so no `EINPROGRESS` ever
+/// surfaces and the CQE arrives only once the handshake has resolved.
+#[test]
+fn an_in_flight_connect_addr_hides_both_its_bytes_and_its_outcome() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/an_in_flight_connect_addr_is_unreachable.rs");
+    t.compile_fail("tests/ui/a_connect_ticket_must_be_kept.rs");
+}
+
 /// An `epoll_ctl` borrows both descriptors and owns only the event the
 /// kernel reads — and for a `Del` it reads none at all. The storage is
 /// still unreachable in flight, because nothing in the SQE distinguishes

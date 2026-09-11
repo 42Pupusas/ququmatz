@@ -19,6 +19,7 @@ use std::boxed::Box;
 use std::vec::Vec;
 
 use super::bind::{BindOutcome, PendingBind, PreparedBind};
+use super::connect::{ConnectOutcome, PendingConnect, PreparedConnect};
 use super::direct::{PendingDirectOpen, PreparedDirectOpen};
 use super::epoll::{EpollChange, EpollOutcome, PendingEpollCtl, PreparedEpollCtl};
 use super::event::PartialReceipt;
@@ -398,6 +399,14 @@ impl Lifecycle {
         &self,
         prepared: PreparedBind<S>,
     ) -> (FakeKernel, PendingBind<S>) {
+        let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
+        (FakeKernel::holding(sqe), pending)
+    }
+
+    fn submit_connect<S: StableBufferMut>(
+        &self,
+        prepared: PreparedConnect<S>,
+    ) -> (FakeKernel, PendingConnect<S>) {
         let (sqe, pending) = prepared.into_pending(self.ring, self.ids.next());
         (FakeKernel::holding(sqe), pending)
     }
@@ -2883,6 +2892,85 @@ fn reclaiming_an_unpublished_bind_returns_the_storage_and_its_address() {
     let prepared = unsafe { pending.reclaim_unsubmitted() };
     // A retry must issue the same request, so the address and its
     // published bytes both have to survive.
+    assert_eq!(prepared.addr(), miri_loopback(1234));
+    assert_eq!(prepared.published(), miri_loopback(1234).to_bytes());
+    drop(prepared.into_store());
+}
+
+#[test]
+fn the_kernel_reads_a_connect_address_from_storage_the_ticket_owns() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedConnect::new(RawFd::from_raw(3), miri_loopback(8080), bind_addr_store())
+        .ok()
+        .expect("storage fits");
+    let (kernel, pending) = cycle.submit_connect(prepared);
+
+    assert_eq!(kernel.read_sock_addr(), miri_loopback(8080).to_bytes());
+    assert_eq!(
+        kernel.published_addr_len(),
+        core::mem::size_of::<SockAddrIn>() as u64
+    );
+
+    let receipt = kernel.post_status(cycle.ring, 0);
+    let done = pending.redeem(receipt).ok().expect("receipt matches");
+    assert_eq!(done.outcome(), ConnectOutcome::Connected);
+    drop(done.into_store());
+}
+
+#[test]
+fn a_connect_address_survives_the_ticket_moving_between_owners() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedConnect::new(RawFd::from_raw(3), miri_loopback(443), bind_addr_store())
+        .ok()
+        .expect("storage fits");
+    let (kernel, pending) = cycle.submit_connect(prepared);
+
+    // The ticket is meant to cross to a completion thread, so the address
+    // must not ride inline where moving would relocate it.
+    let pending = Box::new(pending);
+    let pending = core::hint::black_box(pending);
+    let pending = *pending;
+
+    assert_eq!(kernel.read_sock_addr(), miri_loopback(443).to_bytes());
+
+    let receipt = kernel.post_status(cycle.ring, 0);
+    let done = pending.redeem(receipt).ok().expect("receipt matches");
+    drop(done.into_store());
+}
+
+#[test]
+fn abandoning_a_connect_leaks_rather_than_freeing_the_address() {
+    let cycle = Lifecycle::new();
+    let store = bind_addr_store();
+    let addr = store.stable_ptr();
+    let prepared = PreparedConnect::new(RawFd::from_raw(3), miri_loopback(9999), store)
+        .ok()
+        .expect("storage fits");
+    let (kernel, pending) = cycle.submit_connect(prepared);
+
+    // Under SQPOLL nothing proves the kernel has copied the address yet,
+    // so dropping the ticket must leak rather than free it.
+    drop(pending);
+    assert_eq!(kernel.read_sock_addr(), miri_loopback(9999).to_bytes());
+
+    // SAFETY: the leak above is deliberate; the stand-in kernel has
+    // finished and nothing else references this allocation.
+    unsafe {
+        HeapBuffer::reclaim_leaked(addr.cast_mut(), core::mem::size_of::<SockAddrIn>());
+    }
+}
+
+#[test]
+fn reclaiming_an_unpublished_connect_returns_the_storage_and_its_address() {
+    let cycle = Lifecycle::new();
+    let prepared = PreparedConnect::new(RawFd::from_raw(3), miri_loopback(1234), bind_addr_store())
+        .ok()
+        .expect("storage fits");
+    let (_kernel, pending) = cycle.submit_connect(prepared);
+
+    // SAFETY: this stands in for a rejected push, so the SQE was built but
+    // never made visible to any kernel and the storage is unreferenced.
+    let prepared = unsafe { pending.reclaim_unsubmitted() };
     assert_eq!(prepared.addr(), miri_loopback(1234));
     assert_eq!(prepared.published(), miri_loopback(1234).to_bytes());
     drop(prepared.into_store());

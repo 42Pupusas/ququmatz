@@ -1,0 +1,17 @@
+error[E0599]: no method named `published` found for struct `PendingConnect<S>` in the current scope
+  --> tests/ui/an_in_flight_connect_addr_is_unreachable.rs:12:20
+   |
+12 |     let _ = ticket.published();
+   |                    ^^^^^^^^^ method not found in `PendingConnect<MmapBuffer>`
+
+error[E0599]: no method named `into_store` found for struct `PendingConnect<S>` in the current scope
+  --> tests/ui/an_in_flight_connect_addr_is_unreachable.rs:18:20
+   |
+18 |     let _ = ticket.into_store();
+   |                    ^^^^^^^^^^ method not found in `PendingConnect<MmapBuffer>`
+
+error[E0599]: no method named `outcome` found for struct `PendingConnect<S>` in the current scope
+  --> tests/ui/an_in_flight_connect_addr_is_unreachable.rs:25:20
+   |
+25 |     let _ = ticket.outcome();
+   |                    ^^^^^^^ method not found in `PendingConnect<MmapBuffer>`
