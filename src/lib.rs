@@ -1,10 +1,24 @@
 #![no_std]
-#![cfg(any(
+
+#[cfg(not(target_os = "linux"))]
+compile_error!(
+    "ququmatz issues raw syscalls by number and only Linux assigns those numbers. \
+     Other systems reuse them for unrelated calls: on FreeBSD amd64, which shares \
+     this target_arch, number 1 is _exit and 3 is read, so a write would terminate \
+     the process. Build for a *-linux-* target."
+);
+
+#[cfg(not(any(
     target_arch = "x86_64",
     target_arch = "aarch64",
     target_arch = "riscv64",
     target_arch = "arm"
-))]
+)))]
+compile_error!(
+    "ququmatz has no syscall table for this architecture. Linux numbers its \
+     syscalls per-architecture, so one must be written and verified rather than \
+     inherited. Supported: x86_64, aarch64, riscv64, arm."
+);
 
 mod error;
 pub mod eventfd;

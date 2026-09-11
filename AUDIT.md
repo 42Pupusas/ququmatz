@@ -958,6 +958,26 @@ Linux enforces the designated issuer for SINGLE_ISSUER and the submitting/creati
 
 **Acceptance:** per-target size, alignment, and field-offset assertions; cross-compilation plus execution on x86_64, aarch64, riscv64, and ARM if retained; synthetic high-bit successful syscall-return tests; checked arithmetic boundary tests; non-Linux build rejection. Treat cross-compilation alone as insufficient ABI proof.
 
+**Partially remediated.** The OS gate is in place. `src/lib.rs` now raises
+`compile_error!` on a non-Linux target and on an architecture with no
+syscall table, replacing the `#![cfg(...)]` that silently produced an
+empty crate.
+
+The hazard was concrete rather than theoretical. FreeBSD amd64 shares
+`target_arch = "x86_64"`, and its `syscalls.master` assigns 1 to `_exit`,
+3 to `read`, and 9 to `link`, where this crate's table has `write`,
+`close`, and `mmap`. Under the old gate a FreeBSD build produced a crate
+with no items, so nothing fired; but the numbers are what any caller
+reaching them would have invoked, and `write` would have terminated the
+process. Verified by building for `wasm32-unknown-unknown`, where both
+messages appear.
+
+Still open under Q-09: `MsgHdr` and the epoll structs remain hard-coded
+to the x86_64 ABI, layout tests assert 64-bit sizes unconditionally, and
+an x86_64 asm helper in the test module breaks `--all-targets` on
+aarch64. Those need per-target layouts and execution on real hardware,
+not another gate.
+
 ### Q-10 — Setup allocation failure leaks a separately mapped CQ
 
 **Status: confirmed conditional error-path defect.**
