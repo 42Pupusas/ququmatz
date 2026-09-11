@@ -328,10 +328,12 @@ mod echo_roundtrip_concurrent {
         });
     }
 
-    /// Describes one submitted batch on the [`ququmatz_split`] bench: which
-    /// phase it belongs to and how many completions to wait for.
+    /// Describes one submitted batch on the [`ququmatz_split`] bench: how
+    /// many completions the main thread should wait for. Which phase it
+    /// belongs to is implicit in call order -- the main thread always
+    /// waits for a recv ticket before a send ticket -- so the ticket
+    /// itself carries only the count.
     struct SplitTicket {
-        phase: SplitPhase,
         count: u32,
     }
 
@@ -384,60 +386,63 @@ mod echo_roundtrip_concurrent {
             self.submitter.submit().unwrap();
         }
 
-        const fn ticket(&self, phase: SplitPhase) -> SplitTicket {
+        const fn ticket(&self) -> SplitTicket {
             SplitTicket {
-                phase,
                 count: self.server_fds.len() as u32,
             }
         }
     }
 
-    /// The completion-thread half of [`ququmatz_split`]: owns the
-    /// `Completer` and reports recv byte counts back through `lens_tx`.
+    /// The completion side of [`ququmatz_split`]: owns the `Completer` and
+    /// drains one phase's CQEs. Runs on the main (bench) thread rather
+    /// than a third spawned thread -- the bench closure already has to
+    /// block until the round trip finishes, so it is the natural place to
+    /// drain completions rather than parking a third thread on a signal
+    /// from whichever thread did.
     struct SplitCompleteWorker {
         completer: ququmatz::Completer,
-        lens_tx: std::sync::mpsc::Sender<Vec<u32>>,
-        done_tx: std::sync::mpsc::Sender<()>,
     }
 
     impl SplitCompleteWorker {
-        fn handle(&mut self, ticket: &SplitTicket) {
+        fn recv_lens(&mut self, ticket: &SplitTicket) -> Vec<u32> {
             self.completer.wait(ticket.count).unwrap();
-            match ticket.phase {
-                SplitPhase::Recv => {
-                    let mut lens = vec![0u32; ticket.count as usize];
-                    for c in self.completer.completions() {
-                        lens[c.user_data as usize] = c.into_result().unwrap();
-                    }
-                    self.completer.sync_cq();
-                    self.lens_tx.send(lens).expect("submit thread alive");
-                }
-                SplitPhase::Send => {
-                    for c in self.completer.completions() {
-                        divan::black_box(c.into_result().unwrap());
-                    }
-                    self.completer.sync_cq();
-                    self.done_tx.send(()).expect("main thread alive");
-                }
+            let mut lens = vec![0u32; ticket.count as usize];
+            for c in self.completer.completions() {
+                lens[c.user_data as usize] = c.into_result().unwrap();
             }
+            self.completer.sync_cq();
+            lens
+        }
+
+        fn drain_sends(&mut self, ticket: &SplitTicket) {
+            self.completer.wait(ticket.count).unwrap();
+            for c in self.completer.completions() {
+                divan::black_box(c.into_result().unwrap());
+            }
+            self.completer.sync_cq();
         }
     }
 
-    /// A submitter/completer split across two persistent OS threads, wired
-    /// by a `quetzalcoatl` SPSC ring instead of a channel from `std`. The
+    /// A submitter/completer split across exactly one spawned thread plus
+    /// the main (bench) thread, wired end to end by `quetzalcoatl` SPSC
+    /// rings -- no `std::sync::mpsc` anywhere in the hot path. The
     /// submission thread pushes and submits each phase's SQEs, then hands
-    /// the completion thread a ticket describing what to wait for; the
-    /// completion thread reaps that phase's CQEs and reports the recv byte
-    /// counts back so the submission thread can build the send phase. This
+    /// the main thread a ticket describing what to wait for over one ring;
+    /// the main thread -- which owns the `Completer` -- reaps that phase's
+    /// CQEs directly and, for the recv phase, reports the byte counts back
+    /// over a second ring so the submission thread can build the send
+    /// phase. Using the bench thread itself as the completion side avoids
+    /// both a third spawned thread and the extra "done" signal it would
+    /// need: the main thread already has to block until the round trip
+    /// finishes, so it might as well be the one draining completions. This
     /// is the shape `ququmatz_split` in `comparison.rs` only gestures at by
-    /// calling `Submitter`/`Completer` from one thread -- here they
-    /// genuinely live on separate threads for the whole benchmark, not
-    /// just per call.
+    /// calling `Submitter`/`Completer` from one thread -- here the
+    /// submitter genuinely lives on its own thread for the whole
+    /// benchmark, not just per call.
     #[divan::bench(args = CONCURRENCY)]
     fn ququmatz_split(bencher: divan::Bencher, k: usize) {
         use quetzalcoatl::capacity::Capacity;
         use quetzalcoatl::spsc::RingBuffer;
-        use std::sync::mpsc as std_mpsc;
 
         let mut pairs = connected_pairs(k);
         let ring = IoUring::new((k * 2).max(8) as u32).expect("setup");
@@ -449,10 +454,9 @@ mod echo_roundtrip_concurrent {
         };
         let server_fds: Vec<i32> = pairs.iter().map(|(_, fd)| *fd).collect();
 
+        let (go_tx, mut go_rx) = RingBuffer::<()>::new(Capacity::exact(4)).split();
         let (ticket_tx, mut ticket_rx) = RingBuffer::<SplitTicket>::new(Capacity::exact(4)).split();
-        let (go_tx, go_rx) = std_mpsc::channel::<()>();
-        let (lens_tx, lens_rx) = std_mpsc::channel::<Vec<u32>>();
-        let (done_tx, done_rx) = std_mpsc::channel::<()>();
+        let (lens_tx, mut lens_rx) = RingBuffer::<Vec<u32>>::new(Capacity::exact(4)).split();
 
         let submit_thread = thread::spawn(move || {
             let mut worker = SplitSubmitWorker {
@@ -460,51 +464,49 @@ mod echo_roundtrip_concurrent {
                 server_fds,
                 recv_bufs: recv_bufs_raw,
             };
-            while go_rx.recv().is_ok() {
+            while go_rx.pop_block().is_some() {
                 worker.push_phase(SplitPhase::Recv, &[]);
                 ticket_tx
-                    .push(worker.ticket(SplitPhase::Recv))
-                    .unwrap_or_else(|_| panic!("ticket ring full"));
+                    .push_block(worker.ticket())
+                    .unwrap_or_else(|_| panic!("main thread gone"));
 
-                let lens = lens_rx.recv().expect("completion thread alive");
+                let lens = lens_rx.pop_block().expect("main thread alive");
 
                 worker.push_phase(SplitPhase::Send, &lens);
                 ticket_tx
-                    .push(worker.ticket(SplitPhase::Send))
-                    .unwrap_or_else(|_| panic!("ticket ring full"));
+                    .push_block(worker.ticket())
+                    .unwrap_or_else(|_| panic!("main thread gone"));
             }
             worker.submitter
         });
 
-        let complete_thread = thread::spawn(move || {
-            let mut worker = SplitCompleteWorker {
-                completer,
-                lens_tx,
-                done_tx,
-            };
-            while let Some(ticket) = ticket_rx.pop_block() {
-                worker.handle(&ticket);
-            }
-            worker.completer
-        });
+        let mut complete = SplitCompleteWorker { completer };
 
         bencher.bench_local(|| {
             for (client, _) in &mut pairs {
                 client.write_all(REQUEST).unwrap();
             }
-            go_tx.send(()).expect("submit thread alive");
-            done_rx.recv().expect("completion thread alive");
+            go_tx.push_block(()).expect("submit thread alive");
 
-            for (client, _) in &mut pairs {
+            let recv_ticket = ticket_rx.pop_block().expect("submit thread alive");
+            let lens = complete.recv_lens(&recv_ticket);
+            lens_tx
+                .push_block(lens.clone())
+                .expect("submit thread alive");
+
+            let send_ticket = ticket_rx.pop_block().expect("submit thread alive");
+            complete.drain_sends(&send_ticket);
+
+            for (i, (client, _)) in pairs.iter_mut().enumerate() {
+                let n = lens[i] as usize;
                 let mut reply_buf = [0u8; 256];
-                client.read_exact(&mut reply_buf[..REQUEST.len()]).unwrap();
-                assert_eq!(&reply_buf[..REQUEST.len()], REQUEST);
+                client.read_exact(&mut reply_buf[..n]).unwrap();
+                assert_eq!(&reply_buf[..n], REQUEST);
             }
         });
 
         drop(go_tx);
         let _submitter = submit_thread.join().expect("submit thread");
-        let _completer = complete_thread.join().expect("complete thread");
     }
 
     /// `k` OS threads, each blocking on its own connection with plain

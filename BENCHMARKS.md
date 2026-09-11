@@ -89,14 +89,19 @@ concurrency is high enough for thread-wakeup and scheduler overhead to
 matter. `K` sweeps 1/8/32/128 so the crossover, if any, is visible rather
 than asserted.
 
-`ququmatz_split` is `ququmatz`'s `IoUring::split()` driven by two
-persistent OS threads instead of one: a submission thread holds the
-`Submitter` and pushes/submits each phase's SQEs, a completion thread
-holds the `Completer` and reaps that phase's CQEs, and the two
-communicate through a `quetzalcoatl` SPSC ring carrying a small "ticket"
-(which phase, how many completions to wait for) plus a `std::sync::mpsc`
-channel carrying the recv byte counts the send phase needs. This is
-genuinely cross-thread for the whole benchmark, not per call — unlike
+`ququmatz_split` is `ququmatz`'s `IoUring::split()` driven by one
+spawned submission thread plus the benchmark's own thread as the
+completion side: the submission thread holds the `Submitter` and
+pushes/submits each phase's SQEs, the bench thread holds the `Completer`
+and reaps that phase's CQEs directly (it already has to block until the
+round trip finishes, so it is the natural place to drain completions
+rather than a third thread parking on a signal from whoever did). The
+two communicate entirely through `quetzalcoatl` SPSC rings — no
+`std::sync::mpsc` anywhere in the hot path: one ring carries a "go"
+signal and per-phase "ticket" (how many completions to wait for) from
+the bench thread to the submission thread and back, and a second ring
+carries the recv byte counts the send phase needs. This is genuinely
+cross-thread for the whole benchmark, not per call — unlike
 `ququmatz_split` in `benches/comparison.rs`, which calls `Submitter`/
 `Completer` from a single thread and only exercises the split API's
 shape, not its cross-thread cost.
@@ -105,32 +110,32 @@ shape, not its cross-thread cost.
 realistic                     fastest       │ slowest       │ median        │ mean          │ samples │ iters
 ╰─ echo_roundtrip_concurrent                │               │               │               │         │
    ├─ io_uring                              │               │               │               │         │
-   │  ├─ 1                    9.116 µs      │ 33.74 µs      │ 9.196 µs      │ 9.586 µs      │ 100     │ 100
-   │  ├─ 8                    61.73 µs      │ 108.2 µs      │ 62.16 µs      │ 63.21 µs      │ 100     │ 100
-   │  ├─ 32                   243.3 µs      │ 421.1 µs      │ 247.8 µs      │ 252.4 µs      │ 100     │ 100
-   │  ╰─ 128                  995.4 µs      │ 1.612 ms      │ 1.02 ms       │ 1.034 ms      │ 100     │ 100
+   │  ├─ 1                    8.958 µs      │ 37.49 µs      │ 9.058 µs      │ 9.626 µs      │ 100     │ 100
+   │  ├─ 8                    61.35 µs      │ 110 µs        │ 61.7 µs       │ 65.53 µs      │ 100     │ 100
+   │  ├─ 32                   243.2 µs      │ 414.8 µs      │ 246.1 µs      │ 251.3 µs      │ 100     │ 100
+   │  ╰─ 128                  993.6 µs      │ 1.607 ms      │ 1.021 ms      │ 1.03 ms       │ 100     │ 100
    ├─ ququmatz                              │               │               │               │         │
-   │  ├─ 1                    9.086 µs      │ 22.67 µs      │ 9.166 µs      │ 9.397 µs      │ 100     │ 100
-   │  ├─ 8                    60.42 µs      │ 105.9 µs      │ 62.26 µs      │ 63.26 µs      │ 100     │ 100
-   │  ├─ 32                   237.8 µs      │ 394.3 µs      │ 246.1 µs      │ 251.6 µs      │ 100     │ 100
-   │  ╰─ 128                  988 µs        │ 1.589 ms      │ 1.021 ms      │ 1.033 ms      │ 100     │ 100
+   │  ├─ 1                    9.068 µs      │ 21.33 µs      │ 9.133 µs      │ 9.364 µs      │ 100     │ 100
+   │  ├─ 8                    60.66 µs      │ 106.7 µs      │ 61.99 µs      │ 62.76 µs      │ 100     │ 100
+   │  ├─ 32                   237.5 µs      │ 474.3 µs      │ 244.4 µs      │ 249.8 µs      │ 100     │ 100
+   │  ╰─ 128                  995.9 µs      │ 1.601 ms      │ 1.019 ms      │ 1.031 ms      │ 100     │ 100
    ├─ ququmatz_split                        │               │               │               │         │
-   │  ├─ 1                    24.24 µs      │ 208.8 µs      │ 24.86 µs      │ 32.77 µs      │ 100     │ 100
-   │  ├─ 8                    82.25 µs      │ 235.4 µs      │ 83.29 µs      │ 88.99 µs      │ 100     │ 100
-   │  ├─ 32                   273.4 µs      │ 528.3 µs      │ 286.7 µs      │ 298.8 µs      │ 100     │ 100
-   │  ╰─ 128                  1.053 ms      │ 1.912 ms      │ 1.092 ms      │ 1.133 ms      │ 100     │ 100
+   │  ├─ 1                    11.73 µs      │ 111.3 µs      │ 14.26 µs      │ 15.17 µs      │ 100     │ 100
+   │  ├─ 8                    73.89 µs      │ 173.5 µs      │ 74.36 µs      │ 80.95 µs      │ 100     │ 100
+   │  ├─ 32                   264.8 µs      │ 535.7 µs      │ 276 µs        │ 290.1 µs      │ 100     │ 100
+   │  ╰─ 128                  1.024 ms      │ 1.782 ms      │ 1.073 ms      │ 1.119 ms      │ 100     │ 100
    ╰─ std_blocking_threads                  │               │               │               │         │
-      ├─ 1                    37.27 µs      │ 100.3 µs      │ 47.2 µs       │ 51.83 µs      │ 100     │ 100
-      ├─ 8                    141.4 µs      │ 263.7 µs      │ 156.9 µs      │ 162.5 µs      │ 100     │ 100
-      ├─ 32                   504 µs        │ 934 µs        │ 594.1 µs      │ 602.9 µs      │ 100     │ 100
-      ╰─ 128                  2.133 ms      │ 3.033 ms      │ 2.564 ms      │ 2.555 ms      │ 100     │ 100
+      ├─ 1                    37.02 µs      │ 115.4 µs      │ 40.25 µs      │ 54.77 µs      │ 100     │ 100
+      ├─ 8                    143.1 µs      │ 298.6 µs      │ 157 µs        │ 163.9 µs      │ 100     │ 100
+      ├─ 32                   496.2 µs      │ 809.9 µs      │ 588.2 µs      │ 603.4 µs      │ 100     │ 100
+      ╰─ 128                  2.063 ms      │ 3.415 ms      │ 2.47 ms       │ 2.508 ms      │ 100     │ 100
 ```
 
 **Reading it:** `ququmatz` and `io-uring` land within noise of each other
 at every `K` — the batching-path parity holds here the same way the
 single-operation parity did on `echo_roundtrip` above. Both beat
 `std_blocking_threads` at every `K` tested, and the margin widens as `K`
-grows — roughly 4× at `K=1` down to roughly 2.5× at `K=128`
+grows — roughly 4× at `K=1` down to roughly 2× at `K=128`
 (`std_blocking_threads` scales worse than linearly past `K=32`, plausibly
 thread-spawn/join and scheduler contention rather than the syscalls
 themselves, though that split was not separately measured). This is the
@@ -140,18 +145,31 @@ connection once there is more than one connection to serve, and
 `ququmatz` gets the same batching win `io-uring` gets, not a smaller one.
 
 `ququmatz_split` sits between the single-ring variants and
-`std_blocking_threads`: it still beats `std_blocking_threads` at every
-`K` (roughly 1.5× at `K=1`, narrowing to roughly 1.9× at `K=128`), but it
-is consistently slower than the single-threaded `ququmatz`/`io-uring`
-runs — most visibly at `K=1`, where its median is nearly 3× the
-single-ring median. That gap is the cross-thread handoff cost this
-variant pays on every iteration: two `quetzalcoatl` SPSC pushes/pops and
-two `std::sync::mpsc` round trips per phase pair, none of which the
-single-threaded split-ring benchmark in `comparison.rs` pays, and none of
-which a single-threaded ring pays at all. The gap narrows as `K` grows
-because the fixed per-iteration handoff cost is amortized over more
-recv/send work per phase, the same shape `io_uring` batching itself
-relies on.
+`std_blocking_threads`, and closer to the single-ring variants than a
+first attempt at this benchmark suggested. An earlier version of this
+benchmark ran the completion side on a third spawned thread and wired
+both the ticket handoff and the recv-length handoff through
+`std::sync::mpsc`; at `K=1` that version's median was 24.86 µs, nearly
+3× the single-ring median, because two extra thread parks (one to signal
+"a batch is ready," one to signal "the round trip is done") and two
+`mpsc` round trips were on the critical path of every iteration for no
+structural reason — the design used three threads' worth of
+synchronization to do what two threads need. Running the completion
+side on the bench thread itself, and carrying every handoff over
+`quetzalcoatl` SPSC rings instead of `std::sync::mpsc`, cut the `K=1`
+median to 14.26 µs: still visibly above the ~9.1 µs single-ring number,
+but the gap is now attributable to the two SPSC round trips this shape
+genuinely needs (submit thread → bench thread ticket, bench thread →
+submit thread recv lengths) rather than to avoidable thread-topology and
+channel-choice overhead.
+
+`ququmatz_split` still beats `std_blocking_threads` at every `K`
+(roughly 2.8× at `K=1`, narrowing to roughly 2× at `K=128`), and the
+remaining gap to the single-threaded `ququmatz`/`io-uring` runs narrows
+sharply as `K` grows (from roughly 1.6× at `K=1` to roughly 1.05× at
+`K=128`), because the fixed per-iteration handoff cost is amortized over
+more batched recv/send work per phase — the same shape `io_uring`
+batching itself relies on.
 
 Reproduced across two consecutive runs with consistent numbers at each
 `K`.
@@ -162,11 +180,14 @@ production load test, and no attempt was made to find where
 thread-per-connection stops being the wrong design — only that it
 already is by `K=8`. Nor does it establish that a submit/complete thread
 split is never worth it: this workload's per-iteration submit-wait-recv
-round trip is exactly the shape that punishes an extra thread handoff
-most, since the completion thread cannot do useful work while the
-submission thread blocks on it (and vice versa) — a workload where the
-submission and completion sides have independent, overlapping work would
-show a different trade.
+round trip is exactly the shape that punishes cross-thread handoffs
+most, since neither side can do useful work while it is waiting on the
+other — a workload where the submission and completion sides have
+independent, overlapping work to do would show a different trade. What
+it does establish is that the topology and channel choice around a
+split ring matter as much as the split itself: a design with an
+unnecessary third thread and a slower channel measured a cost that
+belonged to the harness, not to `IoUring::split()`.
 
 ### A methodology failure caught before publishing
 
