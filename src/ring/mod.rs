@@ -681,16 +681,31 @@ fn map_rings(
     fd: RawFd,
     params: &IoUringParams,
     features: Features,
+    setup_flags: u32,
     guard: &mut SetupGuard,
 ) -> Result<(usize, usize, usize, MappedRegion, usize, usize), Error> {
     let prot = Prot::READ | Prot::WRITE;
     let map = MapFlags::SHARED | MapFlags::POPULATE;
 
-    let sq_ring_sz = ring_bytes(
-        params.sq_off.array,
-        params.sq_entries,
-        core::mem::size_of::<u32>(),
-    );
+    // Under SetupFlags::NO_SQARRAY the kernel omits the indirection array
+    // entirely and reports sq_off.array == 0 (confirmed against
+    // io_uring/io_uring.c's rings_size, which leaves sq_array_offset
+    // untouched -- effectively 0 -- when the flag is set, and against
+    // io_get_sqe, which skips the array lookup outright and indexes
+    // sq_sqes directly by the masked head). Adding an array's worth of
+    // bytes on top of that offset in this mode would map a region larger
+    // than the kernel actually backs -- and the array does not need to be
+    // mapped there is nothing to read or write.
+    let has_sq_array = !SetupFlags::from_raw(setup_flags).contains(SetupFlags::NO_SQARRAY);
+    let sq_ring_sz = if has_sq_array {
+        ring_bytes(
+            params.sq_off.array,
+            params.sq_entries,
+            core::mem::size_of::<u32>(),
+        )
+    } else {
+        ring_bytes(params.sq_off.array, 0, core::mem::size_of::<u32>())
+    };
     let cq_ring_sz = ring_bytes(
         params.cq_off.cqes,
         params.cq_entries,
@@ -754,6 +769,13 @@ fn map_rings(
 ///
 /// Returns `(sq_head, sq_tail, sq_mask, sq_flags, sqes, sq_tail_local)`.
 ///
+/// `has_sq_array` distinguishes the conventional layout (where the kernel
+/// reads `sq_array[tail & mask]` to find which SQE slot to consume) from
+/// `SetupFlags::NO_SQARRAY` (where the kernel indexes `sq_sqes` directly by
+/// the masked head, confirmed against `io_uring/io_uring.c`'s `io_get_sqe`).
+/// When `false`, `sq_off.array` is `0` and does not name a real region to
+/// read or write — skip the array entirely rather than aliasing `sq_head`.
+///
 /// # Safety
 ///
 /// `sq_ring_ptr` must point to a valid SQ ring mmap and `sqes_ptr` to the SQE array mmap,
@@ -763,6 +785,7 @@ unsafe fn parse_sq(
     sq_ring_ptr: usize,
     sqes_ptr: usize,
     params: &IoUringParams,
+    has_sq_array: bool,
 ) -> (
     *const AtomicU32,
     *const AtomicU32,
@@ -776,26 +799,34 @@ unsafe fn parse_sq(
     let sq_tail = unsafe { base.add(params.sq_off.tail as usize) }.cast::<AtomicU32>();
     let sq_mask = unsafe { *base.add(params.sq_off.ring_mask as usize).cast::<u32>() };
     let sq_flags = unsafe { base.add(params.sq_off.flags as usize) }.cast::<AtomicU32>();
-    let sq_array = unsafe { base.add(params.sq_off.array as usize) } as *mut u32;
 
     debug_assert!(sq_head.is_aligned(), "sq_head not aligned");
     debug_assert!(sq_tail.is_aligned(), "sq_tail not aligned");
     debug_assert!(sq_flags.is_aligned(), "sq_flags not aligned");
-    debug_assert!(sq_array.is_aligned(), "sq_array not aligned");
 
-    // Pre-fill sq_array with identity mapping (sq_array[i] = i).
-    //
-    // The kernel reads sq_array[tail & mask] to find which SQE slot to
-    // consume. Because push() always writes sqes[tail & mask] and the
-    // identity mapping means sq_array[j] == j for all j < sq_entries,
-    // the kernel always picks up the right slot without us ever
-    // touching sq_array again.
-    //
-    // SAFETY: this invariant breaks if push() ever writes to a slot
-    // other than (tail & mask), or if SQE reordering is added later.
-    for i in 0..params.sq_entries {
-        unsafe { sq_array.add(i as usize).write(i) };
+    if has_sq_array {
+        let sq_array = unsafe { base.add(params.sq_off.array as usize) } as *mut u32;
+        debug_assert!(sq_array.is_aligned(), "sq_array not aligned");
+
+        // Pre-fill sq_array with identity mapping (sq_array[i] = i).
+        //
+        // The kernel reads sq_array[tail & mask] to find which SQE slot to
+        // consume. Because push() always writes sqes[tail & mask] and the
+        // identity mapping means sq_array[j] == j for all j < sq_entries,
+        // the kernel always picks up the right slot without us ever
+        // touching sq_array again.
+        //
+        // SAFETY: this invariant breaks if push() ever writes to a slot
+        // other than (tail & mask), or if SQE reordering is added later.
+        for i in 0..params.sq_entries {
+            unsafe { sq_array.add(i as usize).write(i) };
+        }
     }
+    // With NO_SQARRAY there is no array to fill: the kernel reads
+    // sq_sqes[cached_sq_head & mask] directly, which is exactly the slot
+    // push() already writes to (tail & mask, before advancing tail becomes
+    // the kernel's next head) -- the same identity relationship the array
+    // fill exists to establish, just without a middleman to populate.
 
     let sq_tail_local = unsafe { &*sq_tail }.load(Ordering::Acquire);
     let sqes = sqes_ptr as *mut IoUringSqe;
@@ -1009,11 +1040,12 @@ impl IoUring {
 
         let features = Features::from_raw(params.features);
         let (sq_ring_ptr, mmap_sz, cq_ring_ptr, cq_ring_region, sqes_ptr, sqes_sz) =
-            map_rings(fd, params, features, &mut guard)?;
+            map_rings(fd, params, features, setup_flags, &mut guard)?;
 
+        let has_sq_array = !SetupFlags::from_raw(setup_flags).contains(SetupFlags::NO_SQARRAY);
         let (sq_head, sq_tail, sq_mask, sq_flags, sqes, sq_tail_local) =
             // SAFETY: sq_ring_ptr points to a valid mmap of at least sq_ring_sz bytes.
-            unsafe { parse_sq(sq_ring_ptr, sqes_ptr, params) };
+            unsafe { parse_sq(sq_ring_ptr, sqes_ptr, params, has_sq_array) };
 
         let (cq_head, cq_tail, cq_mask, cqes, cq_head_local) =
             // SAFETY: cq_ring_ptr points to a valid mmap of at least cq_ring_sz bytes.

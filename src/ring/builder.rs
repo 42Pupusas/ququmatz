@@ -165,6 +165,20 @@ impl IoUringBuilder {
         self
     }
 
+    /// Abolish the SQ indirection array (kernel 6.6+): the kernel reads
+    /// SQEs directly by the masked SQ head rather than through
+    /// `sq_array[head & mask]`.
+    ///
+    /// Saves the array's memory and one indirect load per submitted SQE on
+    /// the kernel side. No different for this crate's own submission path
+    /// -- [`push`](crate::ring::IoUring::push) already writes each SQE to
+    /// the slot the kernel reads either way, array or not.
+    #[must_use]
+    pub const fn no_sqarray(mut self) -> Self {
+        self.params.flags |= SetupFlags::NO_SQARRAY.bits();
+        self
+    }
+
     /// Set raw setup flags directly.
     ///
     /// Accepts any bit, including ones this crate's ring mapping/parsing

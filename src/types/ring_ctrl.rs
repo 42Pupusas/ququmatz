@@ -62,7 +62,11 @@ bitflags! {
     const DEFER_TASKRUN = 1 << 13;
     /// Don't mmap the rings; user provides the memory.
     const NO_MMAP = 1 << 14;
-    /// Abolish the indirection SQ array; kernel reads SQEs directly (6.6+).
+    /// Abolish the indirection SQ array; kernel reads SQEs directly by the
+    /// masked SQ head rather than through `sq_array[head & mask]` (6.6+).
+    /// Saves the array's memory and one indirect load per submitted SQE;
+    /// no different for callers of this crate, since `push()` already
+    /// writes each SQE to the slot the kernel would read either way.
     const NO_SQARRAY = 1 << 16;
 }
 
@@ -71,11 +75,16 @@ impl SetupFlags {
     ///
     /// `NO_MMAP` requires the caller to pre-allocate and describe the ring
     /// memory in `sq_off`/`cq_off` before `io_uring_setup` — this crate's
-    /// builder never does that. `NO_SQARRAY` removes the SQ indirection
-    /// array entirely (`sq_off.array` becomes 0), which the mapping and
-    /// parsing code does not special-case: it always maps a conventional
-    /// array-based ring and writes an identity `sq_array`. Any other
+    /// builder never does that, so it remains unimplemented. Any other
     /// currently-unnamed bit is equally unimplemented by definition.
+    ///
+    /// `NO_SQARRAY` *is* implemented: confirmed against
+    /// `io_uring/io_uring.c`'s `rings_size` (which leaves the SQ indirection
+    /// array's size out of the mapped region entirely under this flag) and
+    /// `io_get_sqe` (which skips the array lookup and indexes `sq_sqes`
+    /// directly by the masked head), the ring mapping/parsing code
+    /// special-cases it: the SQ region is sized without the array's bytes,
+    /// and no identity array is written into memory that does not back one.
     ///
     /// [`IoUring::from_params`](crate::ring::IoUring) rejects flags outside
     /// this mask before the setup syscall runs, so an accepted `IoUring`
@@ -92,7 +101,8 @@ impl SetupFlags {
             | Self::COOP_TASKRUN.0
             | Self::TASKRUN_FLAG.0
             | Self::SINGLE_ISSUER.0
-            | Self::DEFER_TASKRUN.0,
+            | Self::DEFER_TASKRUN.0
+            | Self::NO_SQARRAY.0,
     );
 
     /// Construct from an arbitrary raw value, including bits with no

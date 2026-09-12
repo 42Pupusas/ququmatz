@@ -4219,25 +4219,54 @@ fn builder_rejects_no_mmap_before_syscall() {
 
 #[cfg(not(miri))]
 #[test]
-fn builder_rejects_no_sqarray_before_syscall() {
-    use crate::error::{Error, InvalidArgKind, SetupError};
-    use crate::types::SetupFlags;
-
-    // NO_SQARRAY zeroes sq_off.array and removes the SQ indirection array;
-    // `parse_sq` always maps and writes an identity array, which would
-    // corrupt shared ring metadata under this mode. Reject it up front.
-    let Err(err) = IoUring::builder(4)
-        .setup_flags(SetupFlags::NO_SQARRAY)
+fn a_real_no_sqarray_ring_completes_a_nop_without_an_indirection_array() {
+    // NO_SQARRAY zeroes sq_off.array and removes the SQ indirection array
+    // entirely; the kernel indexes SQEs directly by the masked SQ head
+    // instead. push() already writes each SQE to that exact slot (tail &
+    // mask, which becomes the kernel's next head), so this exercises that
+    // no array needs to exist for a submission to land in the right place
+    // -- confirming both the sizing fix (no oversized/undersized SQ mmap)
+    // and the parse fix (no identity array written into memory that
+    // doesn't back one).
+    let mut ring = IoUring::builder(4)
+        .no_sqarray()
         .build()
-    else {
-        panic!("NO_SQARRAY must be rejected before the kernel is asked")
-    };
-    assert_eq!(
-        err,
-        Error::Setup(SetupError::InvalidArg(
-            InvalidArgKind::UnsupportedSetupFlags(SetupFlags::NO_SQARRAY.bits())
-        ))
-    );
+        .expect("NO_SQARRAY ring should be accepted by this kernel");
+
+    ring.push_nop(42).expect("push nop");
+    ring.submit_and_wait(1).expect("submit");
+    let cqe = ring.complete().expect("expected a completion");
+    assert_eq!(cqe.user_data, 42);
+    assert_eq!(cqe.result, 0);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_no_sqarray_ring_carries_several_submissions_in_order() {
+    // A single SQE landing correctly could be a coincidence of head == 0.
+    // Push several NOPs with distinct user_data and confirm every one
+    // completes -- if the sizing were wrong this would either fail to
+    // build, fault, or silently drop entries past whatever the
+    // (incorrectly computed) region actually held.
+    let mut ring = IoUring::builder(8)
+        .no_sqarray()
+        .build()
+        .expect("NO_SQARRAY ring should be accepted by this kernel");
+
+    for i in 0..5u64 {
+        ring.push_nop(100 + i).expect("push nop");
+    }
+    ring.submit_and_wait(5).expect("submit");
+
+    let mut seen = [false; 5];
+    for _ in 0..5 {
+        let cqe = ring.complete().expect("expected a completion");
+        assert_eq!(cqe.result, 0);
+        let idx = (cqe.user_data - 100) as usize;
+        assert!(!seen[idx], "duplicate completion for user_data {}", cqe.user_data);
+        seen[idx] = true;
+    }
+    assert!(seen.iter().all(|&s| s), "not every pushed nop completed");
 }
 
 #[cfg(not(miri))]
