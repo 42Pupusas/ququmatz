@@ -3028,6 +3028,26 @@ fn sqe_builder_recv_multishot_places_fields_correctly() {
 }
 
 #[test]
+fn sqe_builder_read_multishot_places_fields_correctly() {
+    use crate::types::Opcode;
+    let sqe = Sqe::read_multishot(RawFd::from_raw(5), 0, 9).user_data(3);
+    let inner = sqe.0;
+    assert_eq!(Opcode::ReadMultishot, inner.opcode);
+    assert_eq!(inner.fd, 5);
+    assert_eq!(inner.off, 0);
+    // `read_multishot` must select a buffer itself, unlike `recv_multishot`
+    // which puts the multishot bit in `ioprio` — this is a distinct
+    // opcode, so there is no bit to set, only `IOSQE_BUFFER_SELECT` and
+    // the group id.
+    assert_eq!(
+        inner.flags & SqeFlags::BUFFER_SELECT.bits(),
+        SqeFlags::BUFFER_SELECT.bits()
+    );
+    assert_eq!(inner.buf_index, 9);
+    assert_eq!(inner.len, 0, "nbytes must be zero: the pool buffer's size governs the transfer");
+}
+
+#[test]
 fn sqe_builder_with_poll_first_sets_ioprio_bit() {
     use crate::types::{IORING_RECVSEND_POLL_FIRST, MsgFlags, Opcode, SendRecvFlag};
     let buf = [0u8; 4];
@@ -3938,6 +3958,88 @@ fn splice_pipe_roundtrip() {
     let _ = syscall::close(RawFd::from_raw(read_end as usize));
     let _ = syscall::close(RawFd::from_raw(write_end as usize));
     let _ = syscall::close(RawFd::from_raw(fd as usize));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_read_multishot_delivers_two_writes_from_one_armed_request() {
+    use crate::types::CqeFlags;
+
+    let mut pipe_fds = [0i32; 2];
+    crate::syscall::pipe2(pipe_fds.as_mut_ptr(), 0).expect("pipe2");
+    let [read_end, write_end] = pipe_fds;
+
+    let mut ring = IoUring::new(8).expect("setup");
+    let mut pbuf = ring
+        .register_provided_buffers(21, 4, 64)
+        .expect("register_provided_buffers");
+
+    ring.push(
+        Sqe::read_multishot(RawFd::from_raw(read_end as usize), 0, 21).user_data(1),
+    )
+    .expect("push read_multishot");
+    ring.submit().expect("submit");
+
+    let first = b"first write";
+    ring.push(
+        unsafe { Sqe::write(RawFd::from_raw(write_end as usize), first, 0) }.user_data(2),
+    )
+    .expect("push write 1");
+    ring.submit_and_wait(1).expect("submit write 1");
+
+    let mut arrivals: Vec<Vec<u8>> = Vec::new();
+    let mut saw_more = false;
+    loop {
+        let Some(cqe) = ring.complete() else {
+            break;
+        };
+        if cqe.user_data == 2 {
+            assert_eq!(cqe.result, first.len() as i32);
+            continue;
+        }
+        assert_eq!(cqe.user_data, 1);
+        assert!(cqe.flags.contains(CqeFlags::MORE), "must stay armed");
+        saw_more = true;
+        let buf_id = cqe.buffer_id().expect("buffer_id present");
+        #[allow(clippy::cast_sign_loss)]
+        let payload = pbuf.buffer(buf_id, cqe.result as u32).expect("buffer slice");
+        arrivals.push(payload.to_vec());
+        pbuf.recycle_and_commit(buf_id);
+    }
+    assert!(saw_more, "the read must have delivered at least one arrival");
+
+    let second = b"second write";
+    ring.push(
+        unsafe { Sqe::write(RawFd::from_raw(write_end as usize), second, 0) }.user_data(3),
+    )
+    .expect("push write 2");
+    ring.submit_and_wait(1).expect("submit write 2");
+
+    loop {
+        let Some(cqe) = ring.complete() else {
+            break;
+        };
+        if cqe.user_data == 3 {
+            assert_eq!(cqe.result, second.len() as i32);
+            continue;
+        }
+        assert_eq!(cqe.user_data, 1);
+        let buf_id = cqe.buffer_id().expect("buffer_id present");
+        #[allow(clippy::cast_sign_loss)]
+        let payload = pbuf.buffer(buf_id, cqe.result as u32).expect("buffer slice");
+        arrivals.push(payload.to_vec());
+        pbuf.recycle_and_commit(buf_id);
+    }
+
+    let joined: Vec<u8> = arrivals.concat();
+    let expected: Vec<u8> = first.iter().chain(second.iter()).copied().collect();
+    assert_eq!(
+        joined, expected,
+        "one armed multishot read delivered both writes in order"
+    );
+
+    let _ = syscall::close(RawFd::from_raw(read_end as usize));
+    let _ = syscall::close(RawFd::from_raw(write_end as usize));
 }
 
 #[cfg(not(miri))]

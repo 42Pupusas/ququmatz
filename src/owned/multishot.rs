@@ -203,33 +203,7 @@ impl MultishotRecv {
         if !self.matches(&event) {
             return Err(event);
         }
-        match event {
-            Event::Partial(partial) => {
-                let result = partial.raw_result();
-                Ok(Self::claim(partial.buffer_id(), result, pool)
-                    .map_or(Delivery::Empty(result), Delivery::Data))
-            }
-            Event::Complete(receipt) => {
-                let last = Self::claim(receipt.flags().buffer_id(), receipt.raw_result(), pool);
-                Ok(Delivery::Done(Finished { receipt, last }))
-            }
-        }
-    }
-
-    /// The slot a completion consumed, if it consumed one.
-    ///
-    /// A CQE with no buffer flag or a negative result carries no slot to
-    /// recycle; borrowing the pool for it would invent a borrow that does
-    /// not exist.
-    fn claim(
-        buffer_id: Option<u16>,
-        result: i32,
-        pool: &mut BufferConsumer,
-    ) -> Option<Arrival<'_>> {
-        match (buffer_id, u32::try_from(result)) {
-            (Some(buf_id), Ok(len)) => Some(Arrival { pool, buf_id, len }),
-            _ => None,
-        }
+        Ok(Delivery::from_event(event, pool))
     }
 }
 
@@ -251,7 +225,32 @@ pub enum Delivery<'pool> {
     Done(Finished<'pool>),
 }
 
-impl Delivery<'_> {
+impl<'pool> Delivery<'pool> {
+    /// Interpret a reaped completion known to belong to some multishot
+    /// request that draws buffers from `pool`.
+    ///
+    /// Shared between [`MultishotRecv::record`] and
+    /// [`MultishotRead::record`](super::readmultishot::MultishotRead::record)
+    /// — both are the same borrow-a-pool-slot state machine over a
+    /// different armed resource (a socket, a pollable file), and this is
+    /// the part that does not vary: a partial completion's buffer id (if
+    /// any) becomes a live [`Arrival`], a terminal one becomes
+    /// [`Finished`], and a terminal one that also carried a buffer id
+    /// still claims it rather than dropping it.
+    pub(crate) fn from_event(event: Event, pool: &'pool mut BufferConsumer) -> Self {
+        match event {
+            Event::Partial(partial) => {
+                let result = partial.raw_result();
+                Arrival::claim(partial.buffer_id(), result, pool)
+                    .map_or(Self::Empty(result), Self::Data)
+            }
+            Event::Complete(receipt) => {
+                let last = Arrival::claim(receipt.flags().buffer_id(), receipt.raw_result(), pool);
+                Self::Done(Finished { receipt, last })
+            }
+        }
+    }
+
     /// Whether the multishot is still armed after this completion.
     #[must_use]
     pub const fn armed(&self) -> Armed {
@@ -294,6 +293,20 @@ impl core::fmt::Debug for Arrival<'_> {
             .field("buffer_id", &self.buf_id)
             .field("len", &self.len)
             .finish_non_exhaustive()
+    }
+}
+
+impl<'pool> Arrival<'pool> {
+    /// The slot a completion consumed, if it consumed one.
+    ///
+    /// A CQE with no buffer flag or a negative result carries no slot to
+    /// recycle; borrowing the pool for it would invent a borrow that does
+    /// not exist.
+    fn claim(buffer_id: Option<u16>, result: i32, pool: &'pool mut BufferConsumer) -> Option<Self> {
+        match (buffer_id, u32::try_from(result)) {
+            (Some(buf_id), Ok(len)) => Some(Self { pool, buf_id, len }),
+            _ => None,
+        }
     }
 }
 

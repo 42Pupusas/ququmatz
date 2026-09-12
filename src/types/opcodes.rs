@@ -54,6 +54,7 @@ pub enum Opcode {
     UringCmd = 46,
     SendZc = 47,
     SendmsgZc = 48,
+    ReadMultishot = 49,
     WaitId = 50,
     FutexWait = 51,
     FutexWake = 52,

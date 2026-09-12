@@ -19,6 +19,7 @@ use super::link::{PendingLink, PreparedLink};
 use super::msgring::{PendingMsgRing, PreparedMsgRing};
 use super::multishot::{MultishotRecv, PreparedMultishot};
 use super::open::{PendingOpen, PreparedOpen};
+use super::readmultishot::{MultishotRead, PreparedReadMultishot};
 use super::openat2::{PendingOpenat2, PreparedOpenat2};
 use super::pathop::{PendingPathOp, PreparedPathOp};
 use super::recvmsg::{PendingRecvmsg, PreparedRecvmsg};
@@ -114,6 +115,27 @@ impl OwnedSubmitter {
             Ok(()) => Ok(pending),
             // The request owns no buffer, so handing back the copy taken
             // before submission returns it exactly as it arrived.
+            Err(e) => Err((request, e)),
+        }
+    }
+
+    /// Arm a multishot read against a registered buffer pool.
+    ///
+    /// The file-side twin of [`push_multishot`](Self::push_multishot):
+    /// same borrow-a-pool-slot state machine, armed on a pollable file and
+    /// a byte offset instead of a socket and message flags.
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact.
+    pub fn push_read_multishot(
+        &mut self,
+        request: PreparedReadMultishot,
+    ) -> Result<MultishotRead, (PreparedReadMultishot, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
             Err(e) => Err((request, e)),
         }
     }

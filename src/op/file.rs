@@ -241,6 +241,29 @@ impl Sqe {
         Self(sqe)
     }
 
+    /// Prepare a multishot read (kernel 6.7+).
+    ///
+    /// A single SQE generates a CQE for every read that becomes available
+    /// on `fd`, drawing a buffer from the provided-buffer group registered
+    /// under `bgid` each time — requires
+    /// [`buffer_select`](super::Sqe::buffer_select), which this constructor
+    /// applies itself. `fd` must name a pollable file (a pipe, a
+    /// `tun` device, and similar); the kernel rejects a regular file with
+    /// `-EBADFD`, since "more data becomes available later" has no meaning
+    /// there. On files that cannot seek, `offset` must be `0` or
+    /// `u64::MAX`.
+    ///
+    /// Like `recv_multishot`, an `IORING_CQE_F_MORE`-less completion ends
+    /// the request; issuing again means submitting a fresh multishot read.
+    #[must_use]
+    pub fn read_multishot(fd: RawFd, offset: u64, bgid: u16) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::ReadMultishot.into();
+        sqe.fd = fd.as_i32();
+        sqe.off = offset;
+        Self(sqe).buffer_select(bgid)
+    }
+
     /// Prepare a fixed-buffer write operation.
     ///
     /// Like `write`, but uses a pre-registered buffer identified by `buf_index`.

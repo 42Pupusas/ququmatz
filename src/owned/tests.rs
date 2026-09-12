@@ -10,7 +10,8 @@ use super::{
     PendingStatx, PendingZc, Prepared, PreparedAccept, PreparedBind, PreparedCancel,
     PreparedConnect, PreparedDirectAccept, PreparedDirectOpen, PreparedDirectSocket,
     PreparedEpollCtl, PreparedFilesUpdate, PreparedFixedFdInstall, PreparedLink, PreparedMsgRing,
-    PreparedMultishot, PreparedOpen, PreparedOpenat2, PreparedPathOp, PreparedRecvmsg,
+    PreparedMultishot, PreparedOpen, PreparedOpenat2, PreparedPathOp, PreparedReadMultishot,
+    PreparedRecvmsg,
     PreparedRename, PreparedSendmsg, PreparedSendmsgZc, PreparedStatx, PreparedTimeout,
     PreparedVectored, PreparedWaitId, PreparedZc, Receipt, RenameMode, RingId, SendTarget,
     SlotIndex, SlotTarget, StableBuffer, StatxError, TableEntry, TimeoutError, Update,
@@ -683,6 +684,63 @@ fn a_real_multishot_recv_delivers_many_arrivals_from_one_submission() {
         !Delivery::Done(finished).armed().is_armed(),
         "a finished multishot is not armed"
     );
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_multishot_read_delivers_two_writes_from_one_armed_request() {
+    let mut pipe_fds = [0i32; 2];
+    crate::syscall::pipe2(pipe_fds.as_mut_ptr(), 0).expect("pipe2");
+    let [read_end, write_end] = pipe_fds;
+    let read_end = RawFd::from_raw(read_end as usize);
+    let write_end = RawFd::from_raw(write_end as usize);
+
+    let mut ring = crate::IoUring::new(16).expect("ring");
+    let pool = ring
+        .register_provided_buffers(31, 4, 64)
+        .expect("register pool");
+    let mut pool = pool.split();
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let ticket = sub
+        .push_read_multishot(PreparedReadMultishot::on(read_end, 0, pool.bgid()))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit");
+
+    let sent: [&[u8]; 2] = [b"first write", b"second write"];
+    let mut received: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
+    for msg in sent {
+        assert_eq!(
+            crate::syscall::write(write_end, msg.as_ptr(), msg.len()).expect("write"),
+            msg.len()
+        );
+        loop {
+            comp.wait(1).expect("wait");
+            let Some(event) = comp.reap_event() else {
+                comp.sync();
+                continue;
+            };
+            match ticket.record(event, &mut pool).expect("our request") {
+                Delivery::Data(arrival) => {
+                    received.push(arrival.bytes().to_vec());
+                    break;
+                }
+                Delivery::Empty(res) => panic!("unexpected empty delivery: {res}"),
+                Delivery::Done(fin) => panic!("ended early: {:?}", fin.result()),
+            }
+        }
+        comp.sync();
+    }
+
+    let joined: std::vec::Vec<u8> = received.concat();
+    let expected: std::vec::Vec<u8> = sent.concat();
+    assert_eq!(
+        joined, expected,
+        "one armed multishot read delivered both writes in order"
+    );
+
+    let _ = crate::syscall::close(read_end);
+    let _ = crate::syscall::close(write_end);
 }
 
 #[test]

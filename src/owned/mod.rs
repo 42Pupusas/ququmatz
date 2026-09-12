@@ -371,6 +371,7 @@ mod openat2;
 mod path;
 mod pathop;
 mod queue;
+mod readmultishot;
 mod recvmsg;
 mod rename;
 mod request;
@@ -428,6 +429,7 @@ pub use openat2::{Openat2Error, Openat2Mode, Opened2, PendingOpenat2, PreparedOp
 pub use path::{OwnedPath, PathError};
 pub use pathop::{PathOpCompleted, PathOpKind, PendingPathOp, PreparedPathOp};
 pub use queue::{OwnedCompleter, OwnedSubmitter};
+pub use readmultishot::{MultishotRead, PreparedReadMultishot};
 pub use recvmsg::{
     PeerAddress, PeerWanted, PendingRecvmsg, PreparedRecvmsg, Received, RecvmsgCompleted,
 };
