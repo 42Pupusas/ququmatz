@@ -237,6 +237,42 @@ pub struct IoUringFileIndexRange {
     pub resv: u64,
 }
 
+bitflags! {
+    /// Flags for `IORING_REGISTER_CLONE_BUFFERS` (`struct io_uring_clone_buffers::flags`).
+    pub struct CloneBuffersFlags(u32);
+    /// Look up `src_fd` as a registered ring index rather than a plain fd.
+    /// Only meaningful if the source ring was registered with
+    /// `register_ring_fd` by the calling thread; safe to leave unset when
+    /// the caller still holds the source ring's plain file descriptor.
+    const SRC_REGISTERED = 1 << 0;
+    /// Allow cloning into a destination ring that already has a buffer
+    /// table: any node in the destination range that overlaps the clone
+    /// is released and replaced rather than causing the call to fail with
+    /// `-EBUSY` (kernel 6.13+).
+    const DST_REPLACE = 1 << 1;
+}
+
+/// Argument for `IORING_REGISTER_CLONE_BUFFERS` (`struct io_uring_clone_buffers`).
+///
+/// Clones `nr` registered buffer-table slots from the ring named by
+/// `src_fd`, starting at `src_off` in the source and `dst_off` in this
+/// ring, into this ring's own buffer table — avoiding the cost of
+/// re-pinning and re-mapping the same pages that a second
+/// `register_buffers` call on identical `iovec`s would repeat. The two
+/// rings must share the same address space; the destination ring must
+/// have no buffers registered in the overlapping range unless
+/// [`CloneBuffersFlags::DST_REPLACE`] is set.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct IoUringCloneBuffers {
+    pub src_fd: u32,
+    pub flags: u32,
+    pub src_off: u32,
+    pub dst_off: u32,
+    pub nr: u32,
+    pub pad: [u32; 3],
+}
+
 /// Argument for `IORING_REGISTER_PBUF_STATUS` (`struct io_uring_buf_status`).
 ///
 /// `buf_group` is the input (which buffer group to query); `head` is the

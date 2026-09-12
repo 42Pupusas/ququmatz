@@ -5,9 +5,9 @@ use super::IoUring;
 use crate::error::Error;
 use crate::syscall;
 use crate::types::{
-    CancelOutcome, IoUringFileIndexRange, IoUringFilesUpdate, IoUringRsrcUpdate, IoVec,
-    NapiOp, NapiSettings, NapiTrackingStrategy, RawFd, RawNapi, RawSyncCancelReg, RegisterOp,
-    SyncCancelReg,
+    CancelOutcome, CloneBuffersFlags, IoUringCloneBuffers, IoUringFileIndexRange,
+    IoUringFilesUpdate, IoUringRsrcUpdate, IoVec, NapiOp, NapiSettings, NapiTrackingStrategy,
+    RawFd, RawNapi, RawSyncCancelReg, RegisterOp, SyncCancelReg,
 };
 
 impl IoUring {
@@ -406,6 +406,79 @@ impl IoUring {
             RegisterOp::RegisterNapi.into(),
             core::ptr::from_mut(&mut raw) as usize,
             1,
+        )?;
+        Ok(())
+    }
+
+    /// Clone another ring's whole registered buffer table into this ring
+    /// (kernel 6.12+), instead of re-registering the same buffers a
+    /// second time.
+    ///
+    /// `src` names the source ring by its plain file descriptor. This
+    /// ring must have no buffers registered — use
+    /// [`clone_registered_buffers_replacing`](Self::clone_registered_buffers_replacing)
+    /// if it already does. The two rings must share the same address
+    /// space (e.g. two rings created by the same process).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this ring already has buffers registered, the
+    /// source ring has none, or the kernel otherwise rejects the request
+    /// (e.g. kernel < 6.12, or the rings do not share an address space).
+    pub fn clone_registered_buffers(&mut self, src: RawFd) -> Result<(), Error> {
+        self.clone_registered_buffers_raw(src, CloneBuffersFlags::empty(), 0, 0, 0)
+    }
+
+    /// Like [`clone_registered_buffers`](Self::clone_registered_buffers),
+    /// but permitted even when this ring already has a buffer table: any
+    /// slot in the destination range that overlaps the clone is released
+    /// and replaced rather than the call failing outright (kernel 6.13+).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source ring has no buffers registered or
+    /// the kernel otherwise rejects the request.
+    pub fn clone_registered_buffers_replacing(&mut self, src: RawFd) -> Result<(), Error> {
+        self.clone_registered_buffers_raw(src, CloneBuffersFlags::DST_REPLACE, 0, 0, 0)
+    }
+
+    /// Clone only `nr` buffer-table slots, starting at `src_off` in the
+    /// source ring's table and landing at `dst_off` in this ring's own
+    /// table, with `flags` controlling source-fd lookup and destination
+    /// replacement.
+    ///
+    /// Pass [`CloneBuffersFlags::DST_REPLACE`] to permit overlapping an
+    /// existing destination range rather than failing with `-EBUSY`. Pass
+    /// [`CloneBuffersFlags::SRC_REGISTERED`] only if `src` names a
+    /// registered-ring-fd index (from [`register_ring_fd`](Self::register_ring_fd))
+    /// rather than a plain file descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source ring has no buffers registered in
+    /// the named range, the destination range is occupied without
+    /// `DST_REPLACE`, or the kernel otherwise rejects the request.
+    pub fn clone_registered_buffers_raw(
+        &mut self,
+        src: RawFd,
+        flags: CloneBuffersFlags,
+        src_off: u32,
+        dst_off: u32,
+        nr: u32,
+    ) -> Result<(), Error> {
+        let mut arg = IoUringCloneBuffers {
+            src_fd: src.as_i32().cast_unsigned(),
+            flags: flags.bits(),
+            src_off,
+            dst_off,
+            nr,
+            pad: [0; 3],
+        };
+        syscall::io_uring_register(
+            self.fd,
+            RegisterOp::RegisterCloneBuffers.into(),
+            core::ptr::from_mut(&mut arg) as usize,
+            0,
         )?;
         Ok(())
     }

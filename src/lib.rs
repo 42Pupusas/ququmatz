@@ -43,11 +43,12 @@ pub use ring::{
     ProvidedBufferRing, SplitCompletions, Submitter,
 };
 pub use types::{
-    AcceptFlags, AcceptModifier, AddressFamily, CancelFlags, CancelOutcome, CqeFlags, DirFd,
+    AcceptFlags, AcceptModifier, AddressFamily, CancelFlags, CancelOutcome, CloneBuffersFlags,
+    CqeFlags, DirFd,
     EnterFlags,
     EpollEvent, EpollEvents, EpollOp,
     EventFdFlags, FadviseAdvice, FallocateMode, Features, FileMode, FsyncFlags, InotifyEvent,
-    InotifyInitFlags, IoUringBuf, IoUringBufReg, IoUringBufStatus, IoUringCqe,
+    InotifyInitFlags, IoUringBuf, IoUringBufReg, IoUringBufStatus, IoUringCloneBuffers, IoUringCqe,
     IoUringFileIndexRange, IoUringFilesUpdate, IoUringParams, IoUringRsrcRegister,
     IoUringRsrcUpdate, IoUringRsrcUpdate2, IoUringSqe, IoVec, MadviseAdvice, MsgFlags,
     MsgRingFlags, OpenFlags,

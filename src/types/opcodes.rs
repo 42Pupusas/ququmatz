@@ -149,6 +149,14 @@ pub enum RegisterOp {
     RegisterNapi = 27,
     /// Stop NAPI busy-poll tracking, restoring irq-driven completion.
     UnregisterNapi = 28,
+    /// Clone another ring's registered buffer table into this one
+    /// (kernel 6.12+). Cheaper than re-registering the same buffers
+    /// per ring: no re-pinning of pages, no re-mapping for DMA. The
+    /// destination ring must have no buffers registered unless
+    /// `IORING_REGISTER_DST_REPLACE` is set in the clone request's
+    /// flags, in which case the overlapping range is released and
+    /// replaced. The two rings must share the same address space.
+    RegisterCloneBuffers = 30,
 }
 
 impl From<RegisterOp> for u32 {

@@ -1890,6 +1890,40 @@ fn a_real_tagged_buffer_table_posts_a_death_cqe_once_unregistered() {
 
 #[cfg(not(miri))]
 #[test]
+fn a_real_clone_buffers_gives_the_destination_ring_a_usable_copy() {
+    let mut src = IoUring::new(4).expect("setup src");
+    let mut dst = IoUring::new(4).expect("setup dst");
+
+    let mut buf = vec![0xABu8; 64];
+    let iov = [unsafe { IoVec::new(buf.as_mut_ptr(), buf.len()) }];
+    src.register_buffers(&iov).expect("register_buffers");
+
+    match dst.clone_registered_buffers(src.raw_fd()) {
+        Ok(()) => {}
+        Err(_) => {
+            // Kernel < 6.12 or clone otherwise refused; nothing more to verify.
+            return;
+        }
+    }
+
+    let fd = open_tmpfile(&mut dst);
+    // The clone shares the same underlying pages as `buf`, so its
+    // virtual address is still valid for a fixed write through the
+    // destination ring's copy of the buffer table.
+    let sqe = unsafe {
+        Sqe::write_fixed(RawFd::from_raw(fd as usize), buf.as_ptr(), buf.len() as u32, 0, 0)
+            .user_data(1)
+    };
+    dst.push(sqe).expect("push write_fixed");
+    dst.submit_and_wait(1).expect("submit");
+    let cqe = dst.complete().expect("cqe");
+    assert_eq!(cqe.result, 64, "clone should leave a usable fixed buffer");
+
+    let _ = syscall::close(RawFd::from_raw(fd as usize));
+}
+
+#[cfg(not(miri))]
+#[test]
 fn socket_with_typed_flags_creates_nonblocking_fd() {
     use crate::Socket;
     use crate::types::{AddressFamily, SocketFlags, SocketType};
@@ -2958,6 +2992,19 @@ fn io_uring_rsrc_update2_layout_matches_the_kernel_struct() {
     assert_eq!(mem::offset_of!(IoUringRsrcUpdate2, tags), 16);
     assert_eq!(mem::offset_of!(IoUringRsrcUpdate2, nr), 24);
     assert_eq!(mem::offset_of!(IoUringRsrcUpdate2, resv2), 28);
+}
+
+#[test]
+fn io_uring_clone_buffers_layout_matches_the_kernel_struct() {
+    use crate::types::IoUringCloneBuffers;
+    assert_eq!(mem::size_of::<IoUringCloneBuffers>(), 32);
+    assert_eq!(mem::align_of::<IoUringCloneBuffers>(), 4);
+    assert_eq!(mem::offset_of!(IoUringCloneBuffers, src_fd), 0);
+    assert_eq!(mem::offset_of!(IoUringCloneBuffers, flags), 4);
+    assert_eq!(mem::offset_of!(IoUringCloneBuffers, src_off), 8);
+    assert_eq!(mem::offset_of!(IoUringCloneBuffers, dst_off), 12);
+    assert_eq!(mem::offset_of!(IoUringCloneBuffers, nr), 16);
+    assert_eq!(mem::offset_of!(IoUringCloneBuffers, pad), 20);
 }
 
 // ---------------------------------------------------------------
