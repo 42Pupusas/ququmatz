@@ -69,8 +69,10 @@ fn register_provided_buffers_on(
     // request that the ring-entry writes below would then walk past.
     let ring_bytes = checked_ring_bytes(count, core::mem::size_of::<IoUringBuf>())
         .map_err(SetupError::InvalidArg)?;
-    let ring_addr =
-        syscall::mmap(0, ring_bytes, prot, map, usize::MAX, 0).map_err(SetupError::Syscall)?;
+    // Safety: `addr` 0 and `MapFlags::ANONYMOUS` mean the kernel picks a
+    // fresh, unused range; nothing existing can be clobbered.
+    let ring_addr = unsafe { syscall::mmap(0, ring_bytes, prot, map, usize::MAX, 0) }
+        .map_err(SetupError::Syscall)?;
 
     // Backing region for the buffers themselves. Same overflow concern as
     // `ring_bytes`, and more reachable here since `buf_size` is a
@@ -78,14 +80,20 @@ fn register_provided_buffers_on(
     let bufs_bytes = match checked_ring_bytes(count, buf_size as usize) {
         Ok(bytes) => bytes,
         Err(kind) => {
-            let _ = syscall::munmap(ring_addr, ring_bytes);
+            // Safety: `ring_addr..ring_addr + ring_bytes` is this function's
+            // own just-allocated mapping, unmapped exactly once here.
+            let _ = unsafe { syscall::munmap(ring_addr, ring_bytes) };
             return Err(SetupError::InvalidArg(kind).into());
         }
     };
-    let bufs_addr = match syscall::mmap(0, bufs_bytes, prot, map, usize::MAX, 0) {
+    // Safety: `addr` 0 and `MapFlags::ANONYMOUS` mean the kernel picks a
+    // fresh, unused range; nothing existing can be clobbered.
+    let bufs_addr = match unsafe { syscall::mmap(0, bufs_bytes, prot, map, usize::MAX, 0) } {
         Ok(a) => a,
         Err(e) => {
-            let _ = syscall::munmap(ring_addr, ring_bytes);
+            // Safety: this function's own just-allocated mapping, unmapped
+            // exactly once here.
+            let _ = unsafe { syscall::munmap(ring_addr, ring_bytes) };
             return Err(SetupError::Syscall(e).into());
         }
     };
@@ -98,14 +106,20 @@ fn register_provided_buffers_on(
         resv: [0; 3],
     };
 
-    if let Err(e) = syscall::io_uring_register(
-        fd,
-        RegisterOp::RegisterPbufRing.into(),
-        core::ptr::from_mut(&mut reg) as usize,
-        1,
-    ) {
-        let _ = syscall::munmap(bufs_addr, bufs_bytes);
-        let _ = syscall::munmap(ring_addr, ring_bytes);
+    // Safety: `reg` is a live local `IoUringBufReg`, and this opcode reads
+    // exactly one instance of it.
+    if let Err(e) = unsafe {
+        syscall::io_uring_register(
+            fd,
+            RegisterOp::RegisterPbufRing.into(),
+            core::ptr::from_mut(&mut reg) as usize,
+            1,
+        )
+    } {
+        // Safety: both regions are this function's own just-allocated
+        // mappings, each unmapped exactly once here.
+        let _ = unsafe { syscall::munmap(bufs_addr, bufs_bytes) };
+        let _ = unsafe { syscall::munmap(ring_addr, ring_bytes) };
         return Err(SetupError::Syscall(e).into());
     }
 
@@ -268,12 +282,16 @@ impl IoUring {
             bgid,
             ..Default::default()
         };
-        syscall::io_uring_register(
-            self.fd,
-            RegisterOp::UnregisterPbufRing.into(),
-            core::ptr::from_mut(&mut reg) as usize,
-            1,
-        )?;
+        // Safety: `reg` is a live local `IoUringBufReg`, and this opcode
+        // reads exactly one instance of it.
+        unsafe {
+            syscall::io_uring_register(
+                self.fd,
+                RegisterOp::UnregisterPbufRing.into(),
+                core::ptr::from_mut(&mut reg) as usize,
+                1,
+            )
+        }?;
         Ok(())
     }
 }
@@ -374,12 +392,16 @@ impl ProvidedBufferRing {
             head: 0,
             resv: [0; 8],
         };
-        syscall::io_uring_register(
-            self.fd,
-            RegisterOp::RegisterPbufStatus.into(),
-            core::ptr::addr_of_mut!(arg) as usize,
-            1,
-        )
+        // Safety: `arg` is a live local `IoUringBufStatus`, and this opcode
+        // reads and writes exactly one instance of it.
+        unsafe {
+            syscall::io_uring_register(
+                self.fd,
+                RegisterOp::RegisterPbufStatus.into(),
+                core::ptr::addr_of_mut!(arg) as usize,
+                1,
+            )
+        }
         .map_err(SetupError::Syscall)?;
         Ok(arg.head)
     }
@@ -597,14 +619,20 @@ impl Drop for ProvidedBufferRing {
             bgid: self.bgid,
             ..Default::default()
         };
-        let _ = syscall::io_uring_register(
-            self.fd,
-            RegisterOp::UnregisterPbufRing.into(),
-            core::ptr::from_mut(&mut reg) as usize,
-            1,
-        );
-        let _ = syscall::munmap(self.bufs_addr, self.bufs_bytes);
-        let _ = syscall::munmap(self.ring_addr, self.ring_bytes);
+        // Safety: `reg` is a live local `IoUringBufReg`, and this opcode
+        // reads exactly one instance of it.
+        let _ = unsafe {
+            syscall::io_uring_register(
+                self.fd,
+                RegisterOp::UnregisterPbufRing.into(),
+                core::ptr::from_mut(&mut reg) as usize,
+                1,
+            )
+        };
+        // Safety: both regions are this value's own mappings from
+        // registration, each unmapped exactly once here.
+        let _ = unsafe { syscall::munmap(self.bufs_addr, self.bufs_bytes) };
+        let _ = unsafe { syscall::munmap(self.ring_addr, self.ring_bytes) };
     }
 }
 

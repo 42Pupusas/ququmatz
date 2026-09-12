@@ -54,8 +54,7 @@ impl Sqe {
     /// additional bits of its own beyond `cqe_flags`.
     #[must_use]
     pub fn msg_ring_cqe_flags(target_ring: RawFd, len: u32, data: u64, cqe_flags: u32) -> Self {
-        let mut sqe =
-            Self::msg_ring_with_flags(target_ring, len, data, MsgRingFlags::FLAGS_PASS);
+        let mut sqe = Self::msg_ring_with_flags(target_ring, len, data, MsgRingFlags::FLAGS_PASS);
         // `file_index` aliases `splice_fd_in`; this form repurposes it to
         // carry the requested CQE flags rather than a fixed-file slot.
         #[allow(clippy::cast_possible_wrap)]

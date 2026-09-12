@@ -85,12 +85,16 @@ impl Probe {
             header: ProbeHeader::default(),
             ops: [ProbeOp::default(); SLOT_COUNT],
         };
-        syscall::io_uring_register(
-            ring.fd,
-            RegisterOp::RegisterProbe.into(),
-            core::ptr::from_mut(&mut probe) as usize,
-            SLOTS,
-        )?;
+        // Safety: `probe` is a live local `Self`, sized to hold the `SLOTS`
+        // entries this opcode writes.
+        unsafe {
+            syscall::io_uring_register(
+                ring.fd,
+                RegisterOp::RegisterProbe.into(),
+                core::ptr::from_mut(&mut probe) as usize,
+                SLOTS,
+            )
+        }?;
         Ok(probe)
     }
 

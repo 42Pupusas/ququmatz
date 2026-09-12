@@ -41,12 +41,7 @@ impl Sqe {
     /// `nbytes` of `0` means "to the end of the file". `flags` selects
     /// which of the wait-before/write/wait-after phases run.
     #[must_use]
-    pub fn sync_file_range(
-        fd: RawFd,
-        offset: u64,
-        nbytes: u32,
-        flags: SyncFileRangeFlags,
-    ) -> Self {
+    pub fn sync_file_range(fd: RawFd, offset: u64, nbytes: u32, flags: SyncFileRangeFlags) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::SyncFileRange.into();
         sqe.fd = fd.as_i32();
@@ -790,12 +785,7 @@ impl Sqe {
     /// must point to at least `len` bytes of valid, writable memory. All
     /// three must remain valid until the operation completes.
     #[must_use]
-    pub unsafe fn getxattr_ptr(
-        name: *const u8,
-        path: *const u8,
-        value: *mut u8,
-        len: u32,
-    ) -> Self {
+    pub unsafe fn getxattr_ptr(name: *const u8, path: *const u8, value: *mut u8, len: u32) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::Getxattr.into();
         sqe.addr = name as u64;
@@ -820,7 +810,12 @@ impl Sqe {
     pub unsafe fn fgetxattr(fd: RawFd, name: &core::ffi::CStr, value: &mut [u8]) -> Self {
         debug_assert!(value.len() <= u32::MAX as usize);
         unsafe {
-            Self::fgetxattr_ptr(fd, name.as_ptr().cast(), value.as_mut_ptr(), value.len() as u32)
+            Self::fgetxattr_ptr(
+                fd,
+                name.as_ptr().cast(),
+                value.as_mut_ptr(),
+                value.len() as u32,
+            )
         }
     }
 

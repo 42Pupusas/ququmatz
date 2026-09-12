@@ -3,10 +3,9 @@ use std::{vec, vec::Vec};
 
 use super::*;
 use crate::types::{
-    AcceptFlags, EventFdFlags, FileMode, Futex2Flags, FutexWaitv, FsyncFlags, IdType,
-    InotifyEvent, InotifyInitFlags, IoCqringOffsets, IoSqringOffsets, IoUringBuf, IoUringBufReg,
-    IoUringCqe, IoUringParams, IoUringSqe, MsgFlags, MsgHdr, Opcode, OpenFlags, PbufRingFlags,
-    PollMask,
+    AcceptFlags, EventFdFlags, FileMode, FsyncFlags, Futex2Flags, FutexWaitv, IdType, InotifyEvent,
+    InotifyInitFlags, IoCqringOffsets, IoSqringOffsets, IoUringBuf, IoUringBufReg, IoUringCqe,
+    IoUringParams, IoUringSqe, MsgFlags, MsgHdr, Opcode, OpenFlags, PbufRingFlags, PollMask,
     RecvmsgOut, SockAddrIn, SqeFlags, Statx, StatxFlags, StatxMask, StatxTimestamp, WaitOptions,
     WaitidSiginfo, WatchMask,
 };
@@ -31,7 +30,12 @@ struct UniqueTestPath {
 #[cfg(not(miri))]
 impl UniqueTestPath {
     fn new(prefix: &str) -> Self {
-        Self::new_in(std::env::temp_dir().to_str().expect("temp dir is valid UTF-8"), prefix)
+        Self::new_in(
+            std::env::temp_dir()
+                .to_str()
+                .expect("temp dir is valid UTF-8"),
+            prefix,
+        )
     }
 
     /// Like [`new`](Self::new), but rooted at `dir` instead of the system
@@ -428,8 +432,8 @@ fn sqe_builder_readv_places_fields_correctly() {
 fn sqe_builder_readv_fixed_places_fields_correctly() {
     let mut buf = [0u8; 8];
     let vecs = [unsafe { IoVec::new(buf.as_mut_ptr(), buf.len()) }];
-    let sqe = unsafe { Sqe::readv_fixed(RawFd::from_raw(3), vecs.as_ptr(), 1, 50, 7) }
-        .user_data(10);
+    let sqe =
+        unsafe { Sqe::readv_fixed(RawFd::from_raw(3), vecs.as_ptr(), 1, 50, 7) }.user_data(10);
     let inner = sqe.0;
 
     assert_eq!(Opcode::ReadvFixed, inner.opcode);
@@ -445,8 +449,8 @@ fn sqe_builder_readv_fixed_places_fields_correctly() {
 fn sqe_builder_writev_fixed_places_fields_correctly() {
     let buf = [1u8; 8];
     let vecs = [unsafe { IoVec::new(buf.as_ptr().cast_mut(), buf.len()) }];
-    let sqe = unsafe { Sqe::writev_fixed(RawFd::from_raw(4), vecs.as_ptr(), 1, 20, 3) }
-        .user_data(11);
+    let sqe =
+        unsafe { Sqe::writev_fixed(RawFd::from_raw(4), vecs.as_ptr(), 1, 20, 3) }.user_data(11);
     let inner = sqe.0;
 
     assert_eq!(Opcode::WritevFixed, inner.opcode);
@@ -634,10 +638,7 @@ fn sqe_builder_cancel_fd_matches_by_descriptor() {
 
     assert_eq!(Opcode::AsyncCancel, inner.opcode);
     assert_eq!(inner.fd, 7);
-    assert_eq!(
-        inner.op_flags,
-        (CancelFlags::FD | CancelFlags::ALL).bits()
-    );
+    assert_eq!(inner.op_flags, (CancelFlags::FD | CancelFlags::ALL).bits());
 }
 
 #[test]
@@ -649,10 +650,7 @@ fn sqe_builder_cancel_any_ignores_user_data() {
 
     assert_eq!(Opcode::AsyncCancel, inner.opcode);
     assert_eq!(inner.addr, 0);
-    assert_eq!(
-        inner.op_flags,
-        (CancelFlags::ANY | CancelFlags::ALL).bits()
-    );
+    assert_eq!(inner.op_flags, (CancelFlags::ANY | CancelFlags::ALL).bits());
 }
 
 #[test]
@@ -773,12 +771,19 @@ fn a_real_sync_cancel_stops_a_pending_timeout_without_a_submit_round_trip() {
     ring.submit().expect("submit timeout");
 
     let outcome = ring
-        .sync_cancel(SyncCancelReg::user_data(target_user_data, CancelFlags::empty()))
+        .sync_cancel(SyncCancelReg::user_data(
+            target_user_data,
+            CancelFlags::empty(),
+        ))
         .expect("sync_cancel register call");
-    assert!(outcome.is_applied(), "expected the timeout to be cancelled, got {outcome:?}");
+    assert!(
+        outcome.is_applied(),
+        "expected the timeout to be cancelled, got {outcome:?}"
+    );
 
     // The cancelled timeout still posts its own CQE, reporting -ECANCELED.
-    ring.submit_and_wait(1).expect("wait for cancelled timeout's cqe");
+    ring.submit_and_wait(1)
+        .expect("wait for cancelled timeout's cqe");
     let cqe = ring.complete().expect("completion");
     assert_eq!(cqe.user_data, target_user_data);
     assert_eq!(cqe.result, -125); // -ECANCELED
@@ -979,9 +984,8 @@ fn sqe_builder_futex_wake_places_fields_correctly() {
 #[test]
 fn sqe_builder_futex_waitv_places_fields_correctly() {
     let word: u32 = 0;
-    let waiters = [unsafe {
-        FutexWaitv::new(core::ptr::from_ref(&word), 0, Futex2Flags::default_size())
-    }];
+    let waiters =
+        [unsafe { FutexWaitv::new(core::ptr::from_ref(&word), 0, Futex2Flags::default_size()) }];
     let sqe = unsafe { Sqe::futex_waitv(&waiters) }.user_data(42);
     let inner = sqe.0;
 
@@ -1489,7 +1493,10 @@ fn a_msg_ring_to_its_own_fd_posts_a_second_cqe() {
             saw_message = true;
         }
     }
-    assert!(saw_msg_ring_op, "the msg_ring request's own completion is missing");
+    assert!(
+        saw_msg_ring_op,
+        "the msg_ring request's own completion is missing"
+    );
     assert!(saw_message, "the posted message never arrived");
 }
 
@@ -1840,7 +1847,10 @@ fn a_real_tagged_file_table_posts_a_death_cqe_once_unregistered() {
             saw_nop = true;
         }
     }
-    assert!(saw_death_tag, "expected a CQE carrying the file's death tag");
+    assert!(
+        saw_death_tag,
+        "expected a CQE carrying the file's death tag"
+    );
     assert!(saw_nop, "expected the ordinary nop's own completion too");
 
     let _ = syscall::close(RawFd::from_raw(fd as usize));
@@ -1935,8 +1945,14 @@ fn a_real_clone_buffers_gives_the_destination_ring_a_usable_copy() {
     // virtual address is still valid for a fixed write through the
     // destination ring's copy of the buffer table.
     let sqe = unsafe {
-        Sqe::write_fixed(RawFd::from_raw(fd as usize), buf.as_ptr(), buf.len() as u32, 0, 0)
-            .user_data(1)
+        Sqe::write_fixed(
+            RawFd::from_raw(fd as usize),
+            buf.as_ptr(),
+            buf.len() as u32,
+            0,
+            0,
+        )
+        .user_data(1)
     };
     dst.push(sqe).expect("push write_fixed");
     dst.submit_and_wait(1).expect("submit");
@@ -1976,13 +1992,16 @@ fn setup_tcp_listener() -> (i32, u16) {
     let one: i32 = 1;
     // SOL_SOCKET=1, SO_REUSEADDR=2 — kernel constants, inlined here
     // because they're only needed by this test.
-    syscall::setsockopt(
-        rawfd,
-        1,
-        2,
-        (&raw const one).cast(),
-        core::mem::size_of::<i32>() as u32,
-    )
+    // Safety: `one` is a live local `i32`, matching `SO_REUSEADDR`'s ABI.
+    unsafe {
+        syscall::setsockopt(
+            rawfd,
+            1,
+            2,
+            (&raw const one).cast(),
+            core::mem::size_of::<i32>() as u32,
+        )
+    }
     .expect("setsockopt");
 
     let addr = SockAddrIn {
@@ -1991,18 +2010,23 @@ fn setup_tcp_listener() -> (i32, u16) {
         sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
         sin_zero: [0; 8],
     };
-    syscall::bind(
-        rawfd,
-        (&raw const addr).cast(),
-        core::mem::size_of::<SockAddrIn>() as u32,
-    )
+    // Safety: `addr` is a live local `SockAddrIn`, exactly the size passed.
+    unsafe {
+        syscall::bind(
+            rawfd,
+            (&raw const addr).cast(),
+            core::mem::size_of::<SockAddrIn>() as u32,
+        )
+    }
     .expect("bind");
     syscall::listen(rawfd, 1).expect("listen");
 
     // Retrieve the actual port assigned by the kernel
     let mut bound_addr = SockAddrIn::default();
     let mut addrlen = core::mem::size_of::<SockAddrIn>() as u32;
-    syscall::getsockname(rawfd, (&raw mut bound_addr).cast(), &raw mut addrlen)
+    // Safety: `bound_addr`/`addrlen` are live locals, `addrlen` initialized
+    // to `bound_addr`'s size.
+    unsafe { syscall::getsockname(rawfd, (&raw mut bound_addr).cast(), &raw mut addrlen) }
         .expect("getsockname");
 
     (fd, u16::from_be(bound_addr.sin_port))
@@ -2427,8 +2451,14 @@ fn a_real_incremental_buffer_ring_consumes_one_buffer_across_two_recvs() {
     );
 
     ring.push(
-        unsafe { Sqe::send(RawFd::from_raw(client as usize), second, MsgFlags::default()) }
-            .user_data(12),
+        unsafe {
+            Sqe::send(
+                RawFd::from_raw(client as usize),
+                second,
+                MsgFlags::default(),
+            )
+        }
+        .user_data(12),
     )
     .expect("push send 2");
     ring.submit_and_wait(1).expect("submit send 2");
@@ -2715,8 +2745,10 @@ fn provided_buffer_ring_recv_split_threads() {
         send_next_tx.send(()).expect("submit thread alive");
         // Small settle so the recv SQE is armed before/around the write; the
         // recv is robust to ordering either way (data is buffered in the socket).
-        let n = syscall::write(RawFd::from_raw(client as usize), msg.as_ptr(), msg.len())
-            .expect("write");
+        // Safety: `msg` is a live `String`, readable for its full length.
+        let n =
+            unsafe { syscall::write(RawFd::from_raw(client as usize), msg.as_ptr(), msg.len()) }
+                .expect("write");
         assert_eq!(n, msg.len());
 
         let (idx, payload) = got_rx
@@ -3377,7 +3409,10 @@ fn sqe_builder_read_multishot_places_fields_correctly() {
         SqeFlags::BUFFER_SELECT.bits()
     );
     assert_eq!(inner.buf_index, 9);
-    assert_eq!(inner.len, 0, "nbytes must be zero: the pool buffer's size governs the transfer");
+    assert_eq!(
+        inner.len, 0,
+        "nbytes must be zero: the pool buffer's size governs the transfer"
+    );
 }
 
 #[test]
@@ -3847,7 +3882,10 @@ fn sqe_builder_uring_cmd_sock_inq_places_cmd_op_and_fd() {
 
     assert_eq!(Opcode::UringCmd, inner.opcode);
     assert_eq!(inner.fd, 11);
-    assert_eq!(inner.cmd_op(), u32::from(crate::types::SocketUringCmdOp::SiocInq));
+    assert_eq!(
+        inner.cmd_op(),
+        u32::from(crate::types::SocketUringCmdOp::SiocInq)
+    );
 }
 
 #[cfg(not(miri))]
@@ -3912,10 +3950,8 @@ fn a_real_getsockopt_via_uring_cmd_reports_the_same_option_as_the_ordinary_sysca
 
     let mut ring = IoUring::new(4).expect("ring");
     let mut optval = [0u8; 4];
-    ring.push(
-        unsafe { Sqe::uring_cmd_sock_getsockopt(rawfd, 1, 3, &mut optval) }.user_data(1),
-    )
-    .expect("push");
+    ring.push(unsafe { Sqe::uring_cmd_sock_getsockopt(rawfd, 1, 3, &mut optval) }.user_data(1))
+        .expect("push");
     ring.submit_and_wait(1).expect("submit");
     let cqe = ring.complete().expect("cqe");
 
@@ -3927,7 +3963,11 @@ fn a_real_getsockopt_via_uring_cmd_reports_the_same_option_as_the_ordinary_sysca
         result => {
             assert_eq!(result, 4, "expected the 4-byte SO_TYPE option length back");
             let reported = i32::from_ne_bytes(optval);
-            assert_eq!(reported, types::SOCK_STREAM, "SO_TYPE should read back SOCK_STREAM");
+            assert_eq!(
+                reported,
+                types::SOCK_STREAM,
+                "SO_TYPE should read back SOCK_STREAM"
+            );
         }
     }
 
@@ -3954,7 +3994,9 @@ fn a_real_setsockopt_via_uring_cmd_changes_a_real_socket_option() {
         // Confirm through the ordinary syscall that the option actually changed.
         let mut readback: i32 = 0;
         let mut len = core::mem::size_of::<i32>() as u32;
-        syscall::getsockopt(rawfd, 1, 2, (&raw mut readback).cast(), &raw mut len)
+        // Safety: `readback`/`len` are live locals, `len` initialized to
+        // `readback`'s size.
+        unsafe { syscall::getsockopt(rawfd, 1, 2, (&raw mut readback).cast(), &raw mut len) }
             .expect("getsockopt readback");
         assert_eq!(readback, 1, "SO_REUSEADDR should now be set");
     }
@@ -4022,17 +4064,22 @@ fn a_nonblocking_socket_sqe_really_creates_a_nonblocking_socket() {
         sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
         sin_zero: [0; 8],
     };
-    syscall::bind(
-        fd,
-        (&raw const addr).cast(),
-        core::mem::size_of::<SockAddrIn>() as u32,
-    )
+    // Safety: `addr` is a live local `SockAddrIn`, exactly the size passed.
+    unsafe {
+        syscall::bind(
+            fd,
+            (&raw const addr).cast(),
+            core::mem::size_of::<SockAddrIn>() as u32,
+        )
+    }
     .expect("bind");
     syscall::listen(fd, 1).expect("listen");
 
     let mut peer = SockAddrIn::default();
     let mut len = core::mem::size_of::<SockAddrIn>() as u32;
-    let outcome = syscall::accept4(fd, (&raw mut peer).cast(), &raw mut len, 0);
+    // Safety: `peer`/`len` are live locals, `len` initialized to `peer`'s
+    // size.
+    let outcome = unsafe { syscall::accept4(fd, (&raw mut peer).cast(), &raw mut len, 0) };
     let err = outcome.expect_err("a non-blocking accept4 must not succeed here");
     assert_eq!(err.raw(), 11, "EAGAIN proves the flag was applied");
 
@@ -4124,7 +4171,10 @@ fn builder_coop_taskrun() {
 #[test]
 fn builder_iopoll_sets_the_flag_and_the_kernel_accepts_it() {
     let ring = IoUring::builder(4).iopoll().build().expect("iopoll setup");
-    assert!(ring.setup_flags().contains(crate::types::SetupFlags::IOPOLL));
+    assert!(
+        ring.setup_flags()
+            .contains(crate::types::SetupFlags::IOPOLL)
+    );
     drop(ring);
 }
 
@@ -4179,10 +4229,8 @@ fn a_real_iopoll_ring_writes_and_reads_back_through_o_direct() {
     let mut buf = MmapBuffer::with_capacity(4096).expect("mmap buffer");
     buf.as_mut_slice()[..5].copy_from_slice(b"iouri");
 
-    ring.push(
-        unsafe { Sqe::write(RawFd::from_raw(fd as usize), buf.as_slice(), 0) }.user_data(1),
-    )
-    .expect("push write");
+    ring.push(unsafe { Sqe::write(RawFd::from_raw(fd as usize), buf.as_slice(), 0) }.user_data(1))
+        .expect("push write");
     ring.submit_and_wait(1).expect("submit write");
     let cqe = ring.complete().expect("write cqe");
     assert_eq!(cqe.user_data, 1);
@@ -4201,8 +4249,7 @@ fn a_real_iopoll_ring_writes_and_reads_back_through_o_direct() {
 
     let mut read_buf = MmapBuffer::with_capacity(4096).expect("mmap buffer");
     ring.push(
-        unsafe { Sqe::read(RawFd::from_raw(fd as usize), read_buf.as_mut_slice(), 0) }
-            .user_data(2),
+        unsafe { Sqe::read(RawFd::from_raw(fd as usize), read_buf.as_mut_slice(), 0) }.user_data(2),
     )
     .expect("push read");
     ring.submit_and_wait(1).expect("submit read");
@@ -4235,7 +4282,10 @@ fn a_real_no_mmap_ring_completes_a_nop_with_caller_supplied_memory() {
         .no_mmap()
         .build()
         .expect("NO_MMAP ring should be accepted by this kernel (6.5+)");
-    assert!(ring.setup_flags().contains(crate::types::SetupFlags::NO_MMAP));
+    assert!(
+        ring.setup_flags()
+            .contains(crate::types::SetupFlags::NO_MMAP)
+    );
 
     ring.push_nop(7).expect("push nop");
     ring.submit_and_wait(1).expect("submit");
@@ -4254,20 +4304,27 @@ fn a_real_no_mmap_ring_rejects_a_plain_mmap_on_its_fd() {
     // the kernel documents rather than a silent, differently-sized map.
     use crate::types::{MapFlags, Prot, RingOffset};
 
-    let ring = IoUring::builder(4).no_mmap().build().expect("NO_MMAP setup");
+    let ring = IoUring::builder(4)
+        .no_mmap()
+        .build()
+        .expect("NO_MMAP setup");
     // The exact errno the kernel settles on here has drifted across
     // versions (EINVAL from `io_region_validate_mmap`'s explicit check,
     // ENOMEM from a later `vm_insert_pages` failure on some paths) --
     // what this crate's own correctness rests on is that the mmap fails
     // at all, not which errno names the rejection.
-    let _ = crate::syscall::mmap(
-        0,
-        4096,
-        Prot::READ | Prot::WRITE,
-        MapFlags::SHARED,
-        ring.raw_fd().as_usize(),
-        RingOffset::SqRing.into(),
-    )
+    // Safety: this call is expected to fail; the kernel rejects it before
+    // any mapping is established, so there is nothing here to clobber.
+    let _ = unsafe {
+        crate::syscall::mmap(
+            0,
+            4096,
+            Prot::READ | Prot::WRITE,
+            MapFlags::SHARED,
+            ring.raw_fd().as_usize(),
+            RingOffset::SqRing.into(),
+        )
+    }
     .expect_err("a NO_MMAP ring's fd must refuse a plain mmap");
 }
 
@@ -4341,7 +4398,11 @@ fn a_real_no_sqarray_ring_carries_several_submissions_in_order() {
         let cqe = ring.complete().expect("expected a completion");
         assert_eq!(cqe.result, 0);
         let idx = (cqe.user_data - 100) as usize;
-        assert!(!seen[idx], "duplicate completion for user_data {}", cqe.user_data);
+        assert!(
+            !seen[idx],
+            "duplicate completion for user_data {}",
+            cqe.user_data
+        );
         seen[idx] = true;
     }
     assert!(seen.iter().all(|&s| s), "not every pushed nop completed");
@@ -4484,7 +4545,8 @@ fn split_allows_default_flags() {
 fn splice_pipe_roundtrip() {
     use crate::types::SpliceFlags;
     let mut pipe_fds = [0i32; 2];
-    crate::syscall::pipe2(pipe_fds.as_mut_ptr(), 0).expect("pipe2");
+    // Safety: `pipe_fds` is a live local `[i32; 2]`, writable for two `i32`s.
+    unsafe { crate::syscall::pipe2(pipe_fds.as_mut_ptr(), 0) }.expect("pipe2");
     let [read_end, write_end] = pipe_fds;
 
     let mut ring = IoUring::new(8).expect("setup");
@@ -4535,7 +4597,8 @@ fn a_real_read_multishot_delivers_two_writes_from_one_armed_request() {
     use crate::types::CqeFlags;
 
     let mut pipe_fds = [0i32; 2];
-    crate::syscall::pipe2(pipe_fds.as_mut_ptr(), 0).expect("pipe2");
+    // Safety: `pipe_fds` is a live local `[i32; 2]`, writable for two `i32`s.
+    unsafe { crate::syscall::pipe2(pipe_fds.as_mut_ptr(), 0) }.expect("pipe2");
     let [read_end, write_end] = pipe_fds;
 
     let mut ring = IoUring::new(8).expect("setup");
@@ -4543,17 +4606,13 @@ fn a_real_read_multishot_delivers_two_writes_from_one_armed_request() {
         .register_provided_buffers(21, 4, 64)
         .expect("register_provided_buffers");
 
-    ring.push(
-        Sqe::read_multishot(RawFd::from_raw(read_end as usize), 0, 21).user_data(1),
-    )
-    .expect("push read_multishot");
+    ring.push(Sqe::read_multishot(RawFd::from_raw(read_end as usize), 0, 21).user_data(1))
+        .expect("push read_multishot");
     ring.submit().expect("submit");
 
     let first = b"first write";
-    ring.push(
-        unsafe { Sqe::write(RawFd::from_raw(write_end as usize), first, 0) }.user_data(2),
-    )
-    .expect("push write 1");
+    ring.push(unsafe { Sqe::write(RawFd::from_raw(write_end as usize), first, 0) }.user_data(2))
+        .expect("push write 1");
     ring.submit_and_wait(1).expect("submit write 1");
 
     let mut arrivals: Vec<Vec<u8>> = Vec::new();
@@ -4571,17 +4630,20 @@ fn a_real_read_multishot_delivers_two_writes_from_one_armed_request() {
         saw_more = true;
         let buf_id = cqe.buffer_id().expect("buffer_id present");
         #[allow(clippy::cast_sign_loss)]
-        let payload = pbuf.buffer(buf_id, cqe.result as u32).expect("buffer slice");
+        let payload = pbuf
+            .buffer(buf_id, cqe.result as u32)
+            .expect("buffer slice");
         arrivals.push(payload.to_vec());
         pbuf.recycle_and_commit(buf_id);
     }
-    assert!(saw_more, "the read must have delivered at least one arrival");
+    assert!(
+        saw_more,
+        "the read must have delivered at least one arrival"
+    );
 
     let second = b"second write";
-    ring.push(
-        unsafe { Sqe::write(RawFd::from_raw(write_end as usize), second, 0) }.user_data(3),
-    )
-    .expect("push write 2");
+    ring.push(unsafe { Sqe::write(RawFd::from_raw(write_end as usize), second, 0) }.user_data(3))
+        .expect("push write 2");
     ring.submit_and_wait(1).expect("submit write 2");
 
     loop {
@@ -4595,7 +4657,9 @@ fn a_real_read_multishot_delivers_two_writes_from_one_armed_request() {
         assert_eq!(cqe.user_data, 1);
         let buf_id = cqe.buffer_id().expect("buffer_id present");
         #[allow(clippy::cast_sign_loss)]
-        let payload = pbuf.buffer(buf_id, cqe.result as u32).expect("buffer slice");
+        let payload = pbuf
+            .buffer(buf_id, cqe.result as u32)
+            .expect("buffer slice");
         arrivals.push(payload.to_vec());
         pbuf.recycle_and_commit(buf_id);
     }
@@ -4623,7 +4687,8 @@ fn a_real_epoll_wait_reports_a_pipe_becoming_readable() {
     use crate::types::{EpollEvent, EpollEvents, EpollOp};
 
     let mut pipe_fds = [0i32; 2];
-    crate::syscall::pipe2(pipe_fds.as_mut_ptr(), 0).expect("pipe2");
+    // Safety: `pipe_fds` is a live local `[i32; 2]`, writable for two `i32`s.
+    unsafe { crate::syscall::pipe2(pipe_fds.as_mut_ptr(), 0) }.expect("pipe2");
     let [read_end, write_end] = pipe_fds;
 
     // SAFETY: a plain syscall with no pointer arguments.
@@ -4656,8 +4721,7 @@ fn a_real_epoll_wait_reports_a_pipe_becoming_readable() {
     // outstanding until the pipe becomes readable.
     let mut wait_events = [EpollEvent::default(); 1];
     ring.push(
-        unsafe { Sqe::epoll_wait(RawFd::from_raw(epfd as usize), &mut wait_events) }
-            .user_data(2),
+        unsafe { Sqe::epoll_wait(RawFd::from_raw(epfd as usize), &mut wait_events) }.user_data(2),
     )
     .expect("push epoll_wait");
     ring.submit().expect("submit wait");
@@ -5079,11 +5143,8 @@ fn error_display_delegates_to_inner() {
 fn a_real_ring_fd_registration_can_be_undone() {
     let mut ring = IoUring::new(4).expect("setup");
     let offset = ring.register_ring_fd().expect("register_ring_fd");
-    ring.unregister_ring_fd(offset)
-        .expect("unregister_ring_fd");
+    ring.unregister_ring_fd(offset).expect("unregister_ring_fd");
 }
-
-
 
 #[cfg(not(miri))]
 #[test]
@@ -5139,15 +5200,15 @@ fn a_real_r_disabled_ring_rejects_enter_until_enable_rings_is_called() {
     assert!(ring.setup_flags().contains(SetupFlags::R_DISABLED));
 
     ring.push_nop(1).expect("push");
-    ring.submit()
-        .expect_err("EBADFD: ring is still disabled");
+    ring.submit().expect_err("EBADFD: ring is still disabled");
 
     ring.enable_rings().expect("enable_rings");
 
     // The NOP pushed before enabling is still queued — flush_sq_tail was
     // called by the rejected submit(), so this round trips it the same
     // way any other submit would.
-    ring.submit_and_wait(1).expect("submit_and_wait after enable");
+    ring.submit_and_wait(1)
+        .expect("submit_and_wait after enable");
     let cqe = ring.complete().expect("nop completion");
     assert_eq!(cqe.user_data, 1);
     assert_eq!(cqe.result, 0);

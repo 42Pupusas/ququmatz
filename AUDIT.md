@@ -878,7 +878,26 @@ userspace storage, so there is no pointer lifetime to model.
 
 ### Q-04 — Safe raw syscall interface permits memory corruption
 
-**Status: confirmed.**
+**Status: fixed.** Every pointer/length-taking function in `src/syscall/mod.rs`
+(`io_uring_setup`, `mmap`, `munmap`, `connect`, `accept4`, `bind`,
+`getsockname`, `setsockopt`, `getsockopt`, `io_uring_register`, `sendto`,
+`recvfrom`, `read`, `write`, `pipe2`, `inotify_add_watch`) is now `unsafe
+fn` with a `# Safety` contract naming exactly what the caller must
+uphold (pointer validity, length, lifetime, aliasing). Every call site
+inside this crate -- `src/net.rs`, `src/eventfd.rs`, `src/inotify.rs`,
+`src/owned/buffer.rs`, `src/ring/mod.rs`, `src/ring/no_mmap.rs`,
+`src/ring/pbuf.rs`, `src/ring/probe.rs`, and the `io_uring_register`
+call sites in `src/ring/register.rs`/`src/ring/rsrc_tags.rs` (funneled
+through one `IoUring::register_raw` unsafe boundary) -- now wraps the
+call in `unsafe { }` with a comment justifying why the contract holds
+at that site. The crate's own safe public API (`Socket`, `EventFd`,
+`Inotify`, `IoUring`) is unaffected: none of it was reaching for these
+functions without already upholding their preconditions, so no
+caller-visible behavior changed. What changed is that external code can
+no longer reach a raw pointer/length syscall through `ququmatz::syscall`
+without writing `unsafe` itself.
+
+**Status (original): confirmed.**
 
 **Evidence:** `src/lib.rs` publicly exports `syscall`. `src/syscall/mod.rs` exposes safe pointer/length or integer-address wrappers including `read`, `recvfrom`, `getsockname`, `accept4`, `io_uring_setup`, `io_uring_register`, `mmap`, and `munmap`.
 

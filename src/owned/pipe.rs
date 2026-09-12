@@ -107,12 +107,7 @@ impl<D: StableBufferMut> PreparedPipe<D> {
         }
         let base = dest.stable_mut_ptr();
         if !base.addr().is_multiple_of(DEST_ALIGN) {
-            return Err((
-                dest,
-                PipeError::DestMisaligned {
-                    needed: DEST_ALIGN,
-                },
-            ));
+            return Err((dest, PipeError::DestMisaligned { needed: DEST_ALIGN }));
         }
         // The alignment check above is what makes this cast well-defined.
         #[allow(clippy::cast_ptr_alignment)]

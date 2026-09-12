@@ -95,14 +95,18 @@ const fn sqes_region_size(sq_entries: u32) -> usize {
 }
 
 fn alloc_anon(len: usize) -> Result<MappedRegion, Error> {
-    let addr = syscall::mmap(
-        0,
-        len,
-        Prot::READ | Prot::WRITE,
-        MapFlags::PRIVATE | MapFlags::ANONYMOUS,
-        usize::MAX,
-        0,
-    )?;
+    // Safety: `addr` 0 and `MapFlags::ANONYMOUS` mean the kernel picks a
+    // fresh, unused range; nothing existing can be clobbered.
+    let addr = unsafe {
+        syscall::mmap(
+            0,
+            len,
+            Prot::READ | Prot::WRITE,
+            MapFlags::PRIVATE | MapFlags::ANONYMOUS,
+            usize::MAX,
+            0,
+        )
+    }?;
     Ok(MappedRegion::new(addr, len))
 }
 
@@ -142,7 +146,9 @@ impl NoMmapGuard {
         let sqes_region = match alloc_anon(sqes_region_size(sq_entries)) {
             Ok(region) => region,
             Err(err) => {
-                let _ = syscall::munmap(ring_region.addr, ring_region.len);
+                // Safety: `ring_region` is this function's own just-allocated
+                // mapping, unmapped exactly once here before returning.
+                let _ = unsafe { syscall::munmap(ring_region.addr, ring_region.len) };
                 return Err(err);
             }
         };
@@ -161,7 +167,8 @@ impl NoMmapGuard {
     /// Take the regions out without running cleanup, for handing off to
     /// `SetupGuard` once `io_uring_setup` has succeeded.
     pub(super) const fn disarm(self) -> NoMmapRegions {
-        let regions = MappedRegion::new(self.regions.ring_region.addr, self.regions.ring_region.len);
+        let regions =
+            MappedRegion::new(self.regions.ring_region.addr, self.regions.ring_region.len);
         let sqes = MappedRegion::new(self.regions.sqes_region.addr, self.regions.sqes_region.len);
         core::mem::forget(self);
         NoMmapRegions {
@@ -173,7 +180,11 @@ impl NoMmapGuard {
 
 impl Drop for NoMmapGuard {
     fn drop(&mut self) {
-        let _ = syscall::munmap(self.regions.sqes_region.addr, self.regions.sqes_region.len);
-        let _ = syscall::munmap(self.regions.ring_region.addr, self.regions.ring_region.len);
+        // Safety: both regions are this guard's own mappings from `alloc`,
+        // each unmapped exactly once here and never used afterward.
+        let _ =
+            unsafe { syscall::munmap(self.regions.sqes_region.addr, self.regions.sqes_region.len) };
+        let _ =
+            unsafe { syscall::munmap(self.regions.ring_region.addr, self.regions.ring_region.len) };
     }
 }

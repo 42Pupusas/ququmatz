@@ -45,7 +45,12 @@ const fn check(ret: isize) -> Result<usize, Errno> {
     }
 }
 
-pub fn io_uring_setup(
+/// # Safety
+///
+/// `params` must be a valid, uniquely-owned, properly aligned pointer to an
+/// `IoUringParams` the kernel may both read and write for the duration of
+/// this call.
+pub unsafe fn io_uring_setup(
     entries: u32,
     params: *mut crate::types::IoUringParams,
 ) -> Result<RawFd, Errno> {
@@ -72,7 +77,14 @@ pub fn io_uring_enter(
     })
 }
 
-pub fn mmap(
+/// # Safety
+///
+/// The caller answers for every consequence of the resulting mapping: `addr`
+/// (when `MapFlags::FIXED` is set) must not clobber memory the caller does
+/// not own, and the returned mapping must be used consistently with `prot`
+/// and unmapped (via [`munmap`]) before its backing `fd`/offset assumptions
+/// stop holding.
+pub unsafe fn mmap(
     addr: usize,
     len: usize,
     prot: crate::types::Prot,
@@ -104,7 +116,12 @@ pub fn mmap(
     })
 }
 
-pub fn munmap(addr: usize, len: usize) -> Result<(), Errno> {
+/// # Safety
+///
+/// `addr..addr + len` must be a mapping the caller owns and is not still
+/// using through any live reference, and no other code may hold a
+/// reference into it after this call returns.
+pub unsafe fn munmap(addr: usize, len: usize) -> Result<(), Errno> {
     check(unsafe { syscall2(SYS_MUNMAP, addr, len) })?;
     Ok(())
 }
@@ -121,12 +138,26 @@ pub fn socket(domain: i32, sock_type: i32, protocol: i32) -> Result<RawFd, Errno
     .map(RawFd::from_raw)
 }
 
-pub fn connect(fd: RawFd, addr: *const u8, addrlen: u32) -> Result<(), Errno> {
+/// # Safety
+///
+/// `addr` must point to at least `addrlen` readable bytes of a valid
+/// socket-address structure for the duration of this call.
+pub unsafe fn connect(fd: RawFd, addr: *const u8, addrlen: u32) -> Result<(), Errno> {
     check(unsafe { syscall3(SYS_CONNECT, fd.as_usize(), addr as usize, addrlen as usize) })?;
     Ok(())
 }
 
-pub fn accept4(fd: RawFd, addr: *mut u8, addrlen: *mut u32, flags: i32) -> Result<RawFd, Errno> {
+/// # Safety
+///
+/// `addr` must point to a writable buffer at least `*addrlen` bytes long
+/// (or be null), and `addrlen` must point to a valid, initialized `u32`
+/// (or be null iff `addr` is), each writable for the duration of this call.
+pub unsafe fn accept4(
+    fd: RawFd,
+    addr: *mut u8,
+    addrlen: *mut u32,
+    flags: i32,
+) -> Result<RawFd, Errno> {
     check(unsafe {
         syscall4(
             SYS_ACCEPT4,
@@ -139,7 +170,11 @@ pub fn accept4(fd: RawFd, addr: *mut u8, addrlen: *mut u32, flags: i32) -> Resul
     .map(RawFd::from_raw)
 }
 
-pub fn bind(fd: RawFd, addr: *const u8, addrlen: u32) -> Result<(), Errno> {
+/// # Safety
+///
+/// `addr` must point to at least `addrlen` readable bytes of a valid
+/// socket-address structure for the duration of this call.
+pub unsafe fn bind(fd: RawFd, addr: *const u8, addrlen: u32) -> Result<(), Errno> {
     check(unsafe { syscall3(SYS_BIND, fd.as_usize(), addr as usize, addrlen as usize) })?;
     Ok(())
 }
@@ -149,7 +184,12 @@ pub fn listen(fd: RawFd, backlog: i32) -> Result<(), Errno> {
     Ok(())
 }
 
-pub fn getsockname(fd: RawFd, addr: *mut u8, addrlen: *mut u32) -> Result<(), Errno> {
+/// # Safety
+///
+/// `addr` must point to a writable buffer at least `*addrlen` bytes long,
+/// and `addrlen` must point to a valid, initialized `u32`, both writable
+/// for the duration of this call.
+pub unsafe fn getsockname(fd: RawFd, addr: *mut u8, addrlen: *mut u32) -> Result<(), Errno> {
     check(unsafe {
         syscall3(
             SYS_GETSOCKNAME,
@@ -161,7 +201,11 @@ pub fn getsockname(fd: RawFd, addr: *mut u8, addrlen: *mut u32) -> Result<(), Er
     Ok(())
 }
 
-pub fn setsockopt(
+/// # Safety
+///
+/// `optval` must point to at least `optlen` readable bytes whose layout
+/// matches what `level`/`optname` expect, for the duration of this call.
+pub unsafe fn setsockopt(
     fd: RawFd,
     level: i32,
     optname: i32,
@@ -181,7 +225,12 @@ pub fn setsockopt(
     Ok(())
 }
 
-pub fn getsockopt(
+/// # Safety
+///
+/// `optval` must point to a writable buffer at least `*optlen` bytes long,
+/// and `optlen` must point to a valid, initialized `u32`, both writable for
+/// the duration of this call.
+pub unsafe fn getsockopt(
     fd: RawFd,
     level: i32,
     optname: i32,
@@ -201,7 +250,17 @@ pub fn getsockopt(
     Ok(())
 }
 
-pub fn io_uring_register(fd: RawFd, opcode: u32, arg: usize, nr_args: u32) -> Result<usize, Errno> {
+/// # Safety
+///
+/// `arg` is an opcode-dependent pointer-or-integer argument; when it is a
+/// pointer, the caller must ensure it references memory of the layout and
+/// length `opcode`/`nr_args` require, valid for the duration of this call.
+pub unsafe fn io_uring_register(
+    fd: RawFd,
+    opcode: u32,
+    arg: usize,
+    nr_args: u32,
+) -> Result<usize, Errno> {
     check(unsafe {
         syscall4(
             SYS_IO_URING_REGISTER,
@@ -213,7 +272,11 @@ pub fn io_uring_register(fd: RawFd, opcode: u32, arg: usize, nr_args: u32) -> Re
     })
 }
 
-pub fn sendto(fd: RawFd, buf: *const u8, len: usize, flags: u32) -> Result<usize, Errno> {
+/// # Safety
+///
+/// `buf` must point to at least `len` readable bytes for the duration of
+/// this call.
+pub unsafe fn sendto(fd: RawFd, buf: *const u8, len: usize, flags: u32) -> Result<usize, Errno> {
     check(unsafe {
         syscall6(
             SYS_SENDTO,
@@ -227,7 +290,11 @@ pub fn sendto(fd: RawFd, buf: *const u8, len: usize, flags: u32) -> Result<usize
     })
 }
 
-pub fn recvfrom(fd: RawFd, buf: *mut u8, len: usize, flags: u32) -> Result<usize, Errno> {
+/// # Safety
+///
+/// `buf` must point to a writable buffer at least `len` bytes long for the
+/// duration of this call.
+pub unsafe fn recvfrom(fd: RawFd, buf: *mut u8, len: usize, flags: u32) -> Result<usize, Errno> {
     check(unsafe {
         syscall6(
             SYS_RECVFROM,
@@ -246,11 +313,19 @@ pub fn shutdown(fd: RawFd, how: u32) -> Result<(), Errno> {
     Ok(())
 }
 
-pub fn read(fd: RawFd, buf: *mut u8, len: usize) -> Result<usize, Errno> {
+/// # Safety
+///
+/// `buf` must point to a writable buffer at least `len` bytes long for the
+/// duration of this call.
+pub unsafe fn read(fd: RawFd, buf: *mut u8, len: usize) -> Result<usize, Errno> {
     check(unsafe { syscall3(SYS_READ, fd.as_usize(), buf as usize, len) })
 }
 
-pub fn write(fd: RawFd, buf: *const u8, len: usize) -> Result<usize, Errno> {
+/// # Safety
+///
+/// `buf` must point to at least `len` readable bytes for the duration of
+/// this call.
+pub unsafe fn write(fd: RawFd, buf: *const u8, len: usize) -> Result<usize, Errno> {
     check(unsafe { syscall3(SYS_WRITE, fd.as_usize(), buf as usize, len) })
 }
 
@@ -266,7 +341,11 @@ pub fn eventfd2(initval: u32, flags: i32) -> Result<RawFd, Errno> {
 /// `pipe2(2)`. Only the tests reach for this, but it lives here so it
 /// picks up the per-architecture syscall number like every other call
 /// rather than hard-coding `x86_64`'s in the test module.
-pub fn pipe2(fds: *mut i32, flags: i32) -> Result<(), Errno> {
+/// # Safety
+///
+/// `fds` must point to a writable buffer of at least two `i32`s for the
+/// duration of this call.
+pub unsafe fn pipe2(fds: *mut i32, flags: i32) -> Result<(), Errno> {
     check(unsafe { syscall2(SYS_PIPE2, fds as usize, flags as usize) })?;
     Ok(())
 }
@@ -275,7 +354,11 @@ pub fn inotify_init1(flags: i32) -> Result<RawFd, Errno> {
     check(unsafe { syscall1(SYS_INOTIFY_INIT1, flags as usize) }).map(RawFd::from_raw)
 }
 
-pub fn inotify_add_watch(fd: RawFd, path: *const u8, mask: u32) -> Result<usize, Errno> {
+/// # Safety
+///
+/// `path` must point to a valid, nul-terminated C string readable for the
+/// duration of this call.
+pub unsafe fn inotify_add_watch(fd: RawFd, path: *const u8, mask: u32) -> Result<usize, Errno> {
     check(unsafe {
         syscall3(
             SYS_INOTIFY_ADD_WATCH,

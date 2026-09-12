@@ -5,17 +5,16 @@ extern crate std;
 use super::{
     Arrival, BindError, BindOutcome, CancelTarget, Completed, ConnectError, ConnectOutcome, Count,
     Delivery, DirectIncoming, DirectOpenError, DirectSlot, DirectSocketError, Direction,
-    EpollChange, EpollError, EpollOutcome, Event, Expiry, FilesUpdateError, Incoming, MmapBuffer,
-    MsgRegionError, Openat2Error, Openat2Mode, OwnedPath, PathError, PeerWanted, Pending,
-    PendingStatx, PendingZc, Prepared, PreparedAccept, PreparedBind, PreparedCancel,
-    PreparedConnect, PreparedDirectAccept, PreparedDirectOpen, PreparedDirectSocket,
-    EpollWaitError, PreparedEpollCtl, PreparedEpollWait, PreparedFilesUpdate,
-    PreparedFixedFdInstall, PreparedLink, PreparedMsgRing,
-    PreparedMultishot, PreparedOpen, PreparedOpenat2, PreparedPathOp, PreparedPipe,
-    PreparedReadMultishot, PreparedRecvmsg,
+    EpollChange, EpollError, EpollOutcome, EpollWaitError, Event, Expiry, FilesUpdateError,
+    Incoming, MmapBuffer, MsgRegionError, Openat2Error, Openat2Mode, OwnedPath, PathError,
+    PeerWanted, Pending, PendingStatx, PendingZc, PipeError, Prepared, PreparedAccept,
+    PreparedBind, PreparedCancel, PreparedConnect, PreparedDirectAccept, PreparedDirectOpen,
+    PreparedDirectSocket, PreparedEpollCtl, PreparedEpollWait, PreparedFilesUpdate,
+    PreparedFixedFdInstall, PreparedLink, PreparedMsgRing, PreparedMultishot, PreparedOpen,
+    PreparedOpenat2, PreparedPathOp, PreparedPipe, PreparedReadMultishot, PreparedRecvmsg,
     PreparedRename, PreparedSendmsg, PreparedSendmsgZc, PreparedStatx, PreparedTimeout,
-    PreparedVectored, PreparedWaitId, PreparedZc, PipeError, Receipt, RenameMode, RingId,
-    SendTarget, SlotIndex, SlotTarget, StableBuffer, StatxError, TableEntry, TimeoutError, Update,
+    PreparedVectored, PreparedWaitId, PreparedZc, Receipt, RenameMode, RingId, SendTarget,
+    SlotIndex, SlotTarget, StableBuffer, StatxError, TableEntry, TimeoutError, Update,
     VectoredError, WaitIdError, ZcCompleted,
 };
 /// Only the kernel-backed tests name a path-op kind or inspect a peer
@@ -398,13 +397,16 @@ impl Listener {
 
         let fd = syscall::socket(types::AF_INET, sock_type, 0).expect("listener");
         let one: i32 = 1;
-        syscall::setsockopt(
-            fd,
-            1,
-            2,
-            (&raw const one).cast(),
-            core::mem::size_of::<i32>() as u32,
-        )
+        // Safety: `one` is a live local `i32`, matching `SO_REUSEADDR`'s ABI.
+        unsafe {
+            syscall::setsockopt(
+                fd,
+                1,
+                2,
+                (&raw const one).cast(),
+                core::mem::size_of::<i32>() as u32,
+            )
+        }
         .expect("setsockopt");
 
         let wanted = SockAddrIn {
@@ -413,17 +415,24 @@ impl Listener {
             sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
             sin_zero: [0; 8],
         };
-        syscall::bind(
-            fd,
-            (&raw const wanted).cast(),
-            core::mem::size_of::<SockAddrIn>() as u32,
-        )
+        // Safety: `wanted` is a live local `SockAddrIn`, exactly the size
+        // passed.
+        unsafe {
+            syscall::bind(
+                fd,
+                (&raw const wanted).cast(),
+                core::mem::size_of::<SockAddrIn>() as u32,
+            )
+        }
         .expect("bind");
         syscall::listen(fd, 16).expect("listen");
 
         let mut addr = SockAddrIn::default();
         let mut len = core::mem::size_of::<SockAddrIn>() as u32;
-        syscall::getsockname(fd, (&raw mut addr).cast(), &raw mut len).expect("getsockname");
+        // Safety: `addr`/`len` are live locals, `len` initialized to
+        // `addr`'s size.
+        unsafe { syscall::getsockname(fd, (&raw mut addr).cast(), &raw mut len) }
+            .expect("getsockname");
 
         Self { fd, addr }
     }
@@ -447,11 +456,15 @@ impl Listener {
 
         let client =
             syscall::socket(crate::types::AF_INET, crate::types::SOCK_STREAM, 0).expect("client");
-        syscall::connect(
-            client,
-            (&raw const self.addr).cast(),
-            core::mem::size_of::<SockAddrIn>() as u32,
-        )
+        // Safety: `self.addr` is a live `SockAddrIn`, exactly the size
+        // passed.
+        unsafe {
+            syscall::connect(
+                client,
+                (&raw const self.addr).cast(),
+                core::mem::size_of::<SockAddrIn>() as u32,
+            )
+        }
         .expect("connect");
         client
     }
@@ -480,13 +493,16 @@ impl SocketPair {
 
         let listener = syscall::socket(types::AF_INET, types::SOCK_STREAM, 0).expect("listener");
         let one: i32 = 1;
-        syscall::setsockopt(
-            listener,
-            1,
-            2,
-            (&raw const one).cast(),
-            core::mem::size_of::<i32>() as u32,
-        )
+        // Safety: `one` is a live local `i32`, matching `SO_REUSEADDR`'s ABI.
+        unsafe {
+            syscall::setsockopt(
+                listener,
+                1,
+                2,
+                (&raw const one).cast(),
+                core::mem::size_of::<i32>() as u32,
+            )
+        }
         .expect("setsockopt");
 
         let addr = SockAddrIn {
@@ -495,30 +511,44 @@ impl SocketPair {
             sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
             sin_zero: [0; 8],
         };
-        syscall::bind(
-            listener,
-            (&raw const addr).cast(),
-            core::mem::size_of::<SockAddrIn>() as u32,
-        )
+        // Safety: `addr` is a live local `SockAddrIn`, exactly the size
+        // passed.
+        unsafe {
+            syscall::bind(
+                listener,
+                (&raw const addr).cast(),
+                core::mem::size_of::<SockAddrIn>() as u32,
+            )
+        }
         .expect("bind");
         syscall::listen(listener, 1).expect("listen");
 
         let mut bound = SockAddrIn::default();
         let mut len = core::mem::size_of::<SockAddrIn>() as u32;
-        syscall::getsockname(listener, (&raw mut bound).cast(), &raw mut len).expect("getsockname");
+        // Safety: `bound`/`len` are live locals, `len` initialized to
+        // `bound`'s size.
+        unsafe { syscall::getsockname(listener, (&raw mut bound).cast(), &raw mut len) }
+            .expect("getsockname");
 
         let client = syscall::socket(types::AF_INET, types::SOCK_STREAM, 0).expect("client");
-        syscall::connect(
-            client,
-            (&raw const bound).cast(),
-            core::mem::size_of::<SockAddrIn>() as u32,
-        )
+        // Safety: `bound` is a live local `SockAddrIn`, exactly the size
+        // passed.
+        unsafe {
+            syscall::connect(
+                client,
+                (&raw const bound).cast(),
+                core::mem::size_of::<SockAddrIn>() as u32,
+            )
+        }
         .expect("connect");
 
         let mut peer = SockAddrIn::default();
         let mut peer_len = core::mem::size_of::<SockAddrIn>() as u32;
-        let server = syscall::accept4(listener, (&raw mut peer).cast(), &raw mut peer_len, 0)
-            .expect("accept");
+        // Safety: `peer`/`peer_len` are live locals, `peer_len` initialized
+        // to `peer`'s size.
+        let server =
+            unsafe { syscall::accept4(listener, (&raw mut peer).cast(), &raw mut peer_len, 0) }
+                .expect("accept");
 
         Self {
             client: Some(client),
@@ -533,11 +563,13 @@ impl SocketPair {
     }
 
     fn read_server(&self, out: &mut [u8]) -> usize {
-        crate::syscall::read(self.server, out.as_mut_ptr(), out.len()).expect("read")
+        // Safety: `out` is a live `&mut [u8]`, writable for its full length.
+        unsafe { crate::syscall::read(self.server, out.as_mut_ptr(), out.len()) }.expect("read")
     }
 
     fn write_client(&self, bytes: &[u8]) -> usize {
-        crate::syscall::write(self.client(), bytes.as_ptr(), bytes.len()).expect("write")
+        // Safety: `bytes` is a live `&[u8]`, readable for its full length.
+        unsafe { crate::syscall::write(self.client(), bytes.as_ptr(), bytes.len()) }.expect("write")
     }
 
     /// Close the client so the server sees EOF, ending a multishot.
@@ -691,7 +723,8 @@ fn a_real_multishot_recv_delivers_many_arrivals_from_one_submission() {
 #[test]
 fn a_real_multishot_read_delivers_two_writes_from_one_armed_request() {
     let mut pipe_fds = [0i32; 2];
-    crate::syscall::pipe2(pipe_fds.as_mut_ptr(), 0).expect("pipe2");
+    // Safety: `pipe_fds` is a live local `[i32; 2]`, writable for two `i32`s.
+    unsafe { crate::syscall::pipe2(pipe_fds.as_mut_ptr(), 0) }.expect("pipe2");
     let [read_end, write_end] = pipe_fds;
     let read_end = RawFd::from_raw(read_end as usize);
     let write_end = RawFd::from_raw(write_end as usize);
@@ -712,7 +745,8 @@ fn a_real_multishot_read_delivers_two_writes_from_one_armed_request() {
     let mut received: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
     for msg in sent {
         assert_eq!(
-            crate::syscall::write(write_end, msg.as_ptr(), msg.len()).expect("write"),
+            // Safety: `msg` is a live `&[u8]`, readable for its full length.
+            unsafe { crate::syscall::write(write_end, msg.as_ptr(), msg.len()) }.expect("write"),
             msg.len()
         );
         loop {
@@ -1054,7 +1088,9 @@ fn a_real_multishot_accept_yields_many_connections_from_one_submission() {
         let sent = socket.send(b"hi", MsgFlags::default()).expect("send");
         assert_eq!(sent, 2);
         let mut seen = [0u8; 2];
-        let got = crate::syscall::read(*client, seen.as_mut_ptr(), seen.len()).expect("read");
+        // Safety: `seen` is a live local `[u8; 2]`, writable for its length.
+        let got =
+            unsafe { crate::syscall::read(*client, seen.as_mut_ptr(), seen.len()) }.expect("read");
         assert_eq!(&seen[..got], b"hi");
     }
 
@@ -1084,9 +1120,12 @@ fn a_finished_accept_hands_back_the_connection_folded_into_its_last_cqe() {
     let client = listener.connect();
     let mut peer = crate::types::SockAddrIn::default();
     let mut peer_len = core::mem::size_of::<crate::types::SockAddrIn>() as u32;
-    let installed =
+    // Safety: `peer`/`peer_len` are live locals, `peer_len` initialized to
+    // `peer`'s size.
+    let installed = unsafe {
         crate::syscall::accept4(listener.fd, (&raw mut peer).cast(), &raw mut peer_len, 0)
-            .expect("accept");
+    }
+    .expect("accept");
 
     let terminal = Event::Complete(super::request::Receipt {
         ring: ticket.ring(),
@@ -1107,7 +1146,8 @@ fn a_finished_accept_hands_back_the_connection_folded_into_its_last_cqe() {
     let sent = socket.send(b"ok", MsgFlags::default()).expect("send");
     assert_eq!(sent, 2);
     let mut seen = [0u8; 2];
-    let got = crate::syscall::read(client, seen.as_mut_ptr(), seen.len()).expect("read");
+    // Safety: `seen` is a live local `[u8; 2]`, writable for its length.
+    let got = unsafe { crate::syscall::read(client, seen.as_mut_ptr(), seen.len()) }.expect("read");
     assert_eq!(&seen[..got], b"ok");
 
     let (_receipt, last) = finished.into_parts();
@@ -1199,7 +1239,9 @@ fn a_real_direct_accept_installs_connections_into_the_table_not_the_process() {
         assert_eq!(cqe.raw_result(), 2, "write through the slot");
 
         let mut seen = [0u8; 2];
-        let got = crate::syscall::read(*client, seen.as_mut_ptr(), seen.len()).expect("read");
+        // Safety: `seen` is a live local `[u8; 2]`, writable for its length.
+        let got =
+            unsafe { crate::syscall::read(*client, seen.as_mut_ptr(), seen.len()) }.expect("read");
         assert_eq!(&seen[..got], b"hi");
     }
 
@@ -2062,7 +2104,9 @@ fn a_real_fixed_fd_install_promotes_a_table_slot_to_a_process_descriptor() {
             .unwrap_or_else(|(_, e)| panic!("{e}"));
         sub.submit_and_wait(1).expect("submit");
         let receipt = comp.wait_one().expect("completion");
-        ticket.redeem(receipt).unwrap_or_else(|_| panic!("mismatch"))
+        ticket
+            .redeem(receipt)
+            .unwrap_or_else(|_| panic!("mismatch"))
     };
     let (slot, _path) = opened.into_parts();
     let slot = slot.expect("a successful direct open names a slot");
@@ -2088,7 +2132,9 @@ fn a_real_fixed_fd_install_promotes_a_table_slot_to_a_process_descriptor() {
     // The returned descriptor is a real, independent fd: writing through
     // it (a plain syscall, not fixed_file -- it is no longer a table
     // index) reaches the same file the slot still names.
-    let written = crate::syscall::write(file.fd(), b"promoted".as_ptr(), 8).expect("write");
+    // Safety: the byte-string literal is a static, readable 8-byte buffer.
+    let written =
+        unsafe { crate::syscall::write(file.fd(), b"promoted".as_ptr(), 8) }.expect("write");
     assert_eq!(written, 8);
 
     // The slot itself was left alone: the table can still reach the same
@@ -3983,15 +4029,22 @@ fn an_addressed_send_reaches_a_peer_the_socket_never_connected_to() {
         sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
         sin_zero: [0; 8],
     };
-    syscall::bind(
-        dest,
-        (&raw const wanted).cast(),
-        core::mem::size_of::<SockAddrIn>() as u32,
-    )
+    // Safety: `wanted` is a live local `SockAddrIn`, exactly the size
+    // passed.
+    unsafe {
+        syscall::bind(
+            dest,
+            (&raw const wanted).cast(),
+            core::mem::size_of::<SockAddrIn>() as u32,
+        )
+    }
     .expect("bind");
     let mut bound = SockAddrIn::default();
     let mut len = core::mem::size_of::<SockAddrIn>() as u32;
-    syscall::getsockname(dest, (&raw mut bound).cast(), &raw mut len).expect("getsockname");
+    // Safety: `bound`/`len` are live locals, `len` initialized to `bound`'s
+    // size.
+    unsafe { syscall::getsockname(dest, (&raw mut bound).cast(), &raw mut len) }
+        .expect("getsockname");
 
     let sender = syscall::socket(types::AF_INET, 2, 0).expect("sender");
     let ring = crate::IoUring::new(4).expect("ring");
@@ -4017,7 +4070,8 @@ fn an_addressed_send_reaches_a_peer_the_socket_never_connected_to() {
     assert_eq!(done.result().expect("send ok"), 9);
 
     let mut got = [0u8; 32];
-    let n = syscall::recvfrom(dest, got.as_mut_ptr(), got.len(), 0).expect("recv");
+    // Safety: `got` is a live local `[u8; 32]`, writable for its length.
+    let n = unsafe { syscall::recvfrom(dest, got.as_mut_ptr(), got.len(), 0) }.expect("recv");
     assert_eq!(&got[..n], b"addressed");
 
     let _ = syscall::close(sender);
@@ -4180,11 +4234,15 @@ impl DatagramPair {
         // The sender is bound too, so the receiver has a real peer address
         // to report rather than an ephemeral unbound one.
         let tx_addr = Self::bind(tx);
-        crate::syscall::connect(
-            tx,
-            (&raw const rx_addr).cast(),
-            core::mem::size_of::<SockAddrIn>() as u32,
-        )
+        // Safety: `rx_addr` is a live local `SockAddrIn`, exactly the size
+        // passed.
+        unsafe {
+            crate::syscall::connect(
+                tx,
+                (&raw const rx_addr).cast(),
+                core::mem::size_of::<SockAddrIn>() as u32,
+            )
+        }
         .expect("connect tx");
         Self { tx, rx, tx_addr }
     }
@@ -4200,21 +4258,28 @@ impl DatagramPair {
             sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
             sin_zero: [0; 8],
         };
-        crate::syscall::bind(
-            fd,
-            (&raw const wanted).cast(),
-            core::mem::size_of::<SockAddrIn>() as u32,
-        )
+        // Safety: `wanted` is a live local `SockAddrIn`, exactly the size
+        // passed.
+        unsafe {
+            crate::syscall::bind(
+                fd,
+                (&raw const wanted).cast(),
+                core::mem::size_of::<SockAddrIn>() as u32,
+            )
+        }
         .expect("bind");
         let mut bound = SockAddrIn::default();
         let mut len = core::mem::size_of::<SockAddrIn>() as u32;
-        crate::syscall::getsockname(fd, (&raw mut bound).cast(), &raw mut len)
+        // Safety: `bound`/`len` are live locals, `len` initialized to
+        // `bound`'s size.
+        unsafe { crate::syscall::getsockname(fd, (&raw mut bound).cast(), &raw mut len) }
             .expect("getsockname");
         bound
     }
 
     fn send(&self, bytes: &[u8]) {
-        crate::syscall::sendto(self.tx, bytes.as_ptr(), bytes.len(), 0).expect("sendto");
+        // Safety: `bytes` is a live `&[u8]`, readable for its full length.
+        unsafe { crate::syscall::sendto(self.tx, bytes.as_ptr(), bytes.len(), 0) }.expect("sendto");
     }
 }
 
@@ -4376,13 +4441,18 @@ fn a_peer_larger_than_the_reserved_slot_is_reported_rather_than_handed_back_as_a
     wanted[8..24].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
 
     let rx = syscall::socket(AF_INET6, 2, 0).expect("rx6");
-    syscall::bind(rx, wanted.as_ptr(), 28).expect("bind6");
+    // Safety: `wanted` is a live local `[u8; 28]`, readable for 28 bytes.
+    unsafe { syscall::bind(rx, wanted.as_ptr(), 28) }.expect("bind6");
     let mut bound = [0u8; 28];
     let mut len = 28u32;
-    syscall::getsockname(rx, bound.as_mut_ptr(), &raw mut len).expect("getsockname6");
+    // Safety: `bound`/`len` are live locals, `len` initialized to `bound`'s
+    // length.
+    unsafe { syscall::getsockname(rx, bound.as_mut_ptr(), &raw mut len) }.expect("getsockname6");
     let tx = syscall::socket(AF_INET6, 2, 0).expect("tx6");
-    syscall::connect(tx, bound.as_ptr(), 28).expect("connect6");
-    syscall::sendto(tx, b"six".as_ptr(), 3, 0).expect("sendto");
+    // Safety: `bound` is a live local `[u8; 28]`, readable for 28 bytes.
+    unsafe { syscall::connect(tx, bound.as_ptr(), 28) }.expect("connect6");
+    // Safety: the byte-string literal is a static, readable 3-byte buffer.
+    unsafe { syscall::sendto(tx, b"six".as_ptr(), 3, 0) }.expect("sendto");
 
     let ring = crate::IoUring::new(4).expect("ring");
     let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
@@ -4440,7 +4510,9 @@ impl UnixDatagram {
         let _ = std::fs::remove_file(path);
         let fd = crate::syscall::socket(Self::AF_UNIX, 2, 0).expect("unix socket");
         let (addr, len) = Self::sockaddr_un(path);
-        crate::syscall::bind(fd, addr.as_ptr(), len).expect("bind unix");
+        // Safety: `addr` is a live local `[u8; 110]`, and `len` was
+        // computed to be within its bounds.
+        unsafe { crate::syscall::bind(fd, addr.as_ptr(), len) }.expect("bind unix");
         Self {
             fd,
             path: std::string::String::from(path),
@@ -4449,11 +4521,15 @@ impl UnixDatagram {
 
     fn connect_to(&self, path: &str) {
         let (addr, len) = Self::sockaddr_un(path);
-        crate::syscall::connect(self.fd, addr.as_ptr(), len).expect("connect unix");
+        // Safety: `addr` is a live local `[u8; 110]`, and `len` was
+        // computed to be within its bounds.
+        unsafe { crate::syscall::connect(self.fd, addr.as_ptr(), len) }.expect("connect unix");
     }
 
     fn send(&self, bytes: &[u8]) {
-        crate::syscall::sendto(self.fd, bytes.as_ptr(), bytes.len(), 0).expect("sendto unix");
+        // Safety: `bytes` is a live `&[u8]`, readable for its full length.
+        unsafe { crate::syscall::sendto(self.fd, bytes.as_ptr(), bytes.len(), 0) }
+            .expect("sendto unix");
     }
 
     /// `struct sockaddr_un` plus the length that covers family, path, and
@@ -6562,8 +6638,8 @@ fn an_epoll_ticket_survives_moving_to_another_thread_before_completion() {
 #[test]
 fn an_epoll_wait_sizes_its_max_events_from_the_storage_it_was_given() {
     let store = MmapBuffer::with_capacity(core::mem::size_of::<EpollEvent>() * 3).expect("map");
-    let prepared = PreparedEpollWait::new(RawFd::from_raw(9), store)
-        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let prepared =
+        PreparedEpollWait::new(RawFd::from_raw(9), store).unwrap_or_else(|(_, e)| panic!("{e}"));
     assert_eq!(prepared.epfd(), RawFd::from_raw(9));
     assert_eq!(prepared.max_events(), 3);
 }
@@ -6593,8 +6669,8 @@ fn an_epoll_wait_push_that_does_not_fit_hands_the_storage_back() {
 
     let store = epoll_store();
     let addr = store.stable_ptr();
-    let prepared = PreparedEpollWait::new(RawFd::from_raw(9), store)
-        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let prepared =
+        PreparedEpollWait::new(RawFd::from_raw(9), store).unwrap_or_else(|(_, e)| panic!("{e}"));
 
     let Err((returned, e)) = sub.push_epoll_wait(prepared) else {
         panic!("a full queue must reject the push");
@@ -6638,7 +6714,8 @@ fn a_real_epoll_wait_reports_a_pipe_becoming_readable_through_the_owned_path() {
     let set = EpollSet::new();
 
     let mut pipe_fds = [0i32; 2];
-    crate::syscall::pipe2(pipe_fds.as_mut_ptr(), 0).expect("pipe2");
+    // Safety: `pipe_fds` is a live local `[i32; 2]`, writable for two `i32`s.
+    unsafe { crate::syscall::pipe2(pipe_fds.as_mut_ptr(), 0) }.expect("pipe2");
     let [read_end, write_end] = pipe_fds;
     let read_end = RawFd::from_raw(read_end as usize);
     let write_end = RawFd::from_raw(write_end as usize);
@@ -6731,8 +6808,8 @@ fn pipe_store() -> MmapBuffer {
 
 #[test]
 fn a_pipe_reports_its_flags_before_submission() {
-    let prepared = PreparedPipe::new(PipeFlags::NONBLOCK, pipe_store())
-        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let prepared =
+        PreparedPipe::new(PipeFlags::NONBLOCK, pipe_store()).unwrap_or_else(|(_, e)| panic!("{e}"));
     assert_eq!(prepared.flags(), PipeFlags::NONBLOCK);
 }
 
@@ -6926,10 +7003,7 @@ fn connect_outcome_display_names_every_variant() {
         ConnectOutcome::AlreadyConnected.to_string(),
         "socket is already connected"
     );
-    assert_eq!(
-        ConnectOutcome::TimedOut.to_string(),
-        "connection timed out"
-    );
+    assert_eq!(ConnectOutcome::TimedOut.to_string(), "connection timed out");
     assert_eq!(
         ConnectOutcome::NetworkUnreachable.to_string(),
         "network is unreachable"
@@ -7018,13 +7092,18 @@ fn a_real_connect_reaches_the_listener_it_named() {
     assert_eq!(done.outcome(), ConnectOutcome::Connected);
 
     // The listener must have a pending connection, and it must be ours.
-    let accepted =
+    // Safety: both pointers are null, which `accept4` accepts as "do not
+    // report the peer address".
+    let accepted = unsafe {
         crate::syscall::accept4(listener.fd, core::ptr::null_mut(), core::ptr::null_mut(), 0)
-            .expect("the connect must have reached this listener");
+    }
+    .expect("the connect must have reached this listener");
     let msg = b"nyaa";
-    crate::syscall::write(sock.fd(), msg.as_ptr(), msg.len()).expect("write");
+    // Safety: `msg` is a static, readable 4-byte buffer.
+    unsafe { crate::syscall::write(sock.fd(), msg.as_ptr(), msg.len()) }.expect("write");
     let mut got = [0u8; 4];
-    let n = crate::syscall::read(accepted, got.as_mut_ptr(), got.len()).expect("read");
+    // Safety: `got` is a live local `[u8; 4]`, writable for its length.
+    let n = unsafe { crate::syscall::read(accepted, got.as_mut_ptr(), got.len()) }.expect("read");
     assert_eq!(n, 4);
     assert_eq!(
         &got, msg,
@@ -7201,13 +7280,8 @@ fn a_waitid_reaps_a_real_child_that_has_already_exited() {
     let dest = waitid_dest();
     let dest_addr = dest.stable_ptr();
     #[allow(clippy::cast_possible_wrap)]
-    let prepared = PreparedWaitId::new(
-        IdType::Pid,
-        pid as i32,
-        WaitOptions::EXITED,
-        dest,
-    )
-    .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let prepared = PreparedWaitId::new(IdType::Pid, pid as i32, WaitOptions::EXITED, dest)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
     let ticket = sub
         .push_waitid(prepared)
         .unwrap_or_else(|(_, e)| panic!("{e}"));
@@ -7282,8 +7356,9 @@ fn a_real_futex_wake_wakes_a_real_futex_wait() {
     let word = Arc::new(AtomicU32::new(0));
 
     let waiter_ring = crate::IoUring::new(4).expect("waiter ring");
-    let (mut wait_sub, mut wait_comp) =
-        waiter_ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let (mut wait_sub, mut wait_comp) = waiter_ring
+        .split_owned()
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
 
     let uaddr: *const u32 = word.as_ptr().cast_const();
     // SAFETY: `word` is an `Arc`, kept alive by this test past the point
@@ -7303,8 +7378,9 @@ fn a_real_futex_wake_wakes_a_real_futex_wait() {
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     let waker_ring = crate::IoUring::new(4).expect("waker ring");
-    let (mut wake_sub, mut wake_comp) =
-        waker_ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let (mut wake_sub, mut wake_comp) = waker_ring
+        .split_owned()
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
     // SAFETY: same address, same lifetime guarantee as the wait above.
     let prepared_wake = unsafe {
         super::PreparedFutexWake::new(uaddr, 1, u64::from(u32::MAX), Futex2Flags::default_size())
@@ -7377,20 +7453,8 @@ fn a_real_futex_waitv_reports_the_index_that_woke_it() {
     // SAFETY: both words are kept alive by the `Arc`s held in this scope
     // past the point the ticket is redeemed below.
     let waiters = [
-        unsafe {
-            FutexWaitv::new(
-                word_a.as_ptr().cast_const(),
-                0,
-                Futex2Flags::default_size(),
-            )
-        },
-        unsafe {
-            FutexWaitv::new(
-                word_b.as_ptr().cast_const(),
-                0,
-                Futex2Flags::default_size(),
-            )
-        },
+        unsafe { FutexWaitv::new(word_a.as_ptr().cast_const(), 0, Futex2Flags::default_size()) },
+        unsafe { FutexWaitv::new(word_b.as_ptr().cast_const(), 0, Futex2Flags::default_size()) },
     ];
     let array = MmapBuffer::with_capacity(core::mem::size_of_val(&waiters)).expect("map");
     // SAFETY: both entries in `waiters` uphold `FutexWaitv::new`'s
@@ -7405,8 +7469,9 @@ fn a_real_futex_waitv_reports_the_index_that_woke_it() {
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     let waker_ring = crate::IoUring::new(4).expect("waker ring");
-    let (mut wake_sub, mut wake_comp) =
-        waker_ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let (mut wake_sub, mut wake_comp) = waker_ring
+        .split_owned()
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
     // SAFETY: `word_b` outlives this call.
     let prepared_wake = unsafe {
         super::PreparedFutexWake::new(

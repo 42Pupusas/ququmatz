@@ -108,11 +108,7 @@ impl Sqe {
     /// size, exactly as `getsockname(2)` does), and `addr_len` itself must
     /// remain valid and writable, until the kernel posts the completion.
     #[must_use]
-    pub unsafe fn uring_cmd_sock_getsockname(
-        fd: RawFd,
-        addr: *mut u8,
-        addr_len: *mut i32,
-    ) -> Self {
+    pub unsafe fn uring_cmd_sock_getsockname(fd: RawFd, addr: *mut u8, addr_len: *mut i32) -> Self {
         Self::uring_cmd_sock_name(fd, addr, addr_len, false)
     }
 
@@ -124,11 +120,7 @@ impl Sqe {
     ///
     /// Same contract as [`uring_cmd_sock_getsockname`](Self::uring_cmd_sock_getsockname).
     #[must_use]
-    pub unsafe fn uring_cmd_sock_getpeername(
-        fd: RawFd,
-        addr: *mut u8,
-        addr_len: *mut i32,
-    ) -> Self {
+    pub unsafe fn uring_cmd_sock_getpeername(fd: RawFd, addr: *mut u8, addr_len: *mut i32) -> Self {
         Self::uring_cmd_sock_name(fd, addr, addr_len, true)
     }
 

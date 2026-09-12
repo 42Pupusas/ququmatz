@@ -104,7 +104,9 @@ impl EventFd {
     /// the counter would overflow).
     pub fn write(&self, value: u64) -> Result<(), Error> {
         let buf = value.to_ne_bytes();
-        syscall::write(self.fd, buf.as_ptr(), 8)?;
+        // Safety: `buf` is a local 8-byte array, live and readable for the
+        // duration of this call.
+        unsafe { syscall::write(self.fd, buf.as_ptr(), 8) }?;
         Ok(())
     }
 
@@ -119,7 +121,9 @@ impl EventFd {
     /// the counter is zero and the fd is non-blocking).
     pub fn read(&self) -> Result<u64, Error> {
         let mut buf = [0u8; 8];
-        syscall::read(self.fd, buf.as_mut_ptr(), 8)?;
+        // Safety: `buf` is a local 8-byte array, live and writable for the
+        // duration of this call.
+        unsafe { syscall::read(self.fd, buf.as_mut_ptr(), 8) }?;
         Ok(u64::from_ne_bytes(buf))
     }
 

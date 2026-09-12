@@ -160,8 +160,7 @@ impl<D> PreparedWaitId<D> {
         // and points into storage this request owns exclusively. The
         // destination moves into `PendingWaitId`, whose destructor is
         // suppressed unless a receipt proves the kernel finished.
-        let sqe =
-            unsafe { Sqe::waitid(self.id_type, self.id, self.dest_addr, self.options) };
+        let sqe = unsafe { Sqe::waitid(self.id_type, self.id, self.dest_addr, self.options) };
         let pending = PendingWaitId {
             dest: ManuallyDrop::new(self.dest),
             ring,

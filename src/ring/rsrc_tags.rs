@@ -12,7 +12,6 @@
 
 use super::IoUring;
 use crate::error::Error;
-use crate::syscall;
 use crate::types::{IoUringRsrcRegister, IoUringRsrcUpdate2, IoVec, RegisterOp};
 
 impl IoUring {
@@ -46,12 +45,17 @@ impl IoUring {
             data: fds.as_ptr() as u64,
             tags: tags.as_ptr() as u64,
         };
-        syscall::io_uring_register(
-            self.fd,
-            RegisterOp::RegisterFiles2.into(),
-            core::ptr::addr_of!(arg) as usize,
-            core::mem::size_of::<IoUringRsrcRegister>() as u32,
-        )?;
+        // Safety: `arg` is a live local `IoUringRsrcRegister` whose `data`
+        // and `tags` fields point at the still-live `fds`/`tags` slices,
+        // each `fds.len()` entries long, matching `RegisterFiles2`'s
+        // contract.
+        unsafe {
+            self.register_raw(
+                RegisterOp::RegisterFiles2.into(),
+                core::ptr::addr_of!(arg) as usize,
+                core::mem::size_of::<IoUringRsrcRegister>() as u32,
+            )
+        }?;
         Ok(())
     }
 
@@ -90,12 +94,17 @@ impl IoUring {
             nr: fds.len() as u32,
             resv2: 0,
         };
-        syscall::io_uring_register(
-            self.fd,
-            RegisterOp::RegisterFilesUpdate2.into(),
-            core::ptr::addr_of!(arg) as usize,
-            core::mem::size_of::<IoUringRsrcUpdate2>() as u32,
-        )?;
+        // Safety: `arg` is a live local `IoUringRsrcUpdate2` whose `data`
+        // and `tags` fields point at the still-live `fds`/`tags` slices,
+        // each `fds.len()` entries long, matching `RegisterFilesUpdate2`'s
+        // contract.
+        unsafe {
+            self.register_raw(
+                RegisterOp::RegisterFilesUpdate2.into(),
+                core::ptr::addr_of!(arg) as usize,
+                core::mem::size_of::<IoUringRsrcUpdate2>() as u32,
+            )
+        }?;
         Ok(())
     }
 
@@ -128,12 +137,17 @@ impl IoUring {
             data: bufs.as_ptr() as u64,
             tags: tags.as_ptr() as u64,
         };
-        syscall::io_uring_register(
-            self.fd,
-            RegisterOp::RegisterBuffers2.into(),
-            core::ptr::addr_of!(arg) as usize,
-            core::mem::size_of::<IoUringRsrcRegister>() as u32,
-        )?;
+        // Safety: `arg` is a live local `IoUringRsrcRegister` whose `data`
+        // and `tags` fields point at the still-live `bufs`/`tags` slices,
+        // each `bufs.len()` entries long, matching `RegisterBuffers2`'s
+        // contract.
+        unsafe {
+            self.register_raw(
+                RegisterOp::RegisterBuffers2.into(),
+                core::ptr::addr_of!(arg) as usize,
+                core::mem::size_of::<IoUringRsrcRegister>() as u32,
+            )
+        }?;
         Ok(())
     }
 
@@ -172,12 +186,17 @@ impl IoUring {
             nr: bufs.len() as u32,
             resv2: 0,
         };
-        syscall::io_uring_register(
-            self.fd,
-            RegisterOp::RegisterBuffersUpdate.into(),
-            core::ptr::addr_of!(arg) as usize,
-            core::mem::size_of::<IoUringRsrcUpdate2>() as u32,
-        )?;
+        // Safety: `arg` is a live local `IoUringRsrcUpdate2` whose `data`
+        // and `tags` fields point at the still-live `bufs`/`tags` slices,
+        // each `bufs.len()` entries long, matching
+        // `RegisterBuffersUpdate`'s contract.
+        unsafe {
+            self.register_raw(
+                RegisterOp::RegisterBuffersUpdate.into(),
+                core::ptr::addr_of!(arg) as usize,
+                core::mem::size_of::<IoUringRsrcUpdate2>() as u32,
+            )
+        }?;
         Ok(())
     }
 }

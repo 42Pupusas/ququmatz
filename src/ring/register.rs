@@ -11,6 +11,27 @@ use crate::types::{
 };
 
 impl IoUring {
+    /// Thin, single unsafe boundary for every `io_uring_register` call in
+    /// this module.
+    ///
+    /// # Safety
+    ///
+    /// `arg` must be a valid pointer for the opcode identified by
+    /// `opcode`/`nr_args` -- either 0 with `nr_args == 0` for an
+    /// argument-less opcode, or a pointer to a live value (or array) of
+    /// the exact layout and length that opcode's kernel contract expects,
+    /// valid for reads (and writes, for opcodes that report back through
+    /// `arg`) for the duration of this call. Every call site in this
+    /// module constructs `arg` from a live local matching its opcode.
+    pub(super) unsafe fn register_raw(
+        &self,
+        opcode: u32,
+        arg: usize,
+        nr_args: u32,
+    ) -> Result<usize, crate::Errno> {
+        unsafe { syscall::io_uring_register(self.fd, opcode, arg, nr_args) }
+    }
+
     /// Register buffers for zero-copy I/O with `read_fixed`/`write_fixed`.
     ///
     /// # Errors
@@ -19,12 +40,15 @@ impl IoUring {
     /// already registered).
     #[allow(clippy::cast_possible_truncation)]
     pub fn register_buffers(&mut self, bufs: &[IoVec]) -> Result<(), Error> {
-        syscall::io_uring_register(
-            self.fd,
-            RegisterOp::RegisterBuffers.into(),
-            bufs.as_ptr() as usize,
-            bufs.len() as u32,
-        )?;
+        // Safety: `bufs` is a live `&[IoVec]`, exactly `bufs.len()` entries
+        // long, matching `RegisterBuffers`'s array-of-`IoVec` contract.
+        unsafe {
+            self.register_raw(
+                RegisterOp::RegisterBuffers.into(),
+                bufs.as_ptr() as usize,
+                bufs.len() as u32,
+            )
+        }?;
         Ok(())
     }
 
@@ -34,7 +58,8 @@ impl IoUring {
     ///
     /// Returns an error if no buffers are registered.
     pub fn unregister_buffers(&mut self) -> Result<(), Error> {
-        syscall::io_uring_register(self.fd, RegisterOp::UnregisterBuffers.into(), 0, 0)?;
+        // Safety: argument-less opcode; `arg` 0 with `nr_args` 0.
+        unsafe { self.register_raw(RegisterOp::UnregisterBuffers.into(), 0, 0) }?;
         Ok(())
     }
 
@@ -45,12 +70,15 @@ impl IoUring {
     /// Returns an error if registration fails.
     #[allow(clippy::cast_possible_truncation)]
     pub fn register_files(&mut self, fds: &[i32]) -> Result<(), Error> {
-        syscall::io_uring_register(
-            self.fd,
-            RegisterOp::RegisterFiles.into(),
-            fds.as_ptr() as usize,
-            fds.len() as u32,
-        )?;
+        // Safety: `fds` is a live `&[i32]`, exactly `fds.len()` entries
+        // long, matching `RegisterFiles`'s array-of-`i32` contract.
+        unsafe {
+            self.register_raw(
+                RegisterOp::RegisterFiles.into(),
+                fds.as_ptr() as usize,
+                fds.len() as u32,
+            )
+        }?;
         Ok(())
     }
 
@@ -60,7 +88,8 @@ impl IoUring {
     ///
     /// Returns an error if no files are registered.
     pub fn unregister_files(&mut self) -> Result<(), Error> {
-        syscall::io_uring_register(self.fd, RegisterOp::UnregisterFiles.into(), 0, 0)?;
+        // Safety: argument-less opcode; `arg` 0 with `nr_args` 0.
+        unsafe { self.register_raw(RegisterOp::UnregisterFiles.into(), 0, 0) }?;
         Ok(())
     }
 
@@ -79,12 +108,16 @@ impl IoUring {
             resv: 0,
             fds: fds.as_ptr() as u64,
         };
-        syscall::io_uring_register(
-            self.fd,
-            RegisterOp::RegisterFilesUpdate.into(),
-            core::ptr::addr_of!(arg) as usize,
-            fds.len() as u32,
-        )?;
+        // Safety: `arg` is a live local `IoUringFilesUpdate` whose `fds`
+        // field points at the still-live `fds` slice, matching
+        // `RegisterFilesUpdate`'s contract for `fds.len()` entries.
+        unsafe {
+            self.register_raw(
+                RegisterOp::RegisterFilesUpdate.into(),
+                core::ptr::addr_of!(arg) as usize,
+                fds.len() as u32,
+            )
+        }?;
         Ok(())
     }
 
@@ -103,12 +136,15 @@ impl IoUring {
     /// fit within it.
     pub fn register_file_alloc_range(&mut self, off: u32, len: u32) -> Result<(), Error> {
         let arg = IoUringFileIndexRange { off, len, resv: 0 };
-        syscall::io_uring_register(
-            self.fd,
-            RegisterOp::RegisterFileAllocRange.into(),
-            core::ptr::addr_of!(arg) as usize,
-            0,
-        )?;
+        // Safety: `arg` is a live local `IoUringFileIndexRange`, matching
+        // `RegisterFileAllocRange`'s single-struct contract.
+        unsafe {
+            self.register_raw(
+                RegisterOp::RegisterFileAllocRange.into(),
+                core::ptr::addr_of!(arg) as usize,
+                0,
+            )
+        }?;
         Ok(())
     }
 
@@ -122,12 +158,15 @@ impl IoUring {
     /// Returns an error if registration fails.
     pub fn register_eventfd(&mut self, efd: RawFd) -> Result<(), Error> {
         let raw: i32 = efd.as_i32();
-        syscall::io_uring_register(
-            self.fd,
-            RegisterOp::RegisterEventFd.into(),
-            core::ptr::addr_of!(raw) as usize,
-            1,
-        )?;
+        // Safety: `raw` is a live local `i32`, matching `RegisterEventFd`'s
+        // single-`i32` contract.
+        unsafe {
+            self.register_raw(
+                RegisterOp::RegisterEventFd.into(),
+                core::ptr::addr_of!(raw) as usize,
+                1,
+            )
+        }?;
         Ok(())
     }
 
@@ -139,12 +178,15 @@ impl IoUring {
     /// Returns an error if registration fails.
     pub fn register_eventfd_async(&mut self, efd: RawFd) -> Result<(), Error> {
         let raw: i32 = efd.as_i32();
-        syscall::io_uring_register(
-            self.fd,
-            RegisterOp::RegisterEventFdAsync.into(),
-            core::ptr::addr_of!(raw) as usize,
-            1,
-        )?;
+        // Safety: `raw` is a live local `i32`, matching
+        // `RegisterEventFdAsync`'s single-`i32` contract.
+        unsafe {
+            self.register_raw(
+                RegisterOp::RegisterEventFdAsync.into(),
+                core::ptr::addr_of!(raw) as usize,
+                1,
+            )
+        }?;
         Ok(())
     }
 
@@ -154,7 +196,8 @@ impl IoUring {
     ///
     /// Returns an error if no eventfd is registered.
     pub fn unregister_eventfd(&mut self) -> Result<(), Error> {
-        syscall::io_uring_register(self.fd, RegisterOp::UnregisterEventFd.into(), 0, 0)?;
+        // Safety: argument-less opcode; `arg` 0 with `nr_args` 0.
+        unsafe { self.register_raw(RegisterOp::UnregisterEventFd.into(), 0, 0) }?;
         Ok(())
     }
 
@@ -175,12 +218,15 @@ impl IoUring {
     /// CPU the process itself may run on).
     #[allow(clippy::cast_possible_truncation)]
     pub fn register_iowq_affinity(&mut self, mask: &[u8]) -> Result<(), Error> {
-        syscall::io_uring_register(
-            self.fd,
-            RegisterOp::RegisterIowqAff.into(),
-            mask.as_ptr() as usize,
-            mask.len() as u32,
-        )?;
+        // Safety: `mask` is a live `&[u8]`, exactly `mask.len()` bytes
+        // long, matching `RegisterIowqAff`'s raw-bitmask contract.
+        unsafe {
+            self.register_raw(
+                RegisterOp::RegisterIowqAff.into(),
+                mask.as_ptr() as usize,
+                mask.len() as u32,
+            )
+        }?;
         Ok(())
     }
 
@@ -191,7 +237,8 @@ impl IoUring {
     ///
     /// Returns an error if the kernel rejects the request.
     pub fn unregister_iowq_affinity(&mut self) -> Result<(), Error> {
-        syscall::io_uring_register(self.fd, RegisterOp::UnregisterIowqAff.into(), 0, 0)?;
+        // Safety: argument-less opcode; `arg` 0 with `nr_args` 0.
+        unsafe { self.register_raw(RegisterOp::UnregisterIowqAff.into(), 0, 0) }?;
         Ok(())
     }
 
@@ -210,12 +257,15 @@ impl IoUring {
         max_unbounded: u32,
     ) -> Result<(), Error> {
         let mut workers = [max_bounded, max_unbounded];
-        syscall::io_uring_register(
-            self.fd,
-            RegisterOp::RegisterIowqMaxWorkers.into(),
-            workers.as_mut_ptr() as usize,
-            2,
-        )?;
+        // Safety: `workers` is a live local `[u32; 2]`, matching
+        // `RegisterIowqMaxWorkers`'s two-`u32` in/out contract.
+        unsafe {
+            self.register_raw(
+                RegisterOp::RegisterIowqMaxWorkers.into(),
+                workers.as_mut_ptr() as usize,
+                2,
+            )
+        }?;
         Ok(())
     }
 
@@ -234,12 +284,15 @@ impl IoUring {
             resv: 0,
             data: self.fd.as_usize() as u64,
         };
-        syscall::io_uring_register(
-            self.fd,
-            RegisterOp::RegisterRingFds.into(),
-            core::ptr::from_mut(&mut reg) as usize,
-            1,
-        )?;
+        // Safety: `reg` is a live local `IoUringRsrcUpdate`, matching
+        // `RegisterRingFds`'s single-struct in/out contract.
+        unsafe {
+            self.register_raw(
+                RegisterOp::RegisterRingFds.into(),
+                core::ptr::from_mut(&mut reg) as usize,
+                1,
+            )
+        }?;
         Ok(reg.offset)
     }
 
@@ -258,12 +311,15 @@ impl IoUring {
             resv: 0,
             data: 0,
         };
-        syscall::io_uring_register(
-            self.fd,
-            RegisterOp::UnregisterRingFds.into(),
-            core::ptr::from_mut(&mut reg) as usize,
-            1,
-        )?;
+        // Safety: `reg` is a live local `IoUringRsrcUpdate`, matching
+        // `UnregisterRingFds`'s single-struct contract.
+        unsafe {
+            self.register_raw(
+                RegisterOp::UnregisterRingFds.into(),
+                core::ptr::from_mut(&mut reg) as usize,
+                1,
+            )
+        }?;
         Ok(())
     }
 
@@ -279,7 +335,8 @@ impl IoUring {
     /// Returns an error if the kernel rejects the request (e.g. the ring
     /// was not created disabled).
     pub fn enable_rings(&mut self) -> Result<(), Error> {
-        syscall::io_uring_register(self.fd, RegisterOp::RegisterEnableRings.into(), 0, 0)?;
+        // Safety: argument-less opcode; `arg` 0 with `nr_args` 0.
+        unsafe { self.register_raw(RegisterOp::RegisterEnableRings.into(), 0, 0) }?;
         Ok(())
     }
 
@@ -305,12 +362,15 @@ impl IoUring {
     /// (e.g. an invalid fd).
     pub fn sync_cancel(&mut self, reg: SyncCancelReg) -> Result<CancelOutcome, Error> {
         let mut raw: RawSyncCancelReg = reg.as_raw();
-        match syscall::io_uring_register(
-            self.fd,
-            RegisterOp::RegisterSyncCancel.into(),
-            core::ptr::from_mut(&mut raw) as usize,
-            1,
-        ) {
+        // Safety: `raw` is a live local `RawSyncCancelReg`, matching
+        // `RegisterSyncCancel`'s single-struct contract.
+        match unsafe {
+            self.register_raw(
+                RegisterOp::RegisterSyncCancel.into(),
+                core::ptr::from_mut(&mut raw) as usize,
+                1,
+            )
+        } {
             #[allow(clippy::cast_possible_truncation)]
             Ok(n) => Ok(CancelOutcome::Applied(n as u32)),
             Err(errno) => Ok(CancelOutcome::from_raw(-errno.raw())),
@@ -342,12 +402,15 @@ impl IoUring {
         tracking: NapiTrackingStrategy,
     ) -> Result<NapiSettings, Error> {
         let mut raw = RawNapi::register(busy_poll_timeout_usec, prefer_busy_poll, tracking);
-        syscall::io_uring_register(
-            self.fd,
-            RegisterOp::RegisterNapi.into(),
-            core::ptr::from_mut(&mut raw) as usize,
-            1,
-        )?;
+        // Safety: `raw` is a live local `RawNapi`, matching `RegisterNapi`'s
+        // single-struct in/out contract.
+        unsafe {
+            self.register_raw(
+                RegisterOp::RegisterNapi.into(),
+                core::ptr::from_mut(&mut raw) as usize,
+                1,
+            )
+        }?;
         Ok(NapiSettings::from_raw(&raw))
     }
 
@@ -362,12 +425,15 @@ impl IoUring {
     /// Returns an error if the kernel rejects the request.
     pub fn unregister_napi(&mut self) -> Result<NapiSettings, Error> {
         let mut raw = RawNapi::default();
-        syscall::io_uring_register(
-            self.fd,
-            RegisterOp::UnregisterNapi.into(),
-            core::ptr::from_mut(&mut raw) as usize,
-            1,
-        )?;
+        // Safety: `raw` is a live local `RawNapi`, matching
+        // `UnregisterNapi`'s single-struct in/out contract.
+        unsafe {
+            self.register_raw(
+                RegisterOp::UnregisterNapi.into(),
+                core::ptr::from_mut(&mut raw) as usize,
+                1,
+            )
+        }?;
         Ok(NapiSettings::from_raw(&raw))
     }
 
@@ -384,12 +450,15 @@ impl IoUring {
     /// `napi_id` names no real NAPI instance, or it is already tracked.
     pub fn napi_add_static_id(&mut self, napi_id: u32) -> Result<(), Error> {
         let mut raw = RawNapi::static_id(NapiOp::StaticAddId, napi_id);
-        syscall::io_uring_register(
-            self.fd,
-            RegisterOp::RegisterNapi.into(),
-            core::ptr::from_mut(&mut raw) as usize,
-            1,
-        )?;
+        // Safety: `raw` is a live local `RawNapi`, matching `RegisterNapi`'s
+        // single-struct in/out contract.
+        unsafe {
+            self.register_raw(
+                RegisterOp::RegisterNapi.into(),
+                core::ptr::from_mut(&mut raw) as usize,
+                1,
+            )
+        }?;
         Ok(())
     }
 
@@ -401,12 +470,15 @@ impl IoUring {
     /// `napi_id` is not currently tracked.
     pub fn napi_remove_static_id(&mut self, napi_id: u32) -> Result<(), Error> {
         let mut raw = RawNapi::static_id(NapiOp::StaticDelId, napi_id);
-        syscall::io_uring_register(
-            self.fd,
-            RegisterOp::RegisterNapi.into(),
-            core::ptr::from_mut(&mut raw) as usize,
-            1,
-        )?;
+        // Safety: `raw` is a live local `RawNapi`, matching `RegisterNapi`'s
+        // single-struct in/out contract.
+        unsafe {
+            self.register_raw(
+                RegisterOp::RegisterNapi.into(),
+                core::ptr::from_mut(&mut raw) as usize,
+                1,
+            )
+        }?;
         Ok(())
     }
 
@@ -474,12 +546,15 @@ impl IoUring {
             nr,
             pad: [0; 3],
         };
-        syscall::io_uring_register(
-            self.fd,
-            RegisterOp::RegisterCloneBuffers.into(),
-            core::ptr::from_mut(&mut arg) as usize,
-            0,
-        )?;
+        // Safety: `arg` is a live local `IoUringCloneBuffers`, matching
+        // `RegisterCloneBuffers`'s single-struct contract.
+        unsafe {
+            self.register_raw(
+                RegisterOp::RegisterCloneBuffers.into(),
+                core::ptr::from_mut(&mut arg) as usize,
+                0,
+            )
+        }?;
         Ok(())
     }
 }

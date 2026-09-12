@@ -60,14 +60,18 @@ impl RingResources {
     ) -> Result<*mut Self, Error> {
         let page_size = 4096usize;
         let len = core::mem::size_of::<Self>().next_multiple_of(page_size);
-        let addr = syscall::mmap(
-            0,
-            len,
-            Prot::READ | Prot::WRITE,
-            MapFlags::PRIVATE | MapFlags::ANONYMOUS,
-            usize::MAX,
-            0,
-        )?;
+        // Safety: `addr` 0 and `MapFlags::ANONYMOUS` mean the kernel picks a
+        // fresh, unused range; nothing existing can be clobbered.
+        let addr = unsafe {
+            syscall::mmap(
+                0,
+                len,
+                Prot::READ | Prot::WRITE,
+                MapFlags::PRIVATE | MapFlags::ANONYMOUS,
+                usize::MAX,
+                0,
+            )
+        }?;
         let ptr = addr as *mut Self;
         unsafe {
             ptr.write(Self {
@@ -98,15 +102,18 @@ impl RingResources {
         // We are the last owner — clean up.
         // SAFETY: no other references exist at this point.
         let res = unsafe { &*ptr };
-        let _ = syscall::munmap(res.sqes_region.addr, res.sqes_region.len);
+        // Safety: this is the last owner (refcount just hit zero), so
+        // every mapping and the fd below are ours alone to release, each
+        // released exactly once here.
+        let _ = unsafe { syscall::munmap(res.sqes_region.addr, res.sqes_region.len) };
         if res.cq_ring.len > 0 {
-            let _ = syscall::munmap(res.cq_ring.addr, res.cq_ring.len);
+            let _ = unsafe { syscall::munmap(res.cq_ring.addr, res.cq_ring.len) };
         }
-        let _ = syscall::munmap(res.sq_ring.addr, res.sq_ring.len);
+        let _ = unsafe { syscall::munmap(res.sq_ring.addr, res.sq_ring.len) };
         let _ = syscall::close(res.fd);
         // Free the page last — `res` must not be used after this point.
         let self_page = MappedRegion::new(res.self_page.addr, res.self_page.len);
-        let _ = syscall::munmap(self_page.addr, self_page.len);
+        let _ = unsafe { syscall::munmap(self_page.addr, self_page.len) };
     }
 }
 
@@ -187,8 +194,6 @@ impl MappedRegion {
     }
 }
 
-
-
 /// Cleanup guard for partially-initialized ring resources.
 ///
 /// Tracks resources acquired during `from_params` so that *any* error
@@ -220,14 +225,16 @@ impl SetupGuard {
 
 impl Drop for SetupGuard {
     fn drop(&mut self) {
+        // Safety: this guard uniquely owns each region until `disarm`
+        // hands them off, so each is unmapped exactly once here.
         if self.sqes.len > 0 {
-            let _ = syscall::munmap(self.sqes.addr, self.sqes.len);
+            let _ = unsafe { syscall::munmap(self.sqes.addr, self.sqes.len) };
         }
         if self.cq_ring.len > 0 {
-            let _ = syscall::munmap(self.cq_ring.addr, self.cq_ring.len);
+            let _ = unsafe { syscall::munmap(self.cq_ring.addr, self.cq_ring.len) };
         }
         if self.sq_ring.len > 0 {
-            let _ = syscall::munmap(self.sq_ring.addr, self.sq_ring.len);
+            let _ = unsafe { syscall::munmap(self.sq_ring.addr, self.sq_ring.len) };
         }
         let _ = syscall::close(self.fd);
     }
@@ -723,40 +730,54 @@ fn map_rings(
         sq_ring_sz
     };
 
-    let sq_ring_ptr = syscall::mmap(
-        0,
-        mmap_sz,
-        prot,
-        map,
-        fd.as_usize(),
-        RingOffset::SqRing.into(),
-    )?;
+    // Safety: `addr` 0 lets the kernel pick a fresh range; `fd` is the
+    // just-created ring fd and `RingOffset::SqRing` is the offset the
+    // kernel documents for mapping its SQ ring, so this maps kernel memory
+    // the process does not otherwise reference.
+    let sq_ring_ptr = unsafe {
+        syscall::mmap(
+            0,
+            mmap_sz,
+            prot,
+            map,
+            fd.as_usize(),
+            RingOffset::SqRing.into(),
+        )
+    }?;
     guard.sq_ring = MappedRegion::new(sq_ring_ptr, mmap_sz);
 
     let (cq_ring_ptr, cq_ring_region) = if single_mmap {
         (sq_ring_ptr, MappedRegion::new(0, 0))
     } else {
-        let ptr = syscall::mmap(
-            0,
-            cq_ring_sz,
-            prot,
-            map,
-            fd.as_usize(),
-            RingOffset::CqRing.into(),
-        )?;
+        // Safety: same reasoning as the SQ-ring mapping above, using the
+        // kernel-documented `RingOffset::CqRing` offset.
+        let ptr = unsafe {
+            syscall::mmap(
+                0,
+                cq_ring_sz,
+                prot,
+                map,
+                fd.as_usize(),
+                RingOffset::CqRing.into(),
+            )
+        }?;
         guard.cq_ring = MappedRegion::new(ptr, cq_ring_sz);
         (ptr, MappedRegion::new(ptr, cq_ring_sz))
     };
 
     let sqes_sz = ring_bytes(0, params.sq_entries, core::mem::size_of::<IoUringSqe>());
-    let sqes_ptr = syscall::mmap(
-        0,
-        sqes_sz,
-        prot,
-        map,
-        fd.as_usize(),
-        RingOffset::Sqes.into(),
-    )?;
+    // Safety: same reasoning as the SQ-ring mapping above, using the
+    // kernel-documented `RingOffset::Sqes` offset.
+    let sqes_ptr = unsafe {
+        syscall::mmap(
+            0,
+            sqes_sz,
+            prot,
+            map,
+            fd.as_usize(),
+            RingOffset::Sqes.into(),
+        )
+    }?;
     guard.sqes = MappedRegion::new(sqes_ptr, sqes_sz);
 
     Ok((
@@ -1053,7 +1074,10 @@ impl IoUring {
             None
         };
 
-        let fd = syscall::io_uring_setup(entries, &raw mut *params)?;
+        // Safety: `params` is the live `&mut IoUringParams` this function
+        // was called with, writable and readable for the duration of this
+        // call, matching `io_uring_setup`'s in/out contract.
+        let fd = unsafe { syscall::io_uring_setup(entries, &raw mut *params) }?;
         let mut guard = SetupGuard::new(fd);
 
         let features = Features::from_raw(params.features);

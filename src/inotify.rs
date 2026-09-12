@@ -100,7 +100,12 @@ impl Inotify {
     /// `ENOENT` if the path does not exist, `EACCES` if the path is not
     /// readable).
     pub fn add_watch(&self, path: &CStr, mask: WatchMask) -> Result<i32, Error> {
-        Ok(syscall::inotify_add_watch(self.fd, path.as_ptr().cast(), mask.bits())? as i32)
+        // Safety: `path` is a `&CStr`, guaranteeing a valid, nul-terminated,
+        // readable string for the duration of this call.
+        Ok(
+            unsafe { syscall::inotify_add_watch(self.fd, path.as_ptr().cast(), mask.bits()) }?
+                as i32,
+        )
     }
 
     /// Remove a previously added watch.

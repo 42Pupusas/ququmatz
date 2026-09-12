@@ -226,7 +226,9 @@ impl Error {
     #[must_use]
     pub const fn from_failed_cqe(result: i32) -> Option<Self> {
         if result < 0 {
-            Some(Self::Completion(CompletionError::Failed(Errno::new(-result))))
+            Some(Self::Completion(CompletionError::Failed(Errno::new(
+                -result,
+            ))))
         } else {
             None
         }

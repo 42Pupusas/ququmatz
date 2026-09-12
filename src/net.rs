@@ -108,11 +108,15 @@ impl Socket {
     ///
     /// Returns an [`Error`] if the `bind` syscall fails.
     pub fn bind(&self, addr: &SockAddrIn) -> Result<(), Error> {
-        syscall::bind(
-            self.fd,
-            core::ptr::from_ref::<SockAddrIn>(addr).cast(),
-            mem::size_of::<SockAddrIn>() as u32,
-        )
+        // Safety: `addr` is a live `&SockAddrIn`, exactly `size_of::<SockAddrIn>()`
+        // readable bytes for the duration of this call.
+        unsafe {
+            syscall::bind(
+                self.fd,
+                core::ptr::from_ref::<SockAddrIn>(addr).cast(),
+                mem::size_of::<SockAddrIn>() as u32,
+            )
+        }
         .map_err(Into::into)
     }
 
@@ -122,11 +126,15 @@ impl Socket {
     ///
     /// Returns an [`Error`] if the `connect` syscall fails.
     pub fn connect(&self, addr: &SockAddrIn) -> Result<(), Error> {
-        syscall::connect(
-            self.fd,
-            core::ptr::from_ref::<SockAddrIn>(addr).cast(),
-            mem::size_of::<SockAddrIn>() as u32,
-        )
+        // Safety: `addr` is a live `&SockAddrIn`, exactly `size_of::<SockAddrIn>()`
+        // readable bytes for the duration of this call.
+        unsafe {
+            syscall::connect(
+                self.fd,
+                core::ptr::from_ref::<SockAddrIn>(addr).cast(),
+                mem::size_of::<SockAddrIn>() as u32,
+            )
+        }
         .map_err(Into::into)
     }
 
@@ -141,12 +149,16 @@ impl Socket {
     pub fn accept(&self, flags: AcceptFlags) -> Result<(Self, SockAddrIn), Error> {
         let mut addr = SockAddrIn::default();
         let mut len = mem::size_of::<SockAddrIn>() as u32;
-        let fd = syscall::accept4(
-            self.fd,
-            (&raw mut addr).cast(),
-            &raw mut len,
-            flags.bits() as i32,
-        )?;
+        // Safety: `addr`/`len` are live locals; `len` starts initialized to
+        // `addr`'s size, and both are writable for the duration of this call.
+        let fd = unsafe {
+            syscall::accept4(
+                self.fd,
+                (&raw mut addr).cast(),
+                &raw mut len,
+                flags.bits() as i32,
+            )
+        }?;
         Ok((Self { fd }, addr))
     }
 
@@ -169,13 +181,18 @@ impl Socket {
     ///
     /// Returns an [`Error`] if the `setsockopt` syscall fails.
     pub fn set_option<T: Sized>(&self, level: i32, optname: i32, value: &T) -> Result<(), Error> {
-        syscall::setsockopt(
-            self.fd,
-            level,
-            optname,
-            core::ptr::from_ref::<T>(value).cast(),
-            mem::size_of::<T>() as u32,
-        )
+        // Safety: `value` is a live `&T`, exactly `size_of::<T>()` readable
+        // bytes for the duration of this call. The caller answers for `T`
+        // matching the ABI `level`/`optname` expect.
+        unsafe {
+            syscall::setsockopt(
+                self.fd,
+                level,
+                optname,
+                core::ptr::from_ref::<T>(value).cast(),
+                mem::size_of::<T>() as u32,
+            )
+        }
         .map_err(Into::into)
     }
 
@@ -185,7 +202,10 @@ impl Socket {
     ///
     /// Returns an [`Error`] if the `sendto` syscall fails.
     pub fn send(&self, buf: &[u8], flags: MsgFlags) -> Result<usize, Error> {
-        syscall::sendto(self.fd, buf.as_ptr(), buf.len(), flags.bits()).map_err(Into::into)
+        // Safety: `buf` is a live `&[u8]`, readable for its full length for
+        // the duration of this call.
+        unsafe { syscall::sendto(self.fd, buf.as_ptr(), buf.len(), flags.bits()) }
+            .map_err(Into::into)
     }
 
     /// Receive data from the socket. Returns the number of bytes read.
@@ -194,7 +214,10 @@ impl Socket {
     ///
     /// Returns an [`Error`] if the `recvfrom` syscall fails.
     pub fn recv(&self, buf: &mut [u8], flags: MsgFlags) -> Result<usize, Error> {
-        syscall::recvfrom(self.fd, buf.as_mut_ptr(), buf.len(), flags.bits()).map_err(Into::into)
+        // Safety: `buf` is a live `&mut [u8]`, writable for its full length
+        // for the duration of this call.
+        unsafe { syscall::recvfrom(self.fd, buf.as_mut_ptr(), buf.len(), flags.bits()) }
+            .map_err(Into::into)
     }
 
     /// Shut down part or all of the connection.
@@ -227,7 +250,9 @@ impl Socket {
     pub fn local_addr(&self) -> Result<SockAddrIn, Error> {
         let mut addr = SockAddrIn::default();
         let mut len = mem::size_of::<SockAddrIn>() as u32;
-        syscall::getsockname(self.fd, (&raw mut addr).cast(), &raw mut len)?;
+        // Safety: `addr`/`len` are live locals; `len` starts initialized to
+        // `addr`'s size, and both are writable for the duration of this call.
+        unsafe { syscall::getsockname(self.fd, (&raw mut addr).cast(), &raw mut len) }?;
         Ok(addr)
     }
 }

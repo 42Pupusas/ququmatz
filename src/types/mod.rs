@@ -121,8 +121,8 @@ pub use buffers::{
     IoUringBufStatus, IoUringCloneBuffers, IoUringFileIndexRange, IoUringFilesUpdate,
     IoUringRsrcRegister, IoUringRsrcUpdate, IoUringRsrcUpdate2, IoVec, PbufRingFlags, RawFd,
 };
-pub use cancel::{CancelFlags, CancelOutcome, SyncCancelReg};
 pub(crate) use cancel::RawSyncCancelReg;
+pub use cancel::{CancelFlags, CancelOutcome, SyncCancelReg};
 pub use epoll::{EpollEvent, EpollEvents, EpollOp};
 pub use eventfd::EventFdFlags;
 #[cfg(test)]
@@ -136,8 +136,8 @@ pub use futex::{FUTEX_WAITV_MAX, Futex2Flags, FutexWaitv};
 pub use inotify::{InotifyEvent, InotifyInitFlags, WatchMask};
 pub use mmap::{MapFlags, Prot};
 pub use msgring::MsgRingFlags;
-pub use napi::{NapiSettings, NapiTrackingMode, NapiTrackingStrategy};
 pub(crate) use napi::{NapiOp, RawNapi};
+pub use napi::{NapiSettings, NapiTrackingMode, NapiTrackingStrategy};
 #[cfg(test)]
 pub(crate) use net::{AF_INET, SOCK_NONBLOCK, SOCK_STREAM};
 pub use net::{
@@ -149,12 +149,12 @@ pub use poll::PollMask;
 pub use ring_ctrl::{EnterFlags, Features, SetupFlags, SqeFlags};
 pub use rwattr::{RwAttrFlags, RwAttrPi};
 pub use sendrecv::{AcceptModifier, SendRecvFlag};
-pub use socket_cmd::SocketUringCmdOp;
 pub(crate) use sendrecv::{
     IORING_ACCEPT_DONTWAIT, IORING_ACCEPT_MULTISHOT, IORING_ACCEPT_POLL_FIRST,
     IORING_RECV_MULTISHOT, IORING_RECVSEND_BUNDLE, IORING_RECVSEND_FIXED_BUF,
     IORING_RECVSEND_POLL_FIRST, IORING_SEND_VECTORIZED, IORING_SEND_ZC_REPORT_USAGE,
 };
+pub use socket_cmd::SocketUringCmdOp;
 pub use splice::SpliceFlags;
 pub use sqe_cqe::{CqeFlags, IoUringCqe, IoUringParams, IoUringSqe};
 pub use timeout::{TimeoutFlags, Timespec};

@@ -80,14 +80,18 @@ impl MmapBuffer {
             .ok_or(SetupError::InvalidArg(
                 InvalidArgKind::BufferRingSizeOverflow,
             ))?;
-        let addr = syscall::mmap(
-            0,
-            mapped,
-            Prot::READ | Prot::WRITE,
-            MapFlags::PRIVATE | MapFlags::ANONYMOUS,
-            usize::MAX,
-            0,
-        )
+        // Safety: `addr` 0 and `MapFlags::ANONYMOUS` mean the kernel picks a
+        // fresh, unused range; nothing existing can be clobbered.
+        let addr = unsafe {
+            syscall::mmap(
+                0,
+                mapped,
+                Prot::READ | Prot::WRITE,
+                MapFlags::PRIVATE | MapFlags::ANONYMOUS,
+                usize::MAX,
+                0,
+            )
+        }
         .map_err(SetupError::Syscall)?;
         Ok(Self { addr, len, mapped })
     }
@@ -119,7 +123,10 @@ impl MmapBuffer {
 
 impl Drop for MmapBuffer {
     fn drop(&mut self) {
-        let _ = syscall::munmap(self.addr, self.mapped);
+        // Safety: `self.addr..self.addr + self.mapped` is this value's own
+        // mapping from `with_capacity`, unmapped exactly once here and never
+        // used afterward.
+        let _ = unsafe { syscall::munmap(self.addr, self.mapped) };
     }
 }
 

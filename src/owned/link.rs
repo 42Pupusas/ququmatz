@@ -86,7 +86,13 @@ impl LinkKind {
                     old_dir,
                     new_dir,
                     flags,
-                } => Sqe::linkat_ptr(old_dir.as_raw(), old_addr, new_dir.as_raw(), new_addr, flags),
+                } => Sqe::linkat_ptr(
+                    old_dir.as_raw(),
+                    old_addr,
+                    new_dir.as_raw(),
+                    new_addr,
+                    flags,
+                ),
             }
         }
     }

@@ -61,12 +61,7 @@ impl Sqe {
     /// memory it points to remains valid and readable until the kernel
     /// posts the completion for this operation.
     #[must_use]
-    pub unsafe fn futex_wake(
-        uaddr: *const u32,
-        count: u64,
-        mask: u64,
-        flags: Futex2Flags,
-    ) -> Self {
+    pub unsafe fn futex_wake(uaddr: *const u32, count: u64, mask: u64, flags: Futex2Flags) -> Self {
         let mut sqe = ZEROED;
         sqe.opcode = Opcode::FutexWake.into();
         sqe.addr = uaddr as u64;

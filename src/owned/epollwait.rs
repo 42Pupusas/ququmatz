@@ -47,7 +47,10 @@ impl core::fmt::Display for EpollWaitError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::StoreTooSmall { needed, got } => {
-                write!(f, "epoll_wait storage needs at least {needed} bytes, got {got}")
+                write!(
+                    f,
+                    "epoll_wait storage needs at least {needed} bytes, got {got}"
+                )
             }
             Self::StoreMisaligned { needed } => {
                 write!(f, "epoll_wait storage must be {needed}-byte aligned")

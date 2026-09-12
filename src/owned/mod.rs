@@ -421,9 +421,7 @@ pub use futex::{
     FutexWaitDone, FutexWaitOutcome, FutexWakeDone, PendingFutexWait, PendingFutexWake,
     PreparedFutexWait, PreparedFutexWake,
 };
-pub use futexwaitv::{
-    FutexWaitvDone, FutexWaitvError, PendingFutexWaitv, PreparedFutexWaitv,
-};
+pub use futexwaitv::{FutexWaitvDone, FutexWaitvError, PendingFutexWaitv, PreparedFutexWaitv};
 pub use identity::{RequestId, RingId};
 pub use link::{LinkCompleted, LinkKind, PendingLink, PreparedLink};
 pub use msgregion::{MAX_IOV, MsgRegionError};
