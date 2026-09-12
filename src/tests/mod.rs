@@ -4197,24 +4197,78 @@ const fn libc_eopnotsupp() -> i32 {
 
 #[cfg(not(miri))]
 #[test]
-fn builder_rejects_no_mmap_before_syscall() {
-    use crate::error::{Error, InvalidArgKind, SetupError};
-    use crate::types::SetupFlags;
+fn a_real_no_mmap_ring_completes_a_nop_with_caller_supplied_memory() {
+    // NO_MMAP means the kernel pins pages this crate itself allocated and
+    // described in params.sq_off.user_addr/cq_off.user_addr, rather than
+    // allocating its own -- confirmed against io_uring/io_uring.c's
+    // io_allocate_scq_urings and io_uring/memmap.c's io_region_pin_pages.
+    // A round-tripped NOP here exercises that the sizing this crate
+    // predicts for that memory (ring::no_mmap::NoMmapRegions) is large
+    // enough for the kernel to actually lay the rings out in, and that
+    // the parsing code reads the right offsets back out of memory this
+    // crate owns instead of memory `mmap(2)` produced.
+    let mut ring = IoUring::builder(4)
+        .no_mmap()
+        .build()
+        .expect("NO_MMAP ring should be accepted by this kernel (6.5+)");
+    assert!(ring.setup_flags().contains(crate::types::SetupFlags::NO_MMAP));
 
-    // NO_MMAP requires the caller to pre-allocate ring memory and describe
-    // it via sq_off/cq_off before the setup syscall — this builder never
-    // does that, and the mapping code assumes conventional kernel mmaps.
-    // Reject it at `build()` rather than handing the kernel a request this
-    // crate cannot follow through on.
-    let Err(err) = IoUring::builder(4).setup_flags(SetupFlags::NO_MMAP).build() else {
-        panic!("NO_MMAP must be rejected before the kernel is asked")
-    };
-    assert_eq!(
-        err,
-        Error::Setup(SetupError::InvalidArg(
-            InvalidArgKind::UnsupportedSetupFlags(SetupFlags::NO_MMAP.bits())
-        ))
-    );
+    ring.push_nop(7).expect("push nop");
+    ring.submit_and_wait(1).expect("submit");
+    let cqe = ring.complete().expect("expected a completion");
+    assert_eq!(cqe.user_data, 7);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_no_mmap_ring_rejects_a_plain_mmap_on_its_fd() {
+    // The man page and io_uring/memmap.c's io_region_validate_mmap (which
+    // rejects any region flagged IO_REGION_F_USER_PROVIDED) both document
+    // that a NO_MMAP ring's fd cannot be mmap'd through the usual path --
+    // confirming this crate is right not to attempt one internally, and
+    // that a caller reaching for the fd directly gets the same rejection
+    // the kernel documents rather than a silent, differently-sized map.
+    use crate::types::{MapFlags, Prot, RingOffset};
+
+    let ring = IoUring::builder(4).no_mmap().build().expect("NO_MMAP setup");
+    // The exact errno the kernel settles on here has drifted across
+    // versions (EINVAL from `io_region_validate_mmap`'s explicit check,
+    // ENOMEM from a later `vm_insert_pages` failure on some paths) --
+    // what this crate's own correctness rests on is that the mmap fails
+    // at all, not which errno names the rejection.
+    let _ = crate::syscall::mmap(
+        0,
+        4096,
+        Prot::READ | Prot::WRITE,
+        MapFlags::SHARED,
+        ring.raw_fd().as_usize(),
+        RingOffset::SqRing.into(),
+    )
+    .expect_err("a NO_MMAP ring's fd must refuse a plain mmap");
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_no_mmap_ring_survives_a_larger_queue_depth() {
+    // Exercise the sizing prediction (ring::no_mmap::predict_entries /
+    // ring_region_size / sqes_region_size) against a queue depth well
+    // past the smallest power of two, so a formula that only happened to
+    // work for `entries == 4` would be caught here.
+    let mut ring = IoUring::builder(257)
+        .no_mmap()
+        .build()
+        .expect("NO_MMAP setup at a larger depth");
+
+    for i in 0..8u64 {
+        ring.push_nop(i).expect("push nop");
+    }
+    ring.submit_and_wait(8).expect("submit");
+    let mut seen = 0u64;
+    while let Some(cqe) = ring.complete() {
+        seen += 1;
+        assert!(cqe.user_data < 8);
+    }
+    assert_eq!(seen, 8);
 }
 
 #[cfg(not(miri))]

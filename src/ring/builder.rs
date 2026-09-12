@@ -179,11 +179,27 @@ impl IoUringBuilder {
         self
     }
 
+    /// Don't mmap the rings on the kernel's account -- have this crate
+    /// allocate and describe the ring memory itself before `io_uring_setup`
+    /// runs, then hand the kernel that memory to pin instead of allocating
+    /// its own (6.5+).
+    ///
+    /// The kernel refuses a subsequent plain `mmap(2)` on the ring fd once
+    /// this flag is set; this crate never issues one for a `NO_MMAP` ring
+    /// in the first place, so callers see no difference in the public API
+    /// beyond the flag being reported back from
+    /// [`setup_flags`](crate::ring::IoUring::setup_flags).
+    #[must_use]
+    pub const fn no_mmap(mut self) -> Self {
+        self.params.flags |= SetupFlags::NO_MMAP.bits();
+        self
+    }
+
     /// Set raw setup flags directly.
     ///
     /// Accepts any bit, including ones this crate's ring mapping/parsing
-    /// code does not implement (e.g. `NO_MMAP`, `NO_SQARRAY`, or an unnamed
-    /// future flag). [`build`](Self::build) rejects those before the setup
+    /// code does not implement (e.g. an unnamed future flag).
+    /// [`build`](Self::build) rejects those before the setup
     /// syscall runs, so an unsupported combination surfaces as an error
     /// here rather than as a corrupted ring later.
     #[must_use]

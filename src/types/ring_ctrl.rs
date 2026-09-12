@@ -73,10 +73,18 @@ bitflags! {
 impl SetupFlags {
     /// Flags this crate's setup path actually implements.
     ///
-    /// `NO_MMAP` requires the caller to pre-allocate and describe the ring
-    /// memory in `sq_off`/`cq_off` before `io_uring_setup` — this crate's
-    /// builder never does that, so it remains unimplemented. Any other
-    /// currently-unnamed bit is equally unimplemented by definition.
+    /// `NO_MMAP` *is* implemented: confirmed against
+    /// `io_uring/io_uring.c`'s `io_allocate_scq_urings` and
+    /// `io_uring/memmap.c`'s `io_region_pin_pages`, the kernel under this
+    /// flag pins caller-supplied pages named by `params.sq_off.user_addr`
+    /// (the SQE array) and `params.cq_off.user_addr` (the combined SQ/CQ
+    /// ring region) instead of allocating its own. `IoUring::from_params`
+    /// allocates and describes that memory on the caller's behalf before
+    /// the setup syscall runs (see the `ring::no_mmap` module), sized
+    /// generously against a userspace prediction of the kernel's own
+    /// entry-count rounding and internal layout math (`rings_size`) so the
+    /// pin can never read past what this crate actually backs. Any other
+    /// currently-unnamed bit remains unimplemented by definition.
     ///
     /// `NO_SQARRAY` *is* implemented: confirmed against
     /// `io_uring/io_uring.c`'s `rings_size` (which leaves the SQ indirection
@@ -102,6 +110,7 @@ impl SetupFlags {
             | Self::TASKRUN_FLAG.0
             | Self::SINGLE_ISSUER.0
             | Self::DEFER_TASKRUN.0
+            | Self::NO_MMAP.0
             | Self::NO_SQARRAY.0,
     );
 

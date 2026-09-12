@@ -63,10 +63,9 @@ pub enum InvalidArgKind {
     /// exploited to request a mmap smaller than the caller believes.
     BufferRingSizeOverflow,
     /// `IoUringBuilder` was asked for a setup-flag combination this crate's
-    /// ring mapping/parsing code does not implement (e.g. `NO_MMAP`, which
-    /// needs caller-provided ring memory, or `NO_SQARRAY`, which removes
-    /// the SQ indirection array the mapping code assumes). Carries the
-    /// raw unsupported bits for diagnostics.
+    /// ring mapping/parsing code does not implement (e.g. an unnamed
+    /// future flag this crate has no special-case for). Carries the raw
+    /// unsupported bits for diagnostics.
     UnsupportedSetupFlags(u32),
     /// `IoUring::split` was called on a ring whose setup flags restrict
     /// which OS thread may submit or call `IORING_ENTER_GETEVENTS` to the

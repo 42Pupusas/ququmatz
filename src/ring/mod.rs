@@ -17,6 +17,7 @@ use crate::types::{
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 mod builder;
+mod no_mmap;
 mod ops;
 mod pbuf;
 mod probe;
@@ -174,6 +175,7 @@ impl Completion {
 }
 
 /// Mapped memory region, for cleanup in `Drop`.
+#[derive(Clone, Copy)]
 struct MappedRegion {
     addr: usize,
     len: usize,
@@ -184,6 +186,8 @@ impl MappedRegion {
         Self { addr, len }
     }
 }
+
+
 
 /// Cleanup guard for partially-initialized ring resources.
 ///
@@ -1034,13 +1038,48 @@ impl IoUring {
         }
 
         let setup_flags = params.flags;
+        let no_mmap = SetupFlags::from_raw(setup_flags).contains(SetupFlags::NO_MMAP);
+
+        // Under NO_MMAP the caller (this crate, on the real caller's
+        // behalf) must supply and describe the ring memory in
+        // params.sq_off.user_addr / cq_off.user_addr *before*
+        // io_uring_setup runs -- the kernel only pins pages that already
+        // exist under this flag, it never allocates them. Allocate now so
+        // the addresses are in place when the syscall below fires; on any
+        // later error in this function the guard's Drop unwinds it.
+        let no_mmap_guard = if no_mmap {
+            Some(no_mmap::NoMmapGuard::alloc(entries, params)?)
+        } else {
+            None
+        };
 
         let fd = syscall::io_uring_setup(entries, &raw mut *params)?;
         let mut guard = SetupGuard::new(fd);
 
         let features = Features::from_raw(params.features);
         let (sq_ring_ptr, mmap_sz, cq_ring_ptr, cq_ring_region, sqes_ptr, sqes_sz) =
-            map_rings(fd, params, features, setup_flags, &mut guard)?;
+            if let Some(no_mmap_guard) = no_mmap_guard {
+                // No mmap(2) call needed or possible -- the memory is
+                // already ours and the kernel has just pinned the same
+                // pages. Ownership passes to `guard` exactly as it would
+                // for a real mmap: `RingResources`'s cleanup code unmaps
+                // whatever `sq_ring`/`sqes` name, regardless of whether a
+                // real `mmap(2)` or this crate's own anonymous allocation
+                // produced the address.
+                let regions = no_mmap_guard.disarm();
+                guard.sq_ring = regions.ring_region;
+                guard.sqes = regions.sqes_region;
+                (
+                    regions.ring_region.addr,
+                    regions.ring_region.len,
+                    regions.ring_region.addr,
+                    MappedRegion::new(0, 0),
+                    regions.sqes_region.addr,
+                    regions.sqes_region.len,
+                )
+            } else {
+                map_rings(fd, params, features, setup_flags, &mut guard)?
+            };
 
         let has_sq_array = !SetupFlags::from_raw(setup_flags).contains(SetupFlags::NO_SQARRAY);
         let (sq_head, sq_tail, sq_mask, sq_flags, sqes, sq_tail_local) =
