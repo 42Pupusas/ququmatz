@@ -4628,6 +4628,70 @@ fn enabling_a_ring_that_was_never_disabled_is_rejected() {
 
 #[cfg(not(miri))]
 #[test]
+fn a_real_r_disabled_ring_rejects_enter_until_enable_rings_is_called() {
+    use crate::types::SetupFlags;
+
+    let mut ring = IoUring::builder(4).r_disabled().build().expect("setup");
+    assert!(ring.setup_flags().contains(SetupFlags::R_DISABLED));
+
+    ring.push_nop(1).expect("push");
+    ring.submit()
+        .expect_err("EBADFD: ring is still disabled");
+
+    ring.enable_rings().expect("enable_rings");
+
+    // The NOP pushed before enabling is still queued — flush_sq_tail was
+    // called by the rejected submit(), so this round trips it the same
+    // way any other submit would.
+    ring.submit_and_wait(1).expect("submit_and_wait after enable");
+    let cqe = ring.complete().expect("nop completion");
+    assert_eq!(cqe.user_data, 1);
+    assert_eq!(cqe.result, 0);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_submit_all_ring_still_submits_a_batch_with_no_failures() {
+    use crate::types::SetupFlags;
+
+    let mut ring = IoUring::builder(4).submit_all().build().expect("setup");
+    assert!(ring.setup_flags().contains(SetupFlags::SUBMIT_ALL));
+
+    ring.push_nop(1).expect("push");
+    ring.push_nop(2).expect("push");
+    let submitted = ring.submit_and_wait(2).expect("submit_and_wait");
+    assert_eq!(submitted, 2);
+
+    let mut seen: Vec<u64> = ring.completions().map(|c| c.user_data).collect();
+    seen.sort_unstable();
+    assert_eq!(seen, vec![1, 2]);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_taskrun_flag_ring_completes_a_nop_under_defer_taskrun() {
+    use crate::types::SetupFlags;
+
+    // TASKRUN_FLAG is rejected unless combined with COOP_TASKRUN or
+    // DEFER_TASKRUN; defer_taskrun() sets COOP_TASKRUN for us. Some
+    // kernels also require SINGLE_ISSUER alongside DEFER_TASKRUN.
+    let mut ring = IoUring::builder(4)
+        .defer_taskrun()
+        .single_issuer()
+        .taskrun_flag()
+        .build()
+        .expect("setup");
+    assert!(ring.setup_flags().contains(SetupFlags::TASKRUN_FLAG));
+
+    ring.push_nop(1).expect("push");
+    ring.submit_and_wait(1).expect("submit_and_wait");
+    let cqe = ring.complete().expect("nop completion");
+    assert_eq!(cqe.user_data, 1);
+    assert_eq!(cqe.result, 0);
+}
+
+#[cfg(not(miri))]
+#[test]
 fn submit_sqpoll_roundtrip() {
     // 100ms idle so the poll thread reliably parks between submissions,
     // forcing `submit_sqpoll` through its SQ_WAKEUP branch on the 2nd push.

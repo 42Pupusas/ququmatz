@@ -30,8 +30,24 @@ bitflags! {
     const CLAMP = 1 << 4;
     /// Attach to an existing workqueue.
     const ATTACH_WQ = 1 << 5;
+    /// Start the ring rejecting `io_uring_enter` until
+    /// [`IoUring::enable_rings`](crate::ring::IoUring::enable_rings) is
+    /// called, so buffers, files, or other resources can finish
+    /// registering before any submitted request can run against them.
+    const R_DISABLED = 1 << 6;
+    /// Keep submitting the rest of a batch even after one entry in the
+    /// middle is rejected, instead of stopping at the first failure.
+    /// Without this, [`IoUring::submit`](crate::ring::IoUring::submit) and
+    /// [`submit_and_wait`](crate::ring::IoUring::submit_and_wait) can
+    /// report a short count with entries after the failure left unsent.
+    const SUBMIT_ALL = 1 << 7;
     /// Cooperative task-run: don't force preemption when processing completions (6.0+).
     const COOP_TASKRUN = 1 << 8;
+    /// Surface pending task-work through `IORING_SQ_TASKRUN` in the SQ
+    /// ring's flags rather than requiring a kernel transition to discover
+    /// it. Only meaningful combined with `COOP_TASKRUN` or
+    /// `DEFER_TASKRUN` — the kernel rejects it alone.
+    const TASKRUN_FLAG = 1 << 9;
     /// Single-issuer hint (5.18+).
     const SINGLE_ISSUER = 1 << 12;
     /// Defer task-run work to `io_uring_enter` — biggest latency win on 6.1+.
@@ -63,7 +79,10 @@ impl SetupFlags {
             | Self::CQSIZE.0
             | Self::CLAMP.0
             | Self::ATTACH_WQ.0
+            | Self::R_DISABLED.0
+            | Self::SUBMIT_ALL.0
             | Self::COOP_TASKRUN.0
+            | Self::TASKRUN_FLAG.0
             | Self::SINGLE_ISSUER.0
             | Self::DEFER_TASKRUN.0,
     );

@@ -124,6 +124,47 @@ impl IoUringBuilder {
         self
     }
 
+    /// Create the ring disabled: it rejects `io_uring_enter` until
+    /// [`IoUring::enable_rings`](crate::ring::IoUring::enable_rings) is
+    /// called.
+    ///
+    /// This gives a caller a window to finish registering buffers, files,
+    /// or other resources before any submitted request can execute against
+    /// them.
+    #[must_use]
+    pub const fn r_disabled(mut self) -> Self {
+        self.params.flags |= SetupFlags::R_DISABLED.bits();
+        self
+    }
+
+    /// Keep submitting the rest of a batch even after one entry in the
+    /// middle is rejected, instead of stopping at the first failure.
+    ///
+    /// Without this flag, [`IoUring::submit`](crate::ring::IoUring::submit)
+    /// can report a short count that leaves later, otherwise-valid entries
+    /// unsent until a further `submit` call retries them; with it, the
+    /// kernel pushes through the whole batch in one pass regardless of any
+    /// individual failure.
+    #[must_use]
+    pub const fn submit_all(mut self) -> Self {
+        self.params.flags |= SetupFlags::SUBMIT_ALL.bits();
+        self
+    }
+
+    /// Surface pending task-work through `IORING_SQ_TASKRUN` in the SQ
+    /// ring's flags rather than requiring a kernel transition to discover
+    /// it.
+    ///
+    /// Only meaningful combined with [`coop_taskrun`](Self::coop_taskrun) or
+    /// [`defer_taskrun`](Self::defer_taskrun) — the kernel rejects this flag
+    /// alone, so call one of those first (or let `defer_taskrun` set
+    /// `COOP_TASKRUN` for you).
+    #[must_use]
+    pub const fn taskrun_flag(mut self) -> Self {
+        self.params.flags |= SetupFlags::TASKRUN_FLAG.bits();
+        self
+    }
+
     /// Set raw setup flags directly.
     ///
     /// Accepts any bit, including ones this crate's ring mapping/parsing
