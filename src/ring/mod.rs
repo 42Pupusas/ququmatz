@@ -298,6 +298,11 @@ pub struct IoUring {
     /// without needing the caller to remember and re-supply them.
     setup_flags: u32,
 
+    /// Next `user_data` tag [`ops::run_one`](ops) will stamp on a
+    /// synchronous `do_*` submission. See that module for why every such
+    /// submission needs one.
+    do_tag_next: u64,
+
     // Shared cleanup resources
     resources: *mut RingResources,
 }
@@ -1148,6 +1153,7 @@ impl IoUring {
             cq_head_local,
             features,
             setup_flags,
+            do_tag_next: Self::DO_TAG_MARKER,
             resources,
         })
     }

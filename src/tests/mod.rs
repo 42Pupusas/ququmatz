@@ -1636,6 +1636,39 @@ fn read_write_roundtrip() {
 
 #[cfg(not(miri))]
 #[test]
+fn a_stray_leftover_completion_is_not_mistaken_for_do_reads_own_result() {
+    use crate::error::CompletionError;
+
+    let mut ring = IoUring::new(4).expect("failed to create io_uring");
+    let fd = open_tmpfile(&mut ring);
+    let write_buf = b"stray completion probe";
+    let n = ring
+        .do_write(RawFd::from_raw(fd as usize), write_buf, 0)
+        .expect("do_write");
+    assert_eq!(n as usize, write_buf.len());
+
+    // Leave a NOP completion sitting in the CQ, unconsumed, the way a
+    // caller who forgot to drain something earlier would.
+    ring.push_nop(0xdead_beef).expect("push stray nop");
+    ring.submit_and_wait(1).expect("wait for stray nop");
+
+    let mut read_buf = [0u8; 64];
+    let err = ring
+        .do_read(RawFd::from_raw(fd as usize), &mut read_buf, 0)
+        .expect_err("do_read must not accept the stray nop's completion as its own");
+    match err {
+        Error::Completion(CompletionError::UnexpectedCompletion { found, .. }) => {
+            assert_eq!(found, 0xdead_beef);
+        }
+        other => panic!("expected UnexpectedCompletion, got {other:?}"),
+    }
+
+    ring.do_close(RawFd::from_raw(fd as usize))
+        .expect("do_close");
+}
+
+#[cfg(not(miri))]
+#[test]
 fn vectored_read_write() {
     let mut ring = IoUring::new(4).expect("failed to create io_uring");
     let fd = open_tmpfile(&mut ring);

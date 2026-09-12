@@ -129,6 +129,25 @@ pub enum CompletionError {
     NoCompletion,
     /// The kernel reported a negative errno inside the CQE.
     Failed(Errno),
+    /// A synchronous `do_*` call reaped a CQE whose `user_data` did not
+    /// match the tag it stamped on its own submission.
+    ///
+    /// This happens when the ring already had another operation in flight
+    /// (submitted by an earlier `push`/`submit` call, or by a still-armed
+    /// multishot) at the moment a `do_*` helper ran: `do_*` requires
+    /// exclusive use of the ring's completion stream for the duration of
+    /// its call, and cannot tell its own result apart from a foreign
+    /// CQE's without this check. The CQE that triggered this error — and
+    /// any others encountered while still waiting for the tagged one — has
+    /// already been consumed and cannot be recovered; whatever submitted
+    /// it must be resubmitted. `expected` is the tag `do_*` stamped on its
+    /// own submission; `found` is the `user_data` actually seen.
+    UnexpectedCompletion {
+        /// The `user_data` tag the caller's own submission carried.
+        expected: u64,
+        /// The `user_data` actually read off the mismatched CQE.
+        found: u64,
+    },
 }
 
 impl fmt::Display for CompletionError {
@@ -136,6 +155,10 @@ impl fmt::Display for CompletionError {
         match self {
             Self::NoCompletion => f.write_str("no completion available"),
             Self::Failed(e) => write!(f, "operation failed: {e}"),
+            Self::UnexpectedCompletion { expected, found } => write!(
+                f,
+                "expected completion tagged {expected}, found unrelated completion tagged {found} -- another operation was in flight on this ring"
+            ),
         }
     }
 }

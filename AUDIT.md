@@ -864,7 +864,28 @@ userspace storage, so there is no pointer lifetime to model.
 
 ### Q-03 — `run_one` does not wait for its own operation on all paths
 
-**Status: confirmed.**
+**Status: fixed (identity correlation).** `IoUring` now carries a private
+per-ring `do_tag_next: u64` counter (`src/ring/mod.rs`). `run_one` in
+`src/ring/ops.rs` mints a fresh tag from it, stamps it onto the SQE's
+`user_data` before pushing, and after `submit_and_wait(1)` checks the
+reaped CQE's `user_data` against that exact tag before trusting its
+result. A mismatch returns
+`Error::Completion(CompletionError::UnexpectedCompletion { expected,
+found })` instead of returning the foreign CQE's result as if it were
+this call's own -- closing the failure scenario this entry described
+(a stale NOP completion, or a still-armed multishot arrival, being
+mistaken for a `do_recv`'s own result).
+
+The mismatched CQE itself is consumed and cannot be recovered: this
+crate keeps no stash that could hold a foreign CQE for later
+redelivery to whatever actually submitted it, so `UnexpectedCompletion`
+is documented as meaning "resubmit whatever produced `found`," not as
+a retry signal for the current call. `run_one`'s own `?` after
+`submit_and_wait` continues to propagate a syscall failure immediately,
+as before -- that half of the original finding was never in question,
+only the identity gap was.
+
+**Status (original): confirmed.**
 
 **Evidence:** `src/ring/ops.rs:13–24`: push one SQE, `submit_and_wait(1)`, then return `complete().into_result()`. There is no request identity check or outstanding-request isolation. The `?` after submission also returns immediately on syscall error.
 

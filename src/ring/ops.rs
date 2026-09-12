@@ -1,5 +1,25 @@
 //! Scoped convenience methods on [`IoUring`]: `do_*` methods that submit a
 //! single SQE, wait for completion, and return the result.
+//!
+//! # Why every submission here carries an identity tag
+//!
+//! A naive `push` + `submit_and_wait(1)` + `complete()` sequence assumes the
+//! next CQE the ring produces belongs to the SQE it just pushed. That is not
+//! guaranteed: a CQE left over from an earlier submission the caller never
+//! drained, or an arrival from a still-armed multishot request, can occupy
+//! the completion queue and get reaped first. Taking that CQE's result as
+//! this call's outcome would silently return the wrong value and, worse,
+//! could report a read/write/statx call as finished while the buffer it
+//! actually named is still being written by the kernel.
+//!
+//! [`run_one`](IoUring::run_one) closes that gap by tagging every
+//! synchronous submission with a `user_data` value minted from a private
+//! per-ring counter that no other caller of this ring is expected to use,
+//! then checking that the very next CQE carries that exact tag before
+//! trusting its result. A mismatched CQE is consumed — this crate keeps no
+//! stash that could hold it for later redelivery — and reported via
+//! [`CompletionError::UnexpectedCompletion`](crate::CompletionError::UnexpectedCompletion)
+//! rather than mistaken for this call's own result.
 
 use super::IoUring;
 use crate::error::{CompletionError, Error};
@@ -10,17 +30,49 @@ use crate::types::{
 };
 
 impl IoUring {
+    /// High bit set on every tag `run_one` mints, so a `do_*` completion is
+    /// recognisable even if it happens to share the low bits of some other
+    /// caller's `user_data` scheme. Not a hard guarantee against a caller
+    /// who deliberately mints tags in this range themselves — nothing in a
+    /// `user_data` field can be forged-proof against that — but `do_*` is
+    /// documented as requiring exclusive use of the ring for its call, so
+    /// this is a diagnostic aid for the ordinary case (stray leftover CQEs,
+    /// armed multishots) rather than a security boundary.
+    pub(super) const DO_TAG_MARKER: u64 = 1 << 63;
+
+    /// Mint the next tag for a synchronous `do_*` submission.
+    const fn next_do_tag(&mut self) -> u64 {
+        let tag = self.do_tag_next;
+        self.do_tag_next = Self::DO_TAG_MARKER | (tag.wrapping_add(1) & !Self::DO_TAG_MARKER);
+        tag
+    }
+
     /// Submit a single SQE, wait for its completion, and return the result.
     ///
     /// This is the building block for all `do_*` methods. The `&mut self`
     /// borrow prevents concurrent submissions and ensures any referenced
     /// data in the `Sqe` remains valid for the duration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompletionError::UnexpectedCompletion`] if the CQE reaped
+    /// after submission does not carry this call's own tag — see the
+    /// module documentation for what that means and why the mismatched CQE
+    /// cannot be recovered afterward.
     fn run_one(&mut self, sqe: Sqe) -> Result<u32, Error> {
-        self.push(sqe)?;
+        let tag = self.next_do_tag();
+        self.push(sqe.user_data(tag))?;
         self.submit_and_wait(1)?;
-        self.complete()
-            .ok_or(Error::Completion(CompletionError::NoCompletion))?
-            .into_result()
+        let completion = self
+            .complete()
+            .ok_or(Error::Completion(CompletionError::NoCompletion))?;
+        if completion.user_data != tag {
+            return Err(Error::Completion(CompletionError::UnexpectedCompletion {
+                expected: tag,
+                found: completion.user_data,
+            }));
+        }
+        completion.into_result()
     }
 
     /// Read from `fd` into `buf` at `offset`. Returns the byte count.
