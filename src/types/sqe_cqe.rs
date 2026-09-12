@@ -77,6 +77,83 @@ impl IoUringSqe {
     pub const fn set_attr_type_mask(&mut self, mask: u64) {
         self.pad2[0] = mask;
     }
+
+    /// Read the `IORING_OP_URING_CMD` sub-opcode (`sqe->cmd_op`), a union
+    /// alias over the low 32 bits of `off` meaningful only for that opcode
+    /// (confirmed against the kernel's `struct io_uring_sqe` off union:
+    /// `{ off; addr2; struct { cmd_op; __pad1; }; }`, `cmd_op` first and
+    /// therefore lowest-addressed on every target this crate supports).
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub const fn cmd_op(&self) -> u32 {
+        self.off as u32
+    }
+
+    /// Write the `IORING_OP_URING_CMD` sub-opcode, overlapping the low 32
+    /// bits of `off`. The high 32 bits (`__pad1`) are left untouched, which
+    /// is correct only starting from a zeroed SQE — every `uring_cmd_sock_*`
+    /// constructor in this crate starts from [`super::super::op::ZEROED`].
+    pub const fn set_cmd_op(&mut self, op: u32) {
+        self.off = (self.off & 0xFFFF_FFFF_0000_0000) | op as u64;
+    }
+
+    /// Read the socket-ioctl `level` (`sqe->level`), a union alias over the
+    /// low 32 bits of `addr` — meaningful only for
+    /// `SOCKET_URING_OP_GETSOCKOPT`/`SETSOCKOPT`.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub const fn sock_level(&self) -> u32 {
+        self.addr as u32
+    }
+
+    /// Write the socket-ioctl `level`, overlapping the low 32 bits of `addr`.
+    pub const fn set_sock_level(&mut self, level: u32) {
+        self.addr = (self.addr & 0xFFFF_FFFF_0000_0000) | level as u64;
+    }
+
+    /// Read the socket-ioctl `optname` (`sqe->optname`), a union alias over
+    /// the high 32 bits of `addr`.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub const fn sock_optname(&self) -> u32 {
+        (self.addr >> 32) as u32
+    }
+
+    /// Write the socket-ioctl `optname`, overlapping the high 32 bits of
+    /// `addr`.
+    pub const fn set_sock_optname(&mut self, optname: u32) {
+        self.addr = (self.addr & 0xFFFF_FFFF) | ((optname as u64) << 32);
+    }
+
+    /// Read the socket-ioctl option length (`sqe->optlen`), a union alias
+    /// over `splice_fd_in`.
+    #[must_use]
+    pub const fn optlen(&self) -> u32 {
+        self.splice_fd_in.cast_unsigned()
+    }
+
+    /// Write the socket-ioctl option length, overlapping `splice_fd_in`.
+    pub const fn set_optlen(&mut self, len: u32) {
+        self.splice_fd_in = len.cast_signed();
+    }
+
+    /// Read the socket-ioctl option value pointer (`sqe->optval`), a union
+    /// alias over the *same* eight bytes as [`attr_ptr`](Self::attr_ptr) —
+    /// confirmed against the kernel's own union, which lists `optval`
+    /// alongside `addr3`/`attr_ptr` as three names for one slot. Given a
+    /// thin name of its own here rather than reusing `attr_ptr` at call
+    /// sites, since "this is a PI attribute pointer" and "this is a
+    /// sockopt buffer pointer" are unrelated claims that happen to share
+    /// storage, not the same fact spelled two ways.
+    #[must_use]
+    pub const fn sock_optval(&self) -> u64 {
+        self.addr3
+    }
+
+    /// Write the socket-ioctl option value pointer, overlapping `addr3`/`attr_ptr`.
+    pub const fn set_sock_optval(&mut self, optval: u64) {
+        self.addr3 = optval;
+    }
 }
 
 impl Default for IoUringSqe {

@@ -20,6 +20,7 @@ mod file;
 mod futex;
 mod msgring;
 mod net;
+mod socket_cmd;
 mod waitid;
 
 /// A prepared submission queue entry, ready to be pushed onto the ring.

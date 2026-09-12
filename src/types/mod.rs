@@ -110,6 +110,7 @@ mod poll;
 mod ring_ctrl;
 mod rwattr;
 mod sendrecv;
+mod socket_cmd;
 mod splice;
 mod sqe_cqe;
 mod timeout;
@@ -148,6 +149,7 @@ pub use poll::PollMask;
 pub use ring_ctrl::{EnterFlags, Features, SetupFlags, SqeFlags};
 pub use rwattr::{RwAttrFlags, RwAttrPi};
 pub use sendrecv::{AcceptModifier, SendRecvFlag};
+pub use socket_cmd::SocketUringCmdOp;
 pub(crate) use sendrecv::{
     IORING_ACCEPT_DONTWAIT, IORING_ACCEPT_MULTISHOT, IORING_ACCEPT_POLL_FIRST,
     IORING_RECV_MULTISHOT, IORING_RECVSEND_BUNDLE, IORING_RECVSEND_FIXED_BUF,

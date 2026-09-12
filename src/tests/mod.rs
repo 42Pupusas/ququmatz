@@ -3817,6 +3817,159 @@ fn a_socket_sqe_with_flags_is_accepted_by_the_kernel() {
 
 #[cfg(not(miri))]
 #[test]
+fn sqe_builder_uring_cmd_sock_inq_places_cmd_op_and_fd() {
+    let sqe = Sqe::uring_cmd_sock_inq(RawFd::from_raw(11)).user_data(1);
+    let inner = sqe.0;
+
+    assert_eq!(Opcode::UringCmd, inner.opcode);
+    assert_eq!(inner.fd, 11);
+    assert_eq!(inner.cmd_op(), u32::from(crate::types::SocketUringCmdOp::SiocInq));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_siocinq_via_uring_cmd_reports_bytes_a_send_queued() {
+    let mut ring = IoUring::new(8).expect("setup");
+    let (listener, port) = setup_tcp_listener();
+    let client = syscall::socket(types::AF_INET, types::SOCK_STREAM | types::SOCK_NONBLOCK, 0)
+        .expect("client socket")
+        .as_i32();
+    let server_fd = tcp_handshake(&mut ring, listener, client, port);
+
+    let payload = b"hello";
+    ring.push(unsafe { Sqe::write(RawFd::from_raw(client as usize), payload, 0) }.user_data(1))
+        .expect("push write");
+    ring.submit_and_wait(1).expect("submit write");
+    let cqe = ring.complete().expect("write cqe");
+    assert_eq!(cqe.result, payload.len() as i32);
+
+    ring.push(Sqe::uring_cmd_sock_inq(RawFd::from_raw(server_fd as usize)).user_data(2))
+        .expect("push siocinq");
+    ring.submit_and_wait(1).expect("submit siocinq");
+    let cqe = ring.complete().expect("siocinq cqe");
+
+    if cqe.result != -95 {
+        assert_eq!(
+            cqe.result,
+            payload.len() as i32,
+            "SIOCINQ should report the bytes the client just sent"
+        );
+    }
+
+    let _ = syscall::close(RawFd::from_raw(server_fd as usize));
+    let _ = syscall::close(RawFd::from_raw(client as usize));
+    let _ = syscall::close(RawFd::from_raw(listener as usize));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn sqe_builder_uring_cmd_sock_getsockopt_places_level_optname_optval_and_len() {
+    let mut optval = [0u8; 4];
+    let sqe = unsafe { Sqe::uring_cmd_sock_getsockopt(RawFd::from_raw(3), 1, 2, &mut optval) };
+    let inner = sqe.0;
+
+    assert_eq!(Opcode::UringCmd, inner.opcode);
+    assert_eq!(
+        inner.cmd_op(),
+        u32::from(crate::types::SocketUringCmdOp::GetSockOpt)
+    );
+    assert_eq!(inner.sock_level(), 1);
+    assert_eq!(inner.sock_optname(), 2);
+    assert_eq!(inner.sock_optval(), optval.as_ptr() as u64);
+    assert_eq!(inner.optlen(), 4);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_getsockopt_via_uring_cmd_reports_the_same_option_as_the_ordinary_syscall() {
+    // SOL_SOCKET=1, SO_TYPE=3 — kernel constants, inlined because they're
+    // only needed by this test.
+    let rawfd = syscall::socket(types::AF_INET, types::SOCK_STREAM, 0).expect("socket");
+
+    let mut ring = IoUring::new(4).expect("ring");
+    let mut optval = [0u8; 4];
+    ring.push(
+        unsafe { Sqe::uring_cmd_sock_getsockopt(rawfd, 1, 3, &mut optval) }.user_data(1),
+    )
+    .expect("push");
+    ring.submit_and_wait(1).expect("submit");
+    let cqe = ring.complete().expect("cqe");
+
+    match cqe.result {
+        // Older kernels (pre-6.3) reject IORING_OP_URING_CMD on a socket fd
+        // outright; treat that as a valid environment to tolerate rather
+        // than a failure to chase.
+        -95 => {}
+        result => {
+            assert_eq!(result, 4, "expected the 4-byte SO_TYPE option length back");
+            let reported = i32::from_ne_bytes(optval);
+            assert_eq!(reported, types::SOCK_STREAM, "SO_TYPE should read back SOCK_STREAM");
+        }
+    }
+
+    let _ = syscall::close(rawfd);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_setsockopt_via_uring_cmd_changes_a_real_socket_option() {
+    // SOL_SOCKET=1, SO_REUSEADDR=2, SO_TYPE=3.
+    let rawfd = syscall::socket(types::AF_INET, types::SOCK_STREAM, 0).expect("socket");
+
+    let mut ring = IoUring::new(4).expect("ring");
+    let one: i32 = 1;
+    let optval = one.to_ne_bytes();
+    ring.push(unsafe { Sqe::uring_cmd_sock_setsockopt(rawfd, 1, 2, &optval) }.user_data(1))
+        .expect("push");
+    ring.submit_and_wait(1).expect("submit");
+    let cqe = ring.complete().expect("cqe");
+
+    if cqe.result != -95 {
+        assert_eq!(cqe.result, 0, "setsockopt via uring_cmd should succeed");
+
+        // Confirm through the ordinary syscall that the option actually changed.
+        let mut readback: i32 = 0;
+        let mut len = core::mem::size_of::<i32>() as u32;
+        syscall::getsockopt(rawfd, 1, 2, (&raw mut readback).cast(), &raw mut len)
+            .expect("getsockopt readback");
+        assert_eq!(readback, 1, "SO_REUSEADDR should now be set");
+    }
+
+    let _ = syscall::close(rawfd);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_getsockname_via_uring_cmd_reports_the_bound_address() {
+    let (listener, port) = setup_tcp_listener();
+
+    let mut ring = IoUring::new(4).expect("ring");
+    let mut addr = SockAddrIn::default();
+    let mut addr_len = core::mem::size_of::<SockAddrIn>() as i32;
+    ring.push(
+        unsafe {
+            Sqe::uring_cmd_sock_getsockname(
+                RawFd::from_raw(listener as usize),
+                (&raw mut addr).cast(),
+                &raw mut addr_len,
+            )
+        }
+        .user_data(1),
+    )
+    .expect("push");
+    ring.submit_and_wait(1).expect("submit");
+    let cqe = ring.complete().expect("cqe");
+
+    if cqe.result != -95 {
+        assert_eq!(cqe.result, 0, "getsockname via uring_cmd should succeed");
+        assert_eq!(u16::from_be(addr.sin_port), port);
+    }
+
+    let _ = syscall::close(RawFd::from_raw(listener as usize));
+}
+
+#[cfg(not(miri))]
+#[test]
 fn a_nonblocking_socket_sqe_really_creates_a_nonblocking_socket() {
     use crate::types::{AddressFamily, SocketFlags, SocketType};
     // Acceptance is not application: a flag the kernel ignored would still

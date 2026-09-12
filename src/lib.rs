@@ -54,8 +54,9 @@ pub use types::{
     MsgRingFlags, OpenFlags,
     OpenHow, PbufRingFlags, PollMask,
     RawFd, RecvmsgOut, RecvmsgParts, RenameFlags, RwAttrFlags, RwAttrPi, SendRecvFlag, SetupFlags,
-    ShutdownHow, SocketFlags, SocketType, SpliceFlags, SqeFlags, StatxFlags, StatxMask,
-    SyncCancelReg, TimeoutFlags, Timespec, UnlinkFlags, WaitOptions, WaitidSiginfo, WatchMask,
+    ShutdownHow, SocketFlags, SocketType, SocketUringCmdOp, SpliceFlags, SqeFlags, StatxFlags,
+    StatxMask, SyncCancelReg, TimeoutFlags, Timespec, UnlinkFlags, WaitOptions, WaitidSiginfo,
+    WatchMask,
 };
 pub use types::{ChildEvent, IdType};
 

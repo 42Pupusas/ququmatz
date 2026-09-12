@@ -181,6 +181,26 @@ pub fn setsockopt(
     Ok(())
 }
 
+pub fn getsockopt(
+    fd: RawFd,
+    level: i32,
+    optname: i32,
+    optval: *mut u8,
+    optlen: *mut u32,
+) -> Result<(), Errno> {
+    check(unsafe {
+        syscall5(
+            SYS_GETSOCKOPT,
+            fd.as_usize(),
+            level as usize,
+            optname as usize,
+            optval as usize,
+            optlen as usize,
+        )
+    })?;
+    Ok(())
+}
+
 pub fn io_uring_register(fd: RawFd, opcode: u32, arg: usize, nr_args: u32) -> Result<usize, Errno> {
     check(unsafe {
         syscall4(
