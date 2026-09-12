@@ -157,6 +157,43 @@ impl IoUring {
         Ok(())
     }
 
+    /// Pin this ring's io-wq worker threads to the CPUs named by `mask`.
+    ///
+    /// `mask` is a raw CPU bitmask in the same byte layout as `cpu_set_t`
+    /// (bit `n` of byte `n / 8` selects CPU `n`) — this crate makes no
+    /// libc calls and has no `cpu_set_t` of its own to offer, so the
+    /// kernel's own wire format is exposed directly rather than
+    /// reinventing a typed CPU-set wrapper for a single call site. The
+    /// kernel truncates `mask` to its own `cpumask_size()` if longer, and
+    /// zero-extends it if shorter, matching `sched_setaffinity(2)`'s own
+    /// tolerance for a caller-sized mask.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the kernel rejects the request (e.g. naming no
+    /// CPU the process itself may run on).
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn register_iowq_affinity(&mut self, mask: &[u8]) -> Result<(), Error> {
+        syscall::io_uring_register(
+            self.fd,
+            RegisterOp::RegisterIowqAff.into(),
+            mask.as_ptr() as usize,
+            mask.len() as u32,
+        )?;
+        Ok(())
+    }
+
+    /// Undo `register_iowq_affinity`, releasing this ring's io-wq threads
+    /// back to the submitting process's own CPU affinity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the kernel rejects the request.
+    pub fn unregister_iowq_affinity(&mut self) -> Result<(), Error> {
+        syscall::io_uring_register(self.fd, RegisterOp::UnregisterIowqAff.into(), 0, 0)?;
+        Ok(())
+    }
+
     /// Cap the number of async worker threads used by this ring.
     ///
     /// `max_bounded` limits threads for bounded workloads (e.g. buffered I/O);

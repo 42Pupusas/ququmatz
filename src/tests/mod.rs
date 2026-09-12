@@ -4583,6 +4583,21 @@ fn a_real_ring_fd_registration_can_be_undone() {
 
 #[cfg(not(miri))]
 #[test]
+fn a_real_iowq_affinity_registration_can_be_set_and_undone() {
+    let mut ring = IoUring::new(4).expect("setup");
+    // CPU 0 is present on every Linux system this crate targets, online
+    // or not — the kernel accepts naming an offline CPU in the mask, it
+    // just never schedules a worker there, so this does not need to probe
+    // `/sys` for which CPUs actually exist to be a valid affinity mask.
+    let mask: [u8; 1] = [0b0000_0001];
+    ring.register_iowq_affinity(&mask)
+        .expect("register_iowq_affinity");
+    ring.unregister_iowq_affinity()
+        .expect("unregister_iowq_affinity");
+}
+
+#[cfg(not(miri))]
+#[test]
 fn enabling_a_ring_that_was_never_disabled_is_rejected() {
     let mut ring = IoUring::new(4).expect("setup");
     ring.enable_rings()

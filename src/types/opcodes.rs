@@ -100,6 +100,11 @@ pub enum RegisterOp {
     /// submissions.
     RegisterEnableRings = 12,
     RegisterBuffersUpdate = 16,
+    /// Pin this ring's io-wq worker threads to a caller-supplied CPU mask.
+    RegisterIowqAff = 17,
+    /// Undo `RegisterIowqAff`, releasing the io-wq threads back to the
+    /// process's own affinity.
+    UnregisterIowqAff = 18,
     RegisterIowqMaxWorkers = 19,
     /// Register the ring fd itself as a fixed fd (saves file-table lookup on enter).
     RegisterRingFds = 20,
