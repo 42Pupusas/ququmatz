@@ -9,7 +9,8 @@ use super::{
     MsgRegionError, Openat2Error, Openat2Mode, OwnedPath, PathError, PeerWanted, Pending,
     PendingStatx, PendingZc, Prepared, PreparedAccept, PreparedBind, PreparedCancel,
     PreparedConnect, PreparedDirectAccept, PreparedDirectOpen, PreparedDirectSocket,
-    PreparedEpollCtl, PreparedFilesUpdate, PreparedFixedFdInstall, PreparedLink, PreparedMsgRing,
+    EpollWaitError, PreparedEpollCtl, PreparedEpollWait, PreparedFilesUpdate,
+    PreparedFixedFdInstall, PreparedLink, PreparedMsgRing,
     PreparedMultishot, PreparedOpen, PreparedOpenat2, PreparedPathOp, PreparedReadMultishot,
     PreparedRecvmsg,
     PreparedRename, PreparedSendmsg, PreparedSendmsgZc, PreparedStatx, PreparedTimeout,
@@ -6491,6 +6492,172 @@ fn an_epoll_ticket_survives_moving_to_another_thread_before_completion() {
     let (outcome, store) = handle.join().expect("thread");
     assert_eq!(outcome, EpollOutcome::Applied);
     assert_eq!(store.stable_ptr(), addr);
+}
+
+// ---------------------------------------------------------------
+// epoll_wait
+// ---------------------------------------------------------------
+
+#[test]
+fn an_epoll_wait_sizes_its_max_events_from_the_storage_it_was_given() {
+    let store = MmapBuffer::with_capacity(core::mem::size_of::<EpollEvent>() * 3).expect("map");
+    let prepared = PreparedEpollWait::new(RawFd::from_raw(9), store)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    assert_eq!(prepared.epfd(), RawFd::from_raw(9));
+    assert_eq!(prepared.max_events(), 3);
+}
+
+#[test]
+fn storage_too_small_for_even_one_epoll_event_is_rejected_with_it_handed_back() {
+    let store = MmapBuffer::with_capacity(core::mem::size_of::<EpollEvent>() - 1).expect("map");
+    let addr = store.stable_ptr();
+    let Err((returned, e)) = PreparedEpollWait::new(RawFd::from_raw(9), store) else {
+        panic!("short storage must be refused");
+    };
+    assert_eq!(
+        e,
+        EpollWaitError::StoreTooSmall {
+            needed: core::mem::size_of::<EpollEvent>(),
+            got: core::mem::size_of::<EpollEvent>() - 1,
+        }
+    );
+    assert_eq!(returned.stable_ptr(), addr);
+}
+
+#[test]
+fn an_epoll_wait_push_that_does_not_fit_hands_the_storage_back() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let mut tickets = alloc_tickets(&mut sub);
+
+    let store = epoll_store();
+    let addr = store.stable_ptr();
+    let prepared = PreparedEpollWait::new(RawFd::from_raw(9), store)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let Err((returned, e)) = sub.push_epoll_wait(prepared) else {
+        panic!("a full queue must reject the push");
+    };
+    assert_eq!(e, Error::Submit(SubmitError::QueueFull));
+    assert_eq!(returned.max_events(), 1);
+    assert_eq!(returned.into_store().stable_ptr(), addr);
+    tickets.clear();
+}
+
+#[test]
+fn an_epoll_wait_receipt_for_another_request_is_rejected() {
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut make = || {
+        let prepared = PreparedEpollWait::new(RawFd::from_raw(9), epoll_store())
+            .unwrap_or_else(|(_, e)| panic!("{e}"));
+        sub.push_epoll_wait(prepared)
+            .unwrap_or_else(|(_, e)| panic!("{e}"))
+    };
+    let first = make();
+    let second = make();
+
+    let foreign = Receipt {
+        ring: second.ring(),
+        id: second.id(),
+        result: 0,
+        flags: crate::types::CqeFlags::default(),
+    };
+    assert!(!first.matches(&foreign));
+    let Err((first, _)) = first.redeem(foreign) else {
+        panic!("a foreign receipt must not redeem");
+    };
+    drop((first, second));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_epoll_wait_reports_a_pipe_becoming_readable_through_the_owned_path() {
+    let set = EpollSet::new();
+
+    let mut pipe_fds = [0i32; 2];
+    crate::syscall::pipe2(pipe_fds.as_mut_ptr(), 0).expect("pipe2");
+    let [read_end, write_end] = pipe_fds;
+    let read_end = RawFd::from_raw(read_end as usize);
+    let write_end = RawFd::from_raw(write_end as usize);
+
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let watch = PreparedEpollCtl::new(
+        set.fd,
+        read_end,
+        EpollChange::Add {
+            events: EpollEvents::IN,
+            data: 0x5EED,
+        },
+        epoll_store(),
+    )
+    .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let watch_ticket = sub
+        .push_epoll_ctl(watch)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit add");
+    let receipt = comp.wait_one().expect("add completion");
+    let watch_done = watch_ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(watch_done.outcome(), EpollOutcome::Applied);
+
+    let wait_store =
+        MmapBuffer::with_capacity(core::mem::size_of::<EpollEvent>() * 4).expect("map");
+    let wait_prepared =
+        PreparedEpollWait::new(set.fd, wait_store).unwrap_or_else(|(_, e)| panic!("{e}"));
+    let wait_ticket = sub
+        .push_epoll_wait(wait_prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit().expect("submit wait");
+
+    let mut write_buf = MmapBuffer::with_capacity(4).expect("map");
+    write_buf.as_mut_slice().copy_from_slice(b"wake");
+    let write_ticket = sub
+        .push(Prepared::write(write_end, write_buf, 0))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(2).expect("submit write");
+
+    let mut wait_done = None;
+    let mut write_done = None;
+    let mut wait_ticket = Some(wait_ticket);
+    let mut write_ticket = Some(write_ticket);
+    while wait_done.is_none() || write_done.is_none() {
+        let mut receipt = comp.wait_one().expect("completion");
+        if let Some(t) = wait_ticket.take() {
+            match t.redeem(receipt) {
+                Ok(done) => {
+                    wait_done = Some(done);
+                    continue;
+                }
+                Err((t, r)) => {
+                    wait_ticket = Some(t);
+                    receipt = r;
+                }
+            }
+        }
+        if let Some(t) = write_ticket.take() {
+            match t.redeem(receipt) {
+                Ok(done) => write_done = Some(done),
+                Err((t, _)) => write_ticket = Some(t),
+            }
+        }
+    }
+
+    let wait_done = wait_done.expect("wait completed");
+    let write_done = write_done.expect("write completed");
+    assert_eq!(write_done.result().expect("write ok"), 4);
+    assert_eq!(wait_done.count().expect("wait ok"), 1);
+    let reported = wait_done.events()[0];
+    let (events, data) = (reported.events, reported.data);
+    assert_ne!(events & EpollEvents::IN.bits(), 0);
+    assert_eq!(data, 0x5EED);
+
+    let _ = crate::syscall::close(read_end);
+    let _ = crate::syscall::close(write_end);
 }
 
 // ---------------------------------------------------------------

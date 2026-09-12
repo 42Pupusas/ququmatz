@@ -2852,6 +2852,20 @@ fn sqe_builder_epoll_ctl_places_fields_correctly() {
 }
 
 #[test]
+fn sqe_builder_epoll_wait_places_fields_correctly() {
+    use crate::types::EpollEvent;
+    let mut events = [EpollEvent::default(); 4];
+    let addr = events.as_mut_ptr() as u64;
+    let sqe = unsafe { Sqe::epoll_wait(RawFd::from_raw(9), &mut events) }.user_data(88);
+    let inner = sqe.0;
+    assert_eq!(Opcode::EpollWait, inner.opcode);
+    assert_eq!(inner.fd, 9);
+    assert_eq!(inner.addr, addr);
+    assert_eq!(inner.len, 4);
+    assert_eq!(inner.user_data, 88);
+}
+
+#[test]
 fn sqe_builder_fadvise_places_fields_correctly() {
     use crate::types::{FadviseAdvice, Opcode};
     let sqe = Sqe::fadvise(RawFd::from_raw(3), 0, 4096, FadviseAdvice::Sequential).user_data(11);
@@ -4040,6 +4054,86 @@ fn a_real_read_multishot_delivers_two_writes_from_one_armed_request() {
 
     let _ = syscall::close(RawFd::from_raw(read_end as usize));
     let _ = syscall::close(RawFd::from_raw(write_end as usize));
+}
+
+#[cfg(not(miri))]
+unsafe extern "C" {
+    #[link_name = "epoll_create1"]
+    fn epoll_create1(flags: i32) -> i32;
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_epoll_wait_reports_a_pipe_becoming_readable() {
+    use crate::types::{EpollEvent, EpollEvents, EpollOp};
+
+    let mut pipe_fds = [0i32; 2];
+    crate::syscall::pipe2(pipe_fds.as_mut_ptr(), 0).expect("pipe2");
+    let [read_end, write_end] = pipe_fds;
+
+    // SAFETY: a plain syscall with no pointer arguments.
+    let epfd = unsafe { epoll_create1(0) };
+    assert!(epfd >= 0, "epoll_create1 failed");
+
+    let mut ring = IoUring::new(8).expect("setup");
+
+    let watch = EpollEvent {
+        events: EpollEvents::IN.bits(),
+        data: 0xC0FF_EE,
+    };
+    ring.push(
+        unsafe {
+            Sqe::epoll_ctl(
+                RawFd::from_raw(epfd as usize),
+                EpollOp::Add,
+                RawFd::from_raw(read_end as usize),
+                &watch,
+            )
+        }
+        .user_data(1),
+    )
+    .expect("push epoll_ctl add");
+    ring.submit_and_wait(1).expect("submit add");
+    let add_cqe = ring.complete().expect("add cqe");
+    assert_eq!(add_cqe.result, 0, "epoll_ctl add must succeed");
+
+    // Nothing readable yet: this wait is issued before the write and stays
+    // outstanding until the pipe becomes readable.
+    let mut wait_events = [EpollEvent::default(); 1];
+    ring.push(
+        unsafe { Sqe::epoll_wait(RawFd::from_raw(epfd as usize), &mut wait_events) }
+            .user_data(2),
+    )
+    .expect("push epoll_wait");
+    ring.submit().expect("submit wait");
+
+    // The pipe becomes readable while the wait is outstanding.
+    let msg = b"epoll wait test";
+    ring.push(unsafe { Sqe::write(RawFd::from_raw(write_end as usize), msg, 0) }.user_data(3))
+        .expect("push write");
+    ring.submit_and_wait(2).expect("submit write");
+
+    let mut wait_result: Option<i32> = None;
+    let mut write_result: Option<i32> = None;
+    while wait_result.is_none() || write_result.is_none() {
+        let cqe = ring.complete().expect("cqe");
+        match cqe.user_data {
+            2 => wait_result = Some(cqe.result),
+            3 => write_result = Some(cqe.result),
+            other => panic!("unexpected user_data {other}"),
+        }
+    }
+    assert_eq!(write_result.expect("write completion"), msg.len() as i32);
+    let n = wait_result.expect("wait completion");
+    assert_eq!(n, 1, "exactly one fd became readable");
+    let reported = wait_events[0];
+    let (events, data) = (reported.events, reported.data);
+    assert_eq!(data, 0xC0FF_EE);
+    assert_ne!(events & EpollEvents::IN.bits(), 0);
+
+    let _ = syscall::close(RawFd::from_raw(read_end as usize));
+    let _ = syscall::close(RawFd::from_raw(write_end as usize));
+    let _ = syscall::close(RawFd::from_raw(epfd as usize));
 }
 
 #[cfg(not(miri))]

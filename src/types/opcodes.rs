@@ -63,6 +63,7 @@ pub enum Opcode {
     Ftruncate = 55,
     Bind = 56,
     Listen = 57,
+    EpollWait = 59,
     ReadvFixed = 60,
     WritevFixed = 61,
 }

@@ -41,4 +41,49 @@ impl Sqe {
         sqe.len = op.into();
         Self(sqe)
     }
+
+    /// Prepare an `epoll_wait`: an async `epoll_wait(2)` on `epfd`, filling
+    /// up to `events.len()` entries into `events`.
+    ///
+    /// Unlike `epoll_ctl`, the kernel here *writes* through the pointer —
+    /// `events` must remain valid and exclusively writable until the
+    /// operation completes.
+    ///
+    /// # Safety
+    ///
+    /// `events` is borrowed only for this call — the returned `Sqe` stores
+    /// a raw pointer derived from it, not the borrow itself. The caller
+    /// must ensure the memory `events` points to remains valid and
+    /// writable for its whole length until the kernel posts the
+    /// completion for this operation.
+    #[must_use]
+    pub unsafe fn epoll_wait(epfd: RawFd, events: &mut [EpollEvent]) -> Self {
+        let max_events = Self::clamp_max_events(events.len());
+        unsafe { Self::epoll_wait_ptr(epfd, events.as_mut_ptr(), max_events) }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    const fn clamp_max_events(len: usize) -> u32 {
+        if len > u32::MAX as usize {
+            u32::MAX
+        } else {
+            len as u32
+        }
+    }
+
+    /// Prepare an `epoll_wait` operation from a raw pointer.
+    ///
+    /// # Safety
+    ///
+    /// `events` must point to writable storage for at least `max_events`
+    /// entries that remains valid until the operation completes.
+    #[must_use]
+    pub unsafe fn epoll_wait_ptr(epfd: RawFd, events: *mut EpollEvent, max_events: u32) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::EpollWait.into();
+        sqe.fd = epfd.as_i32();
+        sqe.addr = events as u64;
+        sqe.len = max_events;
+        Self(sqe)
+    }
 }

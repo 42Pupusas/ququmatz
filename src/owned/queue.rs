@@ -9,6 +9,7 @@ use super::direct::{PendingDirectOpen, PreparedDirectOpen};
 use super::direct_accept::{DirectAccept, PreparedDirectAccept};
 use super::direct_socket::{PendingDirectSocket, PreparedDirectSocket};
 use super::epoll::{PendingEpollCtl, PreparedEpollCtl};
+use super::epollwait::{PendingEpollWait, PreparedEpollWait};
 use super::event::{Event, PartialReceipt};
 use super::filesupdate::{PendingFilesUpdate, PreparedFilesUpdate};
 use super::fixedfdinstall::{PendingFixedFdInstall, PreparedFixedFdInstall};
@@ -701,6 +702,39 @@ impl OwnedSubmitter {
 
     /// Undo an `epoll_ctl` push that the kernel never observed.
     fn reclaim_epoll_ctl<S: StableBufferMut>(pending: PendingEpollCtl<S>) -> PreparedEpollCtl<S> {
+        // SAFETY: only reached when `Submitter::push` reported the queue was
+        // full, which happens before the SQE is written or the tail is
+        // advanced. No kernel-visible pointer to the storage exists.
+        unsafe { pending.reclaim_unsubmitted() }
+    }
+
+    /// Queue an `epoll_wait`, taking ownership of the destination storage.
+    ///
+    /// The epoll set itself is not taken: `epoll_wait` borrows it for the
+    /// call. Only the destination the kernel writes into is owned.
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact,
+    /// still owning its storage.
+    pub fn push_epoll_wait<D: StableBufferMut>(
+        &mut self,
+        request: PreparedEpollWait<D>,
+    ) -> Result<PendingEpollWait<D>, (PreparedEpollWait<D>, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            // The SQE never became kernel-visible, so the kernel never saw
+            // the destination pointer and reclaiming the storage is sound.
+            Err(e) => Err((Self::reclaim_epoll_wait(pending), e)),
+        }
+    }
+
+    /// Undo an `epoll_wait` push that the kernel never observed.
+    fn reclaim_epoll_wait<D: StableBufferMut>(
+        pending: PendingEpollWait<D>,
+    ) -> PreparedEpollWait<D> {
         // SAFETY: only reached when `Submitter::push` reported the queue was
         // full, which happens before the SQE is written or the tail is
         // advanced. No kernel-visible pointer to the storage exists.

@@ -356,6 +356,7 @@ mod direct;
 mod direct_accept;
 mod direct_socket;
 mod epoll;
+mod epollwait;
 mod event;
 mod filesupdate;
 mod fixedfdinstall;
@@ -407,6 +408,7 @@ pub use direct_socket::{
 pub use epoll::{
     EpollChange, EpollCtlDone, EpollError, EpollOutcome, PendingEpollCtl, PreparedEpollCtl,
 };
+pub use epollwait::{EpollWaitCompleted, EpollWaitError, PendingEpollWait, PreparedEpollWait};
 pub use event::{Event, PartialReceipt};
 pub use filesupdate::{
     FilesUpdateError, FilesUpdated, PendingFilesUpdate, PreparedFilesUpdate, TableEntry, Update,
