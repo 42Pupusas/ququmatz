@@ -10,7 +10,7 @@
 use crate::types::{
     AcceptModifier, IORING_ACCEPT_DONTWAIT, IORING_ACCEPT_POLL_FIRST, IORING_RECVSEND_BUNDLE,
     IORING_RECVSEND_FIXED_BUF, IORING_RECVSEND_POLL_FIRST, IORING_SEND_VECTORIZED,
-    IORING_SEND_ZC_REPORT_USAGE, IoUringSqe, SendRecvFlag, SqeFlags,
+    IORING_SEND_ZC_REPORT_USAGE, IoUringSqe, RwAttrFlags, RwAttrPi, SendRecvFlag, SqeFlags,
 };
 
 mod buffers;
@@ -213,6 +213,35 @@ impl Sqe {
             AcceptModifier::DontWait => self.0.ioprio |= IORING_ACCEPT_DONTWAIT,
             AcceptModifier::PollFirst => self.0.ioprio |= IORING_ACCEPT_POLL_FIRST,
         }
+        self
+    }
+
+    /// Attach PI (protection information) metadata to a read/write SQE
+    /// (kernel 6.14+).
+    ///
+    /// Valid only on the rw-prep family this crate exposes as
+    /// [`read`](Self::read)/[`write`](Self::write)/[`readv`](Self::readv)/
+    /// [`writev`](Self::writev)/[`read_fixed`](Self::read_fixed)/
+    /// [`write_fixed`](Self::write_fixed)/[`readv_fixed`](Self::readv_fixed)/
+    /// [`writev_fixed`](Self::writev_fixed) — every other opcode's `addr3`
+    /// slot means something else entirely, and this modifier overwrites it
+    /// unconditionally. `attr` is copied by the kernel at prep time (unlike
+    /// the request's own data buffer, it does not need to stay alive past
+    /// submission), but the metadata buffer `attr.addr`/`attr.len`
+    /// describe does need to remain valid, correctly sized, and
+    /// exclusively accessible until the kernel posts the completion —
+    /// the same lifetime obligation as any other pointer this crate's SQE
+    /// constructors store.
+    ///
+    /// # Safety
+    ///
+    /// `attr` must point to a valid, readable [`RwAttrPi`], and the memory
+    /// its `addr`/`len` describe must remain valid for the whole operation
+    /// as described above.
+    #[must_use]
+    pub unsafe fn with_pi_attr(mut self, attr: *const RwAttrPi) -> Self {
+        self.0.set_attr_ptr(attr as u64);
+        self.0.set_attr_type_mask(RwAttrFlags::PI.bits());
         self
     }
 

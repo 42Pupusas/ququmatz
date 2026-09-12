@@ -33,8 +33,50 @@ pub struct IoUringSqe {
     pub buf_index: u16,
     pub personality: u16,
     pub splice_fd_in: i32,
+    /// Shares its eight bytes with the rw-attribute pointer
+    /// (`sqe->attr_ptr`) — the kernel's own layout is a union here
+    /// (`addr3`/`__pad2` vs. `attr_ptr`/`attr_type_mask`), so this crate
+    /// exposes both pairs of named accessors
+    /// ([`attr_ptr`](Self::attr_ptr)/[`attr_type_mask`](Self::attr_type_mask))
+    /// over the same two `u64` slots rather than only one. A read/write op
+    /// that sets `attr_ptr`/`attr_type_mask` must not also rely on
+    /// `addr3`/`_pad2` meaning anything, and vice versa — see
+    /// [`super::RwAttrFlags`].
     pub addr3: u64,
-    pub(crate) _pad2: [u64; 1],
+    /// Shares its eight bytes with the rw-attribute type mask
+    /// (`sqe->attr_type_mask`) — see [`attr_type_mask`](Self::attr_type_mask).
+    /// Named without the crate's usual `_pad`-prefix-means-never-read
+    /// convention specifically because this field genuinely is read now,
+    /// through that accessor.
+    pub(crate) pad2: [u64; 1],
+}
+
+impl IoUringSqe {
+    /// Read `addr3`'s union alias as the rw-attribute pointer
+    /// (`sqe->attr_ptr`).
+    #[must_use]
+    pub const fn attr_ptr(&self) -> u64 {
+        self.addr3
+    }
+
+    /// Write the rw-attribute pointer (`sqe->attr_ptr`), which overlaps
+    /// `addr3` in the kernel's own union.
+    pub const fn set_attr_ptr(&mut self, ptr: u64) {
+        self.addr3 = ptr;
+    }
+
+    /// Read `pad2`'s union alias as the rw-attribute type mask
+    /// (`sqe->attr_type_mask`).
+    #[must_use]
+    pub const fn attr_type_mask(&self) -> u64 {
+        self.pad2[0]
+    }
+
+    /// Write the rw-attribute type mask (`sqe->attr_type_mask`), which
+    /// overlaps `pad2` in the kernel's own union.
+    pub const fn set_attr_type_mask(&mut self, mask: u64) {
+        self.pad2[0] = mask;
+    }
 }
 
 impl Default for IoUringSqe {

@@ -2451,6 +2451,80 @@ fn a_real_incremental_buffer_ring_consumes_one_buffer_across_two_recvs() {
 
 #[cfg(not(miri))]
 #[test]
+fn rw_attr_pi_layout_matches_the_kernel_struct() {
+    use crate::types::RwAttrPi;
+
+    assert_eq!(mem::size_of::<RwAttrPi>(), 32);
+    assert_eq!(mem::align_of::<RwAttrPi>(), 8);
+    assert_eq!(mem::offset_of!(RwAttrPi, flags), 0);
+    assert_eq!(mem::offset_of!(RwAttrPi, app_tag), 2);
+    assert_eq!(mem::offset_of!(RwAttrPi, len), 4);
+    assert_eq!(mem::offset_of!(RwAttrPi, addr), 8);
+    assert_eq!(mem::offset_of!(RwAttrPi, seed), 16);
+    assert_eq!(mem::offset_of!(RwAttrPi, rsvd), 24);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn sqe_builder_with_pi_attr_places_attr_ptr_and_mask_over_addr3_and_pad2() {
+    use crate::types::{RwAttrFlags, RwAttrPi};
+
+    let mut buf = [0u8; 16];
+    let attr = RwAttrPi::default();
+    let sqe = unsafe { Sqe::read(RawFd::from_raw(9), &mut buf, 0) };
+    let sqe = unsafe { sqe.with_pi_attr(&raw const attr) };
+    let inner = sqe.0;
+
+    assert_eq!(inner.addr3, &raw const attr as u64);
+    assert_eq!(inner.attr_ptr(), &raw const attr as u64);
+    assert_eq!(inner.pad2[0], RwAttrFlags::PI.bits());
+    assert_eq!(inner.attr_type_mask(), RwAttrFlags::PI.bits());
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_pi_attributed_read_reaches_the_kernels_metadata_check() {
+    use crate::types::RwAttrPi;
+
+    let mut ring = IoUring::new(4).expect("failed to create io_uring");
+    let fd = open_tmpfile(&mut ring);
+
+    let mut read_buf = [0u8; 16];
+    let mut meta_buf = [0u8; 8];
+    let attr = RwAttrPi {
+        flags: 0,
+        app_tag: 0,
+        len: meta_buf.len() as u32,
+        addr: meta_buf.as_mut_ptr() as u64,
+        seed: 0,
+        rsvd: 0,
+    };
+
+    let sqe = unsafe { Sqe::read(RawFd::from_raw(fd as usize), &mut read_buf, 0) };
+    let sqe = unsafe { sqe.with_pi_attr(&raw const attr) }.user_data(1);
+    ring.push(sqe).expect("failed to push PI-attributed read");
+    ring.submit_and_wait(1).expect("failed to submit");
+
+    let cqe = ring.complete().expect("expected a completion");
+    assert_eq!(cqe.user_data, 1);
+    // A tmpfile has no FMODE_HAS_METADATA — the kernel rejects the
+    // request with -EINVAL once it reaches io_rw_init_file's metadata
+    // check, confirming attr_ptr/attr_type_mask were read and parsed
+    // (an unparsed/garbage attribute would fail earlier, at the
+    // attr_type_mask != IORING_RW_ATTR_FLAG_PI check in __io_prep_rw,
+    // or crash on a bad attr_ptr instead of failing this specific,
+    // late-stage check).
+    assert_eq!(cqe.result, -Errno::EINVAL.0);
+
+    ring.push(Sqe::close(RawFd::from_raw(fd as usize)).user_data(2))
+        .expect("failed to push close");
+    ring.submit_and_wait(1).expect("failed to submit close");
+    let cqe = ring.complete().expect("expected close completion");
+    assert_eq!(cqe.result, 0);
+}
+
+#[cfg(not(miri))]
+#[test]
 fn io_uring_buf_status_layout_matches_the_kernel_struct() {
     use crate::types::IoUringBufStatus;
 

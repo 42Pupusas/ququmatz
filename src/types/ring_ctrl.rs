@@ -10,6 +10,14 @@ bitflags! {
     const EXT_ARG = 1 << 3;
     /// Use the registered ring fd (saved file-table lookup on each enter).
     const REGISTERED_RING = 1 << 4;
+    /// Skip the `iowait`-state accounting `io_uring_enter` normally does
+    /// while blocked in `GETEVENTS` (kernel 6.14+). Marking the calling
+    /// thread as iowaiting nudges the scheduler and power governors to
+    /// treat the wait as I/O-bound, which is the right default for most
+    /// blocking waits but wrong for a low-latency poll loop that spends
+    /// most of its time here by design; this flag opts such a loop out of
+    /// that accounting. Requires [`Features::NO_IOWAIT`](super::Features::NO_IOWAIT).
+    const NO_IOWAIT = 1 << 7;
 }
 
 bitflags! {
@@ -129,6 +137,12 @@ bitflags! {
     const REG_REG_RING = 1 << 13;
     const RECVSEND_BUNDLE = 1 << 14;
     const MIN_TIMEOUT = 1 << 15;
+    /// The kernel understands `sqe->attr_ptr`/`attr_type_mask` on rw-prep
+    /// opcodes (kernel 6.14+). See [`super::RwAttrFlags`].
+    const RW_ATTR = 1 << 16;
+    /// `IORING_ENTER_NO_IOWAIT` is accepted by `io_uring_enter` (kernel
+    /// 6.14+): see [`EnterFlags::NO_IOWAIT`].
+    const NO_IOWAIT = 1 << 17;
 }
 
 impl Features {

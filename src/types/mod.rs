@@ -108,6 +108,7 @@ mod net;
 mod opcodes;
 mod poll;
 mod ring_ctrl;
+mod rwattr;
 mod sendrecv;
 mod splice;
 mod sqe_cqe;
@@ -145,6 +146,7 @@ pub use net::{
 pub use opcodes::{Opcode, RegisterOp, RingOffset};
 pub use poll::PollMask;
 pub use ring_ctrl::{EnterFlags, Features, SetupFlags, SqeFlags};
+pub use rwattr::{RwAttrFlags, RwAttrPi};
 pub use sendrecv::{AcceptModifier, SendRecvFlag};
 pub(crate) use sendrecv::{
     IORING_ACCEPT_DONTWAIT, IORING_ACCEPT_MULTISHOT, IORING_ACCEPT_POLL_FIRST,

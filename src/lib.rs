@@ -53,9 +53,9 @@ pub use types::{
     IoUringRsrcUpdate, IoUringRsrcUpdate2, IoUringSqe, IoVec, MadviseAdvice, MsgFlags,
     MsgRingFlags, OpenFlags,
     OpenHow, PbufRingFlags, PollMask,
-    RawFd, RecvmsgOut, RecvmsgParts, RenameFlags, SendRecvFlag, SetupFlags, ShutdownHow,
-    SocketFlags, SocketType, SpliceFlags, SqeFlags, StatxFlags, StatxMask, SyncCancelReg,
-    TimeoutFlags, Timespec, UnlinkFlags, WaitOptions, WaitidSiginfo, WatchMask,
+    RawFd, RecvmsgOut, RecvmsgParts, RenameFlags, RwAttrFlags, RwAttrPi, SendRecvFlag, SetupFlags,
+    ShutdownHow, SocketFlags, SocketType, SpliceFlags, SqeFlags, StatxFlags, StatxMask,
+    SyncCancelReg, TimeoutFlags, Timespec, UnlinkFlags, WaitOptions, WaitidSiginfo, WatchMask,
 };
 pub use types::{ChildEvent, IdType};
 
