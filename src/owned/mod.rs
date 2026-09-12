@@ -380,6 +380,7 @@ mod request;
 mod sendmsg;
 mod sendmsg_zc;
 mod slot;
+mod staged_addr;
 mod statx;
 mod timeout;
 mod vectored;

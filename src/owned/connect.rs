@@ -51,12 +51,15 @@
 //! where the submitting thread never enters the kernel and the SQ thread
 //! reads the SQE on its own schedule. No call's return proves the copy has
 //! happened, so the storage is owned until the completion.
+//!
+//! That machinery lives in [`staged_addr`](super::staged_addr), shared
+//! verbatim with [`bind`](super::bind): this module supplies only the SQE
+//! builder and the outcome table that make a `connect` different from a
+//! `bind`.
 
-use core::mem::{ManuallyDrop, size_of};
-
-use super::buffer::StableBufferMut;
 use super::identity::{RequestId, RingId};
 use super::request::Receipt;
+use super::staged_addr::{AddrOp, StagedDone, StagedPending, StagedPrepared};
 use crate::error::Errno;
 use crate::op::Sqe;
 use crate::types::{RawFd, SockAddrIn};
@@ -69,17 +72,6 @@ const EISCONN: i32 = -106;
 const ETIMEDOUT: i32 = -110;
 /// `-ENETUNREACH`: no route to that address.
 const ENETUNREACH: i32 = -101;
-
-/// Bytes of socket address the kernel is given.
-const ADDR_LEN: usize = size_of::<SockAddrIn>();
-
-/// The same length in the width the SQE carries it in.
-///
-/// Declared as `u32` so there is no narrowing cast to justify; the
-/// assertion pins it to the real struct rather than to a literal that
-/// could drift away from it.
-const ADDR_LEN_U32: u32 = 16;
-const _: () = assert!(ADDR_LEN_U32 as usize == ADDR_LEN);
 
 /// How a `connect` ended.
 ///
@@ -168,22 +160,32 @@ impl core::fmt::Display for ConnectError {
     }
 }
 
-/// A `connect` that owns its address storage, not yet queued.
-pub struct PreparedConnect<S> {
-    store: S,
-    fd: RawFd,
-    addr: SockAddrIn,
-    /// Address of the published bytes, cached where the stability bound is
-    /// in scope and checked for size before it was formed.
-    staged: *mut u8,
+/// Marker tying [`staged_addr`](super::staged_addr)'s generic machinery to
+/// `connect`'s SQE shape and outcome table.
+pub(super) enum ConnectOp {}
+
+impl AddrOp for ConnectOp {
+    type Outcome = ConnectOutcome;
+    type Error = ConnectError;
+
+    fn too_small(needed: usize, got: usize) -> Self::Error {
+        ConnectError::StoreTooSmall { needed, got }
+    }
+
+    unsafe fn build_sqe(fd: RawFd, addr: *const u8, len: u32) -> Sqe {
+        // SAFETY: forwarded from the caller, who requires the same of us.
+        unsafe { Sqe::connect_ptr(fd, addr, len) }
+    }
+
+    fn classify(result: i32) -> Self::Outcome {
+        ConnectOutcome::from_raw(result)
+    }
 }
 
-// SAFETY: the pointer refers into storage this struct exclusively owns, so
-// it stays valid wherever the value goes. The struct adds no thread
-// affinity of its own, leaving `S` to decide.
-unsafe impl<S: Send> Send for PreparedConnect<S> {}
+/// A `connect` that owns its address storage, not yet queued.
+pub struct PreparedConnect<S>(StagedPrepared<S, ConnectOp>);
 
-impl<S: StableBufferMut> PreparedConnect<S> {
+impl<S: super::buffer::StableBufferMut> PreparedConnect<S> {
     /// Prepare a connect of `fd` to `addr`.
     ///
     /// Takes ownership of `store`, which the kernel reads the address from
@@ -194,56 +196,22 @@ impl<S: StableBufferMut> PreparedConnect<S> {
     ///
     /// Returns [`ConnectError`] with the storage handed back if `store` is
     /// too small for a socket address.
-    pub fn new(fd: RawFd, addr: SockAddrIn, mut store: S) -> Result<Self, (S, ConnectError)> {
-        let got = store.stable_len();
-        if got < ADDR_LEN {
-            return Err((
-                store,
-                ConnectError::StoreTooSmall {
-                    needed: ADDR_LEN,
-                    got,
-                },
-            ));
-        }
-        let staged = store.stable_mut_ptr();
-        let mut prepared = Self {
-            store,
-            fd,
-            addr,
-            staged,
-        };
-        prepared.publish();
-        Ok(prepared)
+    pub fn new(fd: RawFd, addr: SockAddrIn, store: S) -> Result<Self, (S, ConnectError)> {
+        StagedPrepared::new(fd, addr, store).map(Self)
     }
 }
 
 impl<S> PreparedConnect<S> {
-    /// Write the address into the storage the kernel will read.
-    ///
-    /// Done at construction so the bytes are in place before any SQE can
-    /// name them. The address is staged as bytes rather than as a struct,
-    /// which is why this needs no alignment check: the kernel copies it
-    /// bytewise, and so does this.
-    fn publish(&mut self) {
-        let bytes = self.addr.to_bytes();
-        // SAFETY: `staged` points into storage this request owns
-        // exclusively and was checked to hold at least `ADDR_LEN` bytes,
-        // so the copy stays in bounds and nothing else can observe it. No
-        // SQE naming it exists yet, so the kernel is not reading
-        // concurrently.
-        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.staged, ADDR_LEN) }
-    }
-
     /// The socket this request connects.
     #[must_use]
     pub const fn fd(&self) -> RawFd {
-        self.fd
+        self.0.fd()
     }
 
     /// The address this request connects to.
     #[must_use]
     pub const fn addr(&self) -> SockAddrIn {
-        self.addr
+        self.0.addr()
     }
 
     /// The address bytes exactly as the kernel will read them.
@@ -251,38 +219,20 @@ impl<S> PreparedConnect<S> {
     /// Reads back the published storage rather than rebuilding it, so it
     /// shows what was actually written.
     #[must_use]
-    pub const fn published(&self) -> [u8; ADDR_LEN] {
-        let mut out = [0u8; ADDR_LEN];
-        // SAFETY: `staged` points into storage this request owns and was
-        // written by `publish` at construction, so `ADDR_LEN` initialised
-        // bytes are readable there.
-        unsafe { core::ptr::copy_nonoverlapping(self.staged, out.as_mut_ptr(), ADDR_LEN) }
-        out
+    pub const fn published(&self) -> [u8; super::staged_addr::ADDR_LEN] {
+        self.0.published()
     }
 
     /// Give the storage back, abandoning the request.
     #[must_use]
     pub fn into_store(self) -> S {
-        self.store
+        self.0.into_store()
     }
 
     /// Build the SQE and move to the pending state.
     pub(crate) fn into_pending(self, ring: RingId, id: RequestId) -> (Sqe, PendingConnect<S>) {
-        // SAFETY: `staged` was checked to hold a whole socket address,
-        // written by `publish`, and points into storage this request owns
-        // exclusively. The storage moves into `PendingConnect`, whose
-        // destructor is suppressed unless a receipt proves the kernel
-        // finished.
-        let sqe = unsafe { Sqe::connect_ptr(self.fd, self.staged.cast_const(), ADDR_LEN_U32) };
-        let pending = PendingConnect {
-            store: ManuallyDrop::new(self.store),
-            ring,
-            id,
-            fd: self.fd,
-            addr: self.addr,
-            staged: self.staged,
-        };
-        (sqe.user_data(id.raw()), pending)
+        let (sqe, pending) = self.0.into_pending(ring, id);
+        (sqe, PendingConnect(pending))
     }
 }
 
@@ -298,43 +248,31 @@ impl<S> PreparedConnect<S> {
 /// No descriptor goes with it: `connect` borrows the socket rather than
 /// taking it, so only the storage is at stake.
 #[must_use = "dropping the ticket leaks the address storage"]
-pub struct PendingConnect<S> {
-    store: ManuallyDrop<S>,
-    ring: RingId,
-    id: RequestId,
-    fd: RawFd,
-    addr: SockAddrIn,
-    staged: *mut u8,
-}
-
-// SAFETY: the pointer refers into storage this ticket exclusively owns and
-// keeps alive at a fixed address, so moving the ticket to another thread
-// keeps it valid; `S` decides whether that move is allowed.
-unsafe impl<S: Send> Send for PendingConnect<S> {}
+pub struct PendingConnect<S>(StagedPending<S, ConnectOp>);
 
 impl<S> PendingConnect<S> {
     /// Identity the kernel echoes back in this request's CQE.
     #[must_use]
     pub const fn id(&self) -> RequestId {
-        self.id
+        self.0.id()
     }
 
     /// Identity of the queue that accepted this request.
     #[must_use]
     pub const fn ring(&self) -> RingId {
-        self.ring
+        self.0.ring()
     }
 
     /// The address this request connects to.
     #[must_use]
     pub const fn addr(&self) -> SockAddrIn {
-        self.addr
+        self.0.addr()
     }
 
     /// Whether `receipt` authenticates this exact request.
     #[must_use]
     pub const fn matches(&self, receipt: &Receipt) -> bool {
-        receipt.id().raw() == self.id.raw() && receipt.ring().raw() == self.ring.raw()
+        self.0.matches(receipt)
     }
 
     /// Take the storage back without a receipt, undoing a failed push.
@@ -344,17 +282,8 @@ impl<S> PendingConnect<S> {
     /// The kernel must never have seen this request's SQE. Calling this
     /// after publication hands back storage the kernel may still read.
     pub(crate) unsafe fn reclaim_unsubmitted(self) -> PreparedConnect<S> {
-        let mut this = ManuallyDrop::new(self);
-        // SAFETY: `this` is wrapped in `ManuallyDrop` so the no-op `Drop`
-        // cannot observe the moved-out field. The caller guarantees no
-        // kernel-visible pointer to the storage exists.
-        let store = unsafe { ManuallyDrop::take(&mut this.store) };
-        PreparedConnect {
-            store,
-            fd: this.fd,
-            addr: this.addr,
-            staged: this.staged,
-        }
+        // SAFETY: forwarded from the caller, who requires the same of us.
+        PreparedConnect(unsafe { self.0.reclaim_unsubmitted() })
     }
 
     /// Trade a matching receipt for the outcome and the storage.
@@ -364,73 +293,50 @@ impl<S> PendingConnect<S> {
     /// Returns the ticket and receipt unchanged if the receipt belongs to
     /// another request or another ring.
     pub fn redeem(self, receipt: Receipt) -> Result<ConnectDone<S>, (Self, Receipt)> {
-        if !self.matches(&receipt) {
-            return Err((self, receipt));
-        }
-        let mut this = ManuallyDrop::new(self);
-        // SAFETY: `this` is wrapped in `ManuallyDrop`, so `Drop` will not
-        // run and cannot observe the moved-out field. The receipt proves
-        // the kernel finished with these bytes.
-        let store = unsafe { ManuallyDrop::take(&mut this.store) };
-        Ok(ConnectDone {
-            store,
-            addr: this.addr,
-            id: this.id,
-            result: receipt.raw_result(),
-        })
-    }
-}
-
-impl<S> Drop for PendingConnect<S> {
-    fn drop(&mut self) {
-        // Intentionally no `ManuallyDrop::drop`. See the type docs: the
-        // kernel may still be reading the address, so the storage leaks
-        // rather than being freed underneath an in-flight request.
+        self.0
+            .redeem(receipt)
+            .map(ConnectDone)
+            .map_err(|(pending, receipt)| (Self(pending), receipt))
     }
 }
 
 /// A finished `connect`: how it ended, and the storage back.
-pub struct ConnectDone<S> {
-    store: S,
-    addr: SockAddrIn,
-    id: RequestId,
-    result: i32,
-}
+pub struct ConnectDone<S>(StagedDone<S, ConnectOp>);
 
 impl<S> ConnectDone<S> {
     /// Identity of the request this completes.
     #[must_use]
     pub const fn id(&self) -> RequestId {
-        self.id
+        self.0.id()
     }
 
     /// Raw CQE result: `0` on success, `-errno` otherwise.
     #[must_use]
     pub const fn raw_result(&self) -> i32 {
-        self.result
+        self.0.raw_result()
     }
 
     /// How the request ended.
     #[must_use]
-    pub const fn outcome(&self) -> ConnectOutcome {
-        ConnectOutcome::from_raw(self.result)
+    pub fn outcome(&self) -> ConnectOutcome {
+        self.0.outcome()
     }
 
     /// The address this request connected to.
     #[must_use]
     pub const fn addr(&self) -> SockAddrIn {
-        self.addr
+        self.0.addr()
     }
 
     /// Take the storage back for reuse.
     #[must_use]
     pub fn into_store(self) -> S {
-        self.store
+        self.0.into_store()
     }
 
     /// Take the outcome and the storage together.
     #[must_use]
     pub fn into_parts(self) -> (ConnectOutcome, S) {
-        (self.outcome(), self.store)
+        self.0.into_parts()
     }
 }
