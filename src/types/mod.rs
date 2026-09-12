@@ -103,6 +103,7 @@ mod futex;
 mod inotify;
 mod mmap;
 mod msgring;
+mod napi;
 mod net;
 mod opcodes;
 mod poll;
@@ -132,6 +133,8 @@ pub use futex::{FUTEX_WAITV_MAX, Futex2Flags, FutexWaitv};
 pub use inotify::{InotifyEvent, InotifyInitFlags, WatchMask};
 pub use mmap::{MapFlags, Prot};
 pub use msgring::MsgRingFlags;
+pub use napi::{NapiSettings, NapiTrackingMode, NapiTrackingStrategy};
+pub(crate) use napi::{NapiOp, RawNapi};
 #[cfg(test)]
 pub(crate) use net::{AF_INET, SOCK_NONBLOCK, SOCK_STREAM};
 pub use net::{

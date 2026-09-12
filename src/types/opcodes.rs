@@ -124,6 +124,11 @@ pub enum RegisterOp {
     RegisterFileAllocRange = 25,
     /// Query a provided-buffer ring's current consumer head (kernel 6.8+).
     RegisterPbufStatus = 26,
+    /// Set or update NAPI busy-poll tracking for this ring's sockets
+    /// (kernel 6.9+, requires `CONFIG_NET_RX_BUSY_POLL`).
+    RegisterNapi = 27,
+    /// Stop NAPI busy-poll tracking, restoring irq-driven completion.
+    UnregisterNapi = 28,
 }
 
 impl From<RegisterOp> for u32 {

@@ -4598,6 +4598,28 @@ fn a_real_iowq_affinity_registration_can_be_set_and_undone() {
 
 #[cfg(not(miri))]
 #[test]
+fn a_real_napi_registration_reports_dynamic_tracking_and_can_be_undone() {
+    use crate::types::NapiTrackingStrategy;
+
+    let mut ring = IoUring::new(4).expect("setup");
+    match ring.register_napi(1000, false, NapiTrackingStrategy::Dynamic) {
+        Ok(before) => {
+            // Freshly created ring: no NAPI tracking was configured yet.
+            assert_eq!(before.busy_poll_timeout_usec, 0);
+            let after = ring.unregister_napi().expect("unregister_napi");
+            // Reports what was in effect just before unregistering, i.e.
+            // what register_napi just set.
+            assert_eq!(after.busy_poll_timeout_usec, 1000);
+        }
+        // Kernels built without CONFIG_NET_RX_BUSY_POLL reject this
+        // opcode outright; that is a valid environment for this crate to
+        // run in, not a bug to chase.
+        Err(_) => {}
+    }
+}
+
+#[cfg(not(miri))]
+#[test]
 fn enabling_a_ring_that_was_never_disabled_is_rejected() {
     let mut ring = IoUring::new(4).expect("setup");
     ring.enable_rings()

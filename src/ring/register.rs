@@ -5,8 +5,9 @@ use super::IoUring;
 use crate::error::Error;
 use crate::syscall;
 use crate::types::{
-    CancelOutcome, IoUringFileIndexRange, IoUringFilesUpdate, IoUringRsrcUpdate, IoVec, RawFd,
-    RawSyncCancelReg, RegisterOp, SyncCancelReg,
+    CancelOutcome, IoUringFileIndexRange, IoUringFilesUpdate, IoUringRsrcUpdate, IoVec,
+    NapiOp, NapiSettings, NapiTrackingStrategy, RawFd, RawNapi, RawSyncCancelReg, RegisterOp,
+    SyncCancelReg,
 };
 
 impl IoUring {
@@ -314,5 +315,98 @@ impl IoUring {
             Ok(n) => Ok(CancelOutcome::Applied(n as u32)),
             Err(errno) => Ok(CancelOutcome::from_raw(-errno.raw())),
         }
+    }
+
+    /// Set this ring's NAPI busy-poll tracking strategy, timeout, and
+    /// preference, replacing whatever was configured before (kernel 6.9+,
+    /// requires `CONFIG_NET_RX_BUSY_POLL`).
+    ///
+    /// `busy_poll_timeout_usec` is clamped by the kernel to 10,000
+    /// microseconds. Returns the settings that were in effect immediately
+    /// before this call took effect, mirroring the kernel's own
+    /// before/after-swap contract for this argument.
+    ///
+    /// Switching `tracking` away from [`NapiTrackingStrategy::Static`]
+    /// silently drops any NAPI ids added with
+    /// [`napi_add_static_id`](Self::napi_add_static_id).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the ring was created with `IORING_SETUP_IOPOLL`
+    /// (NAPI busy-poll and IOPOLL are mutually exclusive) or the kernel
+    /// lacks NAPI support.
+    pub fn register_napi(
+        &mut self,
+        busy_poll_timeout_usec: u32,
+        prefer_busy_poll: bool,
+        tracking: NapiTrackingStrategy,
+    ) -> Result<NapiSettings, Error> {
+        let mut raw = RawNapi::register(busy_poll_timeout_usec, prefer_busy_poll, tracking);
+        syscall::io_uring_register(
+            self.fd,
+            RegisterOp::RegisterNapi.into(),
+            core::ptr::from_mut(&mut raw) as usize,
+            1,
+        )?;
+        Ok(NapiSettings::from_raw(&raw))
+    }
+
+    /// Stop NAPI busy-poll tracking, restoring plain irq-driven completion
+    /// and forgetting every tracked NAPI id.
+    ///
+    /// Returns the settings that were in effect immediately before this
+    /// call took effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the kernel rejects the request.
+    pub fn unregister_napi(&mut self) -> Result<NapiSettings, Error> {
+        let mut raw = RawNapi::default();
+        syscall::io_uring_register(
+            self.fd,
+            RegisterOp::UnregisterNapi.into(),
+            core::ptr::from_mut(&mut raw) as usize,
+            1,
+        )?;
+        Ok(NapiSettings::from_raw(&raw))
+    }
+
+    /// Add `napi_id` to this ring's statically tracked busy-poll set.
+    ///
+    /// Only valid once [`register_napi`](Self::register_napi) has set
+    /// [`NapiTrackingStrategy::Static`] — with dynamic tracking (the
+    /// default) the kernel discovers each socket's NAPI id on its own the
+    /// first time the ring polls it, and this call is rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if static tracking is not the current strategy,
+    /// `napi_id` names no real NAPI instance, or it is already tracked.
+    pub fn napi_add_static_id(&mut self, napi_id: u32) -> Result<(), Error> {
+        let mut raw = RawNapi::static_id(NapiOp::StaticAddId, napi_id);
+        syscall::io_uring_register(
+            self.fd,
+            RegisterOp::RegisterNapi.into(),
+            core::ptr::from_mut(&mut raw) as usize,
+            1,
+        )?;
+        Ok(())
+    }
+
+    /// Remove `napi_id` from this ring's statically tracked busy-poll set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if static tracking is not the current strategy or
+    /// `napi_id` is not currently tracked.
+    pub fn napi_remove_static_id(&mut self, napi_id: u32) -> Result<(), Error> {
+        let mut raw = RawNapi::static_id(NapiOp::StaticDelId, napi_id);
+        syscall::io_uring_register(
+            self.fd,
+            RegisterOp::RegisterNapi.into(),
+            core::ptr::from_mut(&mut raw) as usize,
+            1,
+        )?;
+        Ok(())
     }
 }
