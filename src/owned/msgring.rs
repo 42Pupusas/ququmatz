@@ -114,7 +114,7 @@ impl PendingMsgRing {
     /// Whether `receipt` authenticates this exact request.
     #[must_use]
     pub const fn matches(&self, receipt: &Receipt) -> bool {
-        receipt.id().raw() == self.id.raw() && receipt.ring().raw() == self.ring.raw()
+        receipt.belongs_to(self.ring, self.id)
     }
 
     /// Trade a matching receipt for the request's own outcome.

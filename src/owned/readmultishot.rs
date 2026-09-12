@@ -120,11 +120,7 @@ impl MultishotRead {
     /// Whether a completion belongs to this request.
     #[must_use]
     pub const fn matches(&self, event: &Event) -> bool {
-        let (ring, id) = match event {
-            Event::Complete(receipt) => (receipt.ring(), receipt.id()),
-            Event::Partial(partial) => (partial.ring(), partial.id()),
-        };
-        ring.raw() == self.ring.raw() && id.raw() == self.id.raw()
+        event.belongs_to(self.ring, self.id)
     }
 
     /// Interpret a completion for this request.

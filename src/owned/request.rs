@@ -246,7 +246,7 @@ impl<B> Pending<B> {
     /// Whether `receipt` authenticates this exact request.
     #[must_use]
     pub const fn matches(&self, receipt: &Receipt) -> bool {
-        receipt.id.raw() == self.id.raw() && receipt.ring.raw() == self.ring.raw()
+        receipt.belongs_to(self.ring, self.id)
     }
 
     /// Take the buffer back without a receipt, undoing a failed push.
@@ -421,5 +421,16 @@ impl Receipt {
     #[must_use]
     pub const fn flags(&self) -> crate::types::CqeFlags {
         self.flags
+    }
+
+    /// Whether this receipt authenticates the request identified by
+    /// `ring` and `id`.
+    ///
+    /// Every ticket's own `matches` delegates here rather than repeating
+    /// the comparison, so there is exactly one definition of what
+    /// authenticates a request instead of one copy per owned request type.
+    #[must_use]
+    pub const fn belongs_to(&self, ring: RingId, id: RequestId) -> bool {
+        self.id.raw() == id.raw() && self.ring.raw() == ring.raw()
     }
 }

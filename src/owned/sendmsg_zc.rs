@@ -286,13 +286,13 @@ impl<B, R, const N: usize> PendingSendmsgZc<B, R, N> {
     /// Whether `receipt` authenticates this exact request.
     #[must_use]
     pub const fn matches(&self, receipt: &Receipt) -> bool {
-        receipt.id().raw() == self.id.raw() && receipt.ring().raw() == self.ring.raw()
+        receipt.belongs_to(self.ring, self.id)
     }
 
     /// Whether `notice` authenticates this exact request.
     #[must_use]
     pub const fn matches_sent(&self, notice: &PartialReceipt) -> bool {
-        notice.id().raw() == self.id.raw() && notice.ring().raw() == self.ring.raw()
+        notice.belongs_to(self.ring, self.id)
     }
 
     /// Record the send CQE's byte count, keeping the storage in flight.

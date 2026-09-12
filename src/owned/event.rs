@@ -70,6 +70,13 @@ impl PartialReceipt {
     pub const fn buffer_id(&self) -> Option<u16> {
         self.flags.buffer_id()
     }
+
+    /// Whether this partial receipt authenticates the request identified
+    /// by `ring` and `id`. See [`Receipt::belongs_to`].
+    #[must_use]
+    pub const fn belongs_to(&self, ring: RingId, id: RequestId) -> bool {
+        self.id.raw() == id.raw() && self.ring.raw() == ring.raw()
+    }
 }
 
 /// What a reaped CQE authorizes.
@@ -138,5 +145,15 @@ impl Event {
     #[must_use]
     pub const fn is_terminal(&self) -> bool {
         matches!(self, Self::Complete(_))
+    }
+
+    /// Whether this event authenticates the request identified by `ring`
+    /// and `id`, whichever variant it is. See [`Receipt::belongs_to`].
+    #[must_use]
+    pub const fn belongs_to(&self, ring: RingId, id: RequestId) -> bool {
+        match self {
+            Self::Complete(receipt) => receipt.belongs_to(ring, id),
+            Self::Partial(partial) => partial.belongs_to(ring, id),
+        }
     }
 }
