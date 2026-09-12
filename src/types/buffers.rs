@@ -186,6 +186,47 @@ pub struct IoUringRsrcUpdate {
     pub data: u64,
 }
 
+/// Argument for `IORING_REGISTER_FILES2`/`IORING_REGISTER_BUFFERS2`
+/// (`struct io_uring_rsrc_register`).
+///
+/// `data` points to `nr` file descriptors or `iovec`s (matching the plain
+/// `RegisterFiles`/`RegisterBuffers` array layout); `tags` either is null
+/// (tagging disabled for every slot) or points to `nr` caller-chosen `u64`
+/// tags, one per slot. A zero tag disables tagging for that one slot even
+/// when the array as a whole is non-null. Once a tagged slot is replaced
+/// or its whole table is unregistered, and the kernel is done with
+/// whatever it named, a CQE is posted with `user_data` set to that slot's
+/// tag and every other field zeroed — the caller's own `complete()` loop
+/// picks it up like any other completion, distinguished only by the tag
+/// value it was given, not by any special opcode or flag.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct IoUringRsrcRegister {
+    pub nr: u32,
+    pub flags: u32,
+    pub resv2: u64,
+    pub data: u64,
+    pub tags: u64,
+}
+
+/// Argument for `IORING_REGISTER_FILES_UPDATE2`/`IORING_REGISTER_BUFFERS_UPDATE`
+/// (`struct io_uring_rsrc_update2`).
+///
+/// Like [`IoUringRsrcRegister`] but for updating `nr` slots starting at
+/// `offset` within an already-registered tagged table, rather than
+/// replacing the table wholesale. See [`IoUringRsrcRegister`] for the tag
+/// death-notification contract.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct IoUringRsrcUpdate2 {
+    pub offset: u32,
+    pub resv: u32,
+    pub data: u64,
+    pub tags: u64,
+    pub nr: u32,
+    pub resv2: u32,
+}
+
 /// Argument for `IORING_REGISTER_FILE_ALLOC_RANGE`
 /// (`struct io_uring_file_index_range`).
 #[derive(Debug, Clone, Copy, Default)]

@@ -99,6 +99,26 @@ pub enum RegisterOp {
     /// Start a ring created with `SetupFlags::R_DISABLED` actually accepting
     /// submissions.
     RegisterEnableRings = 12,
+    /// Register files with per-resource death tags (kernel 5.13+): like
+    /// `RegisterFiles`, but through `struct io_uring_rsrc_register` so
+    /// each descriptor can carry a caller-chosen tag posted back as a
+    /// CQE once that slot is replaced or the table is torn down and the
+    /// kernel is done with it.
+    RegisterFiles2 = 13,
+    /// Update a subset of a tagged file table (kernel 5.13+): like
+    /// `RegisterFilesUpdate`, but through `struct io_uring_rsrc_update2`
+    /// so the replaced slots' tags are posted once the kernel is done
+    /// with what they named.
+    RegisterFilesUpdate2 = 14,
+    /// Register buffers with per-resource death tags (kernel 5.13+): like
+    /// `RegisterBuffers`, but through `struct io_uring_rsrc_register` so
+    /// each buffer can carry a caller-chosen tag posted back as a CQE
+    /// once that slot is replaced or the table is torn down and the
+    /// kernel is done with it.
+    RegisterBuffers2 = 15,
+    /// Update a subset of a tagged buffer table (kernel 5.13+): like
+    /// `RegisterBuffers2` but targeting an offset within an
+    /// already-registered table rather than replacing it wholesale.
     RegisterBuffersUpdate = 16,
     /// Pin this ring's io-wq worker threads to a caller-supplied CPU mask.
     RegisterIowqAff = 17,

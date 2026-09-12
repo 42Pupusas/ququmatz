@@ -4,6 +4,7 @@
 //! - [`builder`] — fluent setup configuration
 //! - [`ops`] — `do_*` convenience methods (push + submit + complete)
 //! - [`register`] — `register_*` resource registration (non-pbuf)
+//! - [`rsrc_tags`] — tagged file/buffer registration (`Files2`/`FilesUpdate2`/`Buffers2`)
 //! - [`pbuf`] — provided-buffer ring
 
 use crate::error::{CompletionError, Errno, Error, InvalidArgKind, SetupError, SubmitError};
@@ -20,6 +21,7 @@ mod ops;
 mod pbuf;
 mod probe;
 mod register;
+mod rsrc_tags;
 
 pub use builder::IoUringBuilder;
 pub use pbuf::{BufferConsumer, ProvidedBufferRing};

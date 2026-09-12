@@ -116,7 +116,8 @@ mod waitid;
 
 pub use buffers::{
     IoCqringOffsets, IoSqringOffsets, IoUringBuf, IoUringBufReg, IoUringBufStatus,
-    IoUringFileIndexRange, IoUringFilesUpdate, IoUringRsrcUpdate, IoVec, PbufRingFlags, RawFd,
+    IoUringFileIndexRange, IoUringFilesUpdate, IoUringRsrcRegister, IoUringRsrcUpdate,
+    IoUringRsrcUpdate2, IoVec, PbufRingFlags, RawFd,
 };
 pub use cancel::{CancelFlags, CancelOutcome, SyncCancelReg};
 pub(crate) use cancel::RawSyncCancelReg;

@@ -1792,6 +1792,104 @@ fn registered_files() {
 
 #[cfg(not(miri))]
 #[test]
+fn a_real_tagged_file_table_posts_a_death_cqe_once_unregistered() {
+    let mut ring = IoUring::new(4).expect("setup");
+    let fd = open_tmpfile(&mut ring);
+
+    const DEATH_TAG: u64 = 0xdead_beef;
+    ring.register_files_tagged(&[fd], &[DEATH_TAG])
+        .expect("register_files_tagged");
+
+    ring.unregister_files().expect("unregister_files");
+
+    ring.push(Sqe::nop().user_data(1)).expect("push nop");
+    ring.submit_and_wait(2).expect("submit");
+
+    let mut saw_death_tag = false;
+    let mut saw_nop = false;
+    for _ in 0..2 {
+        let cqe = ring.complete().expect("cqe");
+        if cqe.user_data == DEATH_TAG {
+            saw_death_tag = true;
+            assert_eq!(cqe.result, 0);
+        } else if cqe.user_data == 1 {
+            saw_nop = true;
+        }
+    }
+    assert!(saw_death_tag, "expected a CQE carrying the file's death tag");
+    assert!(saw_nop, "expected the ordinary nop's own completion too");
+
+    let _ = syscall::close(RawFd::from_raw(fd as usize));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_tagged_file_update_posts_a_death_cqe_for_the_slot_it_replaces() {
+    let mut ring = IoUring::new(4).expect("setup");
+    let fd_a = open_tmpfile(&mut ring);
+    let fd_b = open_tmpfile(&mut ring);
+
+    const REPLACED_TAG: u64 = 0xfeed_face;
+    ring.register_files_tagged(&[fd_a], &[0])
+        .expect("register_files_tagged");
+
+    ring.update_registered_files_tagged(&[fd_b], &[REPLACED_TAG], 0)
+        .expect("update_registered_files_tagged");
+    ring.update_registered_files_tagged(&[-1], &[0], 0)
+        .expect("clear the slot to release fd_b");
+
+    ring.push(Sqe::nop().user_data(1)).expect("push nop");
+    ring.submit_and_wait(2).expect("submit");
+
+    let mut saw_death_tag = false;
+    for _ in 0..2 {
+        let cqe = ring.complete().expect("cqe");
+        if cqe.user_data == REPLACED_TAG {
+            saw_death_tag = true;
+        }
+    }
+    assert!(
+        saw_death_tag,
+        "expected a CQE carrying the replaced slot's death tag"
+    );
+
+    ring.unregister_files().expect("unregister_files");
+    let _ = syscall::close(RawFd::from_raw(fd_a as usize));
+    let _ = syscall::close(RawFd::from_raw(fd_b as usize));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_tagged_buffer_table_posts_a_death_cqe_once_unregistered() {
+    let mut ring = IoUring::new(4).expect("setup");
+    let mut buf = vec![0u8; 64];
+    let iov = [unsafe { IoVec::new(buf.as_mut_ptr(), buf.len()) }];
+
+    const DEATH_TAG: u64 = 0xc0ffee;
+    ring.register_buffers_tagged(&iov, &[DEATH_TAG])
+        .expect("register_buffers_tagged");
+
+    ring.unregister_buffers().expect("unregister_buffers");
+
+    ring.push(Sqe::nop().user_data(1)).expect("push nop");
+    ring.submit_and_wait(2).expect("submit");
+
+    let mut saw_death_tag = false;
+    for _ in 0..2 {
+        let cqe = ring.complete().expect("cqe");
+        if cqe.user_data == DEATH_TAG {
+            saw_death_tag = true;
+            assert_eq!(cqe.result, 0);
+        }
+    }
+    assert!(
+        saw_death_tag,
+        "expected a CQE carrying the buffer's death tag"
+    );
+}
+
+#[cfg(not(miri))]
+#[test]
 fn socket_with_typed_flags_creates_nonblocking_fd() {
     use crate::Socket;
     use crate::types::{AddressFamily, SocketFlags, SocketType};
@@ -2835,6 +2933,31 @@ fn io_uring_files_update_layout() {
     assert_eq!(mem::offset_of!(IoUringFilesUpdate, offset), 0);
     assert_eq!(mem::offset_of!(IoUringFilesUpdate, resv), 4);
     assert_eq!(mem::offset_of!(IoUringFilesUpdate, fds), 8);
+}
+
+#[test]
+fn io_uring_rsrc_register_layout_matches_the_kernel_struct() {
+    use crate::types::IoUringRsrcRegister;
+    assert_eq!(mem::size_of::<IoUringRsrcRegister>(), 32);
+    assert_eq!(mem::align_of::<IoUringRsrcRegister>(), 8);
+    assert_eq!(mem::offset_of!(IoUringRsrcRegister, nr), 0);
+    assert_eq!(mem::offset_of!(IoUringRsrcRegister, flags), 4);
+    assert_eq!(mem::offset_of!(IoUringRsrcRegister, resv2), 8);
+    assert_eq!(mem::offset_of!(IoUringRsrcRegister, data), 16);
+    assert_eq!(mem::offset_of!(IoUringRsrcRegister, tags), 24);
+}
+
+#[test]
+fn io_uring_rsrc_update2_layout_matches_the_kernel_struct() {
+    use crate::types::IoUringRsrcUpdate2;
+    assert_eq!(mem::size_of::<IoUringRsrcUpdate2>(), 32);
+    assert_eq!(mem::align_of::<IoUringRsrcUpdate2>(), 8);
+    assert_eq!(mem::offset_of!(IoUringRsrcUpdate2, offset), 0);
+    assert_eq!(mem::offset_of!(IoUringRsrcUpdate2, resv), 4);
+    assert_eq!(mem::offset_of!(IoUringRsrcUpdate2, data), 8);
+    assert_eq!(mem::offset_of!(IoUringRsrcUpdate2, tags), 16);
+    assert_eq!(mem::offset_of!(IoUringRsrcUpdate2, nr), 24);
+    assert_eq!(mem::offset_of!(IoUringRsrcUpdate2, resv2), 28);
 }
 
 // ---------------------------------------------------------------
