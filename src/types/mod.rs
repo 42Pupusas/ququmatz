@@ -124,9 +124,9 @@ pub use eventfd::EventFdFlags;
 #[cfg(test)]
 pub(crate) use fs::AT_FDCWD;
 pub use fs::{
-    DirFd, FadviseAdvice, FallocateMode, FileMode, FsyncFlags, InstallFdFlags, MadviseAdvice,
-    OpenFlags, OpenHow, RenameFlags, ResolveFlags, Statx, StatxFlags, StatxMask, StatxTimestamp,
-    SyncFileRangeFlags, UnlinkFlags, resolve,
+    DirFd, FadviseAdvice, FallocateMode, FileMode, FsyncFlags, InstallFdFlags, LinkFlags,
+    MadviseAdvice, OpenFlags, OpenHow, RenameFlags, ResolveFlags, Statx, StatxFlags, StatxMask,
+    StatxTimestamp, SyncFileRangeFlags, UnlinkFlags, XattrFlags, resolve,
 };
 pub use futex::{FUTEX_WAITV_MAX, Futex2Flags, FutexWaitv};
 pub use inotify::{InotifyEvent, InotifyInitFlags, WatchMask};

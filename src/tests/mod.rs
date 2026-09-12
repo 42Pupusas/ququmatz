@@ -1022,6 +1022,252 @@ fn sqe_builder_fixed_fd_install_sets_fixed_file_and_places_fields_correctly() {
     assert_eq!(inner.op_flags, InstallFdFlags::NO_CLOEXEC.bits());
 }
 
+#[test]
+fn sqe_builder_ftruncate_places_fields_correctly() {
+    let sqe = Sqe::ftruncate(RawFd::from_raw(9), 4096);
+    let inner = sqe.0;
+    assert_eq!(Opcode::Ftruncate, inner.opcode);
+    assert_eq!(inner.fd, 9);
+    assert_eq!(inner.off, 4096);
+    assert_eq!(inner.addr, 0);
+    assert_eq!(inner.len, 0);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_ftruncate_grows_and_shrinks_a_files_reported_size() {
+    let mut ring = IoUring::new(4).expect("setup");
+    let fd = open_tmpfile(&mut ring);
+    let fd = RawFd::from_raw(fd as usize);
+
+    ring.push(unsafe { Sqe::write(fd, b"hello", 0) }.user_data(1))
+        .expect("push write");
+    ring.submit_and_wait(1).expect("submit write");
+    ring.complete().expect("write cqe");
+
+    ring.push(Sqe::ftruncate(fd, 10).user_data(2))
+        .expect("push grow");
+    ring.submit_and_wait(1).expect("submit grow");
+    let cqe = ring.complete().expect("grow cqe");
+    assert_eq!(cqe.result, 0, "ftruncate grow failed");
+
+    let mut stat = Statx::default();
+    ring.push(
+        unsafe {
+            Sqe::statx(
+                crate::types::DirFd::Fd(fd),
+                c"",
+                StatxFlags::EMPTY_PATH,
+                StatxMask::SIZE,
+                &mut stat,
+            )
+        }
+        .user_data(3),
+    )
+    .expect("push statx");
+    ring.submit_and_wait(1).expect("submit statx");
+    ring.complete().expect("statx cqe");
+    assert_eq!(stat.size(), Some(10), "grow must extend the reported size");
+
+    ring.push(Sqe::ftruncate(fd, 2).user_data(4))
+        .expect("push shrink");
+    ring.submit_and_wait(1).expect("submit shrink");
+    let cqe = ring.complete().expect("shrink cqe");
+    assert_eq!(cqe.result, 0, "ftruncate shrink failed");
+
+    let mut stat2 = Statx::default();
+    ring.push(
+        unsafe {
+            Sqe::statx(
+                crate::types::DirFd::Fd(fd),
+                c"",
+                StatxFlags::EMPTY_PATH,
+                StatxMask::SIZE,
+                &mut stat2,
+            )
+        }
+        .user_data(5),
+    )
+    .expect("push statx");
+    ring.submit_and_wait(1).expect("submit statx");
+    ring.complete().expect("statx cqe");
+    assert_eq!(stat2.size(), Some(2), "shrink must discard the tail");
+
+    let _ = syscall::close(fd);
+}
+
+#[test]
+fn sqe_builder_symlinkat_places_fields_correctly() {
+    let sqe = unsafe { Sqe::symlinkat(c"target", crate::types::DirFd::Cwd, c"link") };
+    let inner = sqe.0;
+    assert_eq!(Opcode::Symlinkat, inner.opcode);
+    assert_eq!(inner.fd, crate::types::AT_FDCWD);
+    assert_eq!(inner.addr, c"target".as_ptr() as u64);
+    assert_eq!(inner.off, c"link".as_ptr() as u64);
+}
+
+#[test]
+fn sqe_builder_linkat_places_the_new_directory_in_len() {
+    use crate::types::LinkFlags;
+
+    let sqe = unsafe {
+        Sqe::linkat(
+            crate::types::DirFd::Cwd,
+            c"old",
+            crate::types::DirFd::Fd(RawFd::from_raw(7)),
+            c"new",
+            LinkFlags::SYMLINK_FOLLOW,
+        )
+    };
+    let inner = sqe.0;
+    assert_eq!(Opcode::Linkat, inner.opcode);
+    assert_eq!(inner.fd, crate::types::AT_FDCWD);
+    assert_eq!(inner.len, 7);
+    assert_eq!(inner.addr, c"old".as_ptr() as u64);
+    assert_eq!(inner.off, c"new".as_ptr() as u64);
+    assert_eq!(inner.op_flags, LinkFlags::SYMLINK_FOLLOW.bits());
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_symlinkat_creates_a_link_pointing_at_the_literal_text() {
+    let mut ring = IoUring::new(4).expect("setup");
+    let path = std::format!("/tmp/ququmatz_symlinkat_{}", std::process::id());
+    let cpath = std::ffi::CString::new(path.clone()).expect("cstring");
+    let _ = std::fs::remove_file(&path);
+
+    ring.push(
+        unsafe { Sqe::symlinkat(c"/does/not/exist", crate::types::DirFd::Cwd, &cpath) }
+            .user_data(1),
+    )
+    .expect("push symlinkat");
+    ring.submit_and_wait(1).expect("submit");
+    let cqe = ring.complete().expect("symlinkat cqe");
+    assert_eq!(cqe.result, 0, "symlinkat failed: {}", cqe.result);
+
+    let target = std::fs::read_link(&path).expect("read_link");
+    assert_eq!(target.to_str().unwrap(), "/does/not/exist");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_linkat_shares_the_source_inode() {
+    let mut ring = IoUring::new(4).expect("setup");
+    let source = std::format!("/tmp/ququmatz_linkat_src_{}", std::process::id());
+    let dest = std::format!("/tmp/ququmatz_linkat_dst_{}", std::process::id());
+    std::fs::write(&source, b"shared").expect("seed");
+    let _ = std::fs::remove_file(&dest);
+    let csource = std::ffi::CString::new(source.clone()).expect("cstring");
+    let cdest = std::ffi::CString::new(dest.clone()).expect("cstring");
+
+    ring.push(
+        unsafe {
+            Sqe::linkat(
+                crate::types::DirFd::Cwd,
+                &csource,
+                crate::types::DirFd::Cwd,
+                &cdest,
+                crate::types::LinkFlags::default(),
+            )
+        }
+        .user_data(1),
+    )
+    .expect("push linkat");
+    ring.submit_and_wait(1).expect("submit");
+    let cqe = ring.complete().expect("linkat cqe");
+    assert_eq!(cqe.result, 0, "linkat failed: {}", cqe.result);
+
+    use std::os::unix::fs::MetadataExt;
+    let a = std::fs::metadata(&source).expect("metadata");
+    let b = std::fs::metadata(&dest).expect("metadata");
+    assert_eq!(a.ino(), b.ino());
+
+    let _ = std::fs::remove_file(&source);
+    let _ = std::fs::remove_file(&dest);
+}
+
+#[test]
+fn sqe_builder_setxattr_places_the_path_in_addr3() {
+    use crate::types::XattrFlags;
+
+    let value = b"payload";
+    let sqe = unsafe { Sqe::setxattr(c"user.test", c"/tmp/x", value, XattrFlags::CREATE) };
+    let inner = sqe.0;
+    assert_eq!(Opcode::Setxattr, inner.opcode);
+    assert_eq!(inner.addr, c"user.test".as_ptr() as u64);
+    assert_eq!(inner.off, value.as_ptr() as u64);
+    assert_eq!(inner.len, value.len() as u32);
+    assert_eq!(inner.op_flags, XattrFlags::CREATE.bits());
+    assert_eq!(inner.addr3, c"/tmp/x".as_ptr() as u64);
+}
+
+#[test]
+fn sqe_builder_getxattr_places_the_path_in_addr3() {
+    let mut dest = [0u8; 16];
+    let sqe = unsafe { Sqe::getxattr(c"user.test", c"/tmp/x", &mut dest) };
+    let inner = sqe.0;
+    assert_eq!(Opcode::Getxattr, inner.opcode);
+    assert_eq!(inner.addr, c"user.test".as_ptr() as u64);
+    assert_eq!(inner.off, dest.as_ptr() as u64);
+    assert_eq!(inner.len, dest.len() as u32);
+    assert_eq!(inner.addr3, c"/tmp/x".as_ptr() as u64);
+}
+
+#[test]
+fn sqe_builder_fsetxattr_and_fgetxattr_place_fields_correctly() {
+    use crate::types::XattrFlags;
+
+    let value = b"v";
+    let set = unsafe { Sqe::fsetxattr(RawFd::from_raw(3), c"user.a", value, XattrFlags::REPLACE) };
+    let inner = set.0;
+    assert_eq!(Opcode::Fsetxattr, inner.opcode);
+    assert_eq!(inner.fd, 3);
+    assert_eq!(inner.addr, c"user.a".as_ptr() as u64);
+    assert_eq!(inner.off, value.as_ptr() as u64);
+    assert_eq!(inner.op_flags, XattrFlags::REPLACE.bits());
+
+    let mut dest = [0u8; 8];
+    let get = unsafe { Sqe::fgetxattr(RawFd::from_raw(3), c"user.a", &mut dest) };
+    let inner = get.0;
+    assert_eq!(Opcode::Fgetxattr, inner.opcode);
+    assert_eq!(inner.fd, 3);
+    assert_eq!(inner.addr, c"user.a".as_ptr() as u64);
+    assert_eq!(inner.off, dest.as_ptr() as u64);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_setxattr_getxattr_roundtrip_on_a_regular_file() {
+    let mut ring = IoUring::new(4).expect("setup");
+    let path = std::format!("/tmp/ququmatz_xattr_{}", std::process::id());
+    std::fs::write(&path, b"body").expect("seed");
+    let cpath = std::ffi::CString::new(path.clone()).expect("cstring");
+    let name = c"user.ququmatz_test";
+
+    let value = b"attribute-value";
+    ring.push(
+        unsafe { Sqe::setxattr(name, &cpath, value, crate::types::XattrFlags::default()) }
+            .user_data(1),
+    )
+    .expect("push setxattr");
+    ring.submit_and_wait(1).expect("submit");
+    let cqe = ring.complete().expect("setxattr cqe");
+    assert_eq!(cqe.result, 0, "setxattr failed: {}", cqe.result);
+
+    let mut dest = [0u8; 64];
+    ring.push(unsafe { Sqe::getxattr(name, &cpath, &mut dest) }.user_data(2))
+        .expect("push getxattr");
+    ring.submit_and_wait(1).expect("submit");
+    let cqe = ring.complete().expect("getxattr cqe");
+    assert!(cqe.result >= 0, "getxattr failed: {}", cqe.result);
+    #[allow(clippy::cast_sign_loss)]
+    let n = cqe.result as usize;
+    assert_eq!(&dest[..n], value);
+
+    let _ = std::fs::remove_file(&path);
+}
+
 #[cfg(not(miri))]
 #[test]
 fn statx_on_tmp() {

@@ -15,6 +15,7 @@ use super::fixedfdinstall::{PendingFixedFdInstall, PreparedFixedFdInstall};
 use super::futex::{PendingFutexWait, PendingFutexWake, PreparedFutexWait, PreparedFutexWake};
 use super::futexwaitv::{PendingFutexWaitv, PreparedFutexWaitv};
 use super::identity::{RequestIdSource, RingId};
+use super::link::{PendingLink, PreparedLink};
 use super::msgring::{PendingMsgRing, PreparedMsgRing};
 use super::multishot::{MultishotRecv, PreparedMultishot};
 use super::open::{PendingOpen, PreparedOpen};
@@ -584,6 +585,27 @@ impl OwnedSubmitter {
         }
     }
 
+    /// Queue a `symlinkat`/`linkat`, taking ownership of both path
+    /// storages.
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact,
+    /// still owning both path storages.
+    pub fn push_link<F: StableBuffer, T: StableBuffer>(
+        &mut self,
+        request: PreparedLink<F, T>,
+    ) -> Result<PendingLink<F, T>, (PreparedLink<F, T>, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            // The SQE never became kernel-visible, so the kernel never saw
+            // either path pointer and reclaiming both storages is sound.
+            Err(e) => Err((Self::reclaim_link(pending), e)),
+        }
+    }
+
     /// Queue a `statx`, taking ownership of its path and destination.
     ///
     /// The kernel writes a fixed-size struct into the destination after
@@ -856,6 +878,16 @@ impl OwnedSubmitter {
     fn reclaim_rename<F: StableBuffer, T: StableBuffer>(
         pending: PendingRename<F, T>,
     ) -> PreparedRename<F, T> {
+        // SAFETY: only reached when `Submitter::push` reported the queue was
+        // full, which happens before the SQE is written or the tail is
+        // advanced. No kernel-visible pointer to either path exists.
+        unsafe { pending.reclaim_unsubmitted() }
+    }
+
+    /// Undo a link/symlink push that the kernel never observed.
+    fn reclaim_link<F: StableBuffer, T: StableBuffer>(
+        pending: PendingLink<F, T>,
+    ) -> PreparedLink<F, T> {
         // SAFETY: only reached when `Submitter::push` reported the queue was
         // full, which happens before the SQE is written or the tail is
         // advanced. No kernel-visible pointer to either path exists.

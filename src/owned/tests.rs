@@ -9,7 +9,7 @@ use super::{
     MsgRegionError, Openat2Error, Openat2Mode, OwnedPath, PathError, PeerWanted, Pending,
     PendingStatx, PendingZc, Prepared, PreparedAccept, PreparedBind, PreparedCancel,
     PreparedConnect, PreparedDirectAccept, PreparedDirectOpen, PreparedDirectSocket,
-    PreparedEpollCtl, PreparedFilesUpdate, PreparedFixedFdInstall, PreparedMsgRing,
+    PreparedEpollCtl, PreparedFilesUpdate, PreparedFixedFdInstall, PreparedLink, PreparedMsgRing,
     PreparedMultishot, PreparedOpen, PreparedOpenat2, PreparedPathOp, PreparedRecvmsg,
     PreparedRename, PreparedSendmsg, PreparedSendmsgZc, PreparedStatx, PreparedTimeout,
     PreparedVectored, PreparedWaitId, PreparedZc, Receipt, RenameMode, RingId, SendTarget,
@@ -24,8 +24,8 @@ use crate::error::{Error, SubmitError};
 use crate::net::Socket;
 use crate::types::{
     AcceptFlags, AddressFamily, DirFd, EpollEvent, EpollEvents, FileMode, IdType, InstallFdFlags,
-    MsgFlags, OpenFlags, RawFd, ResolveFlags, SockAddrIn, SocketFlags, SocketType, Statx,
-    StatxFlags, StatxMask, Timespec, WaitOptions, WaitidSiginfo,
+    LinkFlags, MsgFlags, OpenFlags, RawFd, ResolveFlags, SockAddrIn, SocketFlags, SocketType,
+    Statx, StatxFlags, StatxMask, Timespec, WaitOptions, WaitidSiginfo,
 };
 
 /// Static proof that a ticket crosses a thread boundary. The whole design
@@ -6994,4 +6994,113 @@ fn a_real_futex_waitv_reports_the_index_that_woke_it() {
 
     drop(word_a);
     drop(word_b);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_symlink_via_the_owned_path_creates_a_link_and_returns_both_paths() {
+    let scratch = Scratch::new("owned_symlinkat");
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let old = path_of(b"/does/not/exist");
+    let new = scratch.owned_path("link");
+    let (old_addr, new_addr) = (old.as_bytes().as_ptr(), new.as_bytes().as_ptr());
+    let ticket = sub
+        .push_link(PreparedLink::symlink_cwd(old, new))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+
+    assert!(done.is_ok(), "symlinkat failed: {}", done.raw_result());
+    let target = std::fs::read_link(scratch.path("link")).expect("read_link");
+    assert_eq!(target.to_str().unwrap(), "/does/not/exist");
+
+    // Both storages come back at the addresses they went in at.
+    let (old, new) = done.into_paths();
+    assert_eq!(old.as_bytes().as_ptr(), old_addr);
+    assert_eq!(new.as_bytes().as_ptr(), new_addr);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_hardlink_via_the_owned_path_shares_the_source_inode() {
+    let scratch = Scratch::new("owned_linkat");
+    scratch.write("real_file", b"shared");
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let ticket = sub
+        .push_link(PreparedLink::link_cwd(
+            scratch.owned_path("real_file"),
+            scratch.owned_path("hardlink"),
+            LinkFlags::default(),
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit");
+    let receipt = comp.wait_one().expect("completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+
+    assert!(done.is_ok(), "linkat failed: {}", done.raw_result());
+    use std::os::unix::fs::MetadataExt;
+    let a = std::fs::metadata(scratch.path("real_file")).expect("metadata");
+    let b = std::fs::metadata(scratch.path("hardlink")).expect("metadata");
+    assert_eq!(a.ino(), b.ino(), "hard link must share the source inode");
+    assert_eq!(a.nlink(), 2);
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_link_push_that_does_not_fit_hands_both_paths_back() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let mut tickets = alloc_tickets(&mut sub);
+
+    let old = path_of(b"/tmp/never_submitted_old");
+    let new = path_of(b"/tmp/never_submitted_new");
+    let (old_addr, new_addr) = (old.as_bytes().as_ptr(), new.as_bytes().as_ptr());
+    let Err((returned, e)) = sub.push_link(PreparedLink::symlink_cwd(old, new)) else {
+        panic!("a full queue must reject the push");
+    };
+    assert_eq!(e, Error::Submit(SubmitError::QueueFull));
+    let (old, new) = returned.into_paths();
+    assert_eq!(old.as_bytes().as_ptr(), old_addr);
+    assert_eq!(new.as_bytes().as_ptr(), new_addr);
+    tickets.clear();
+}
+
+#[test]
+fn a_link_receipt_for_another_request_is_rejected() {
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let first = sub
+        .push_link(PreparedLink::symlink_cwd(
+            path_of(b"/tmp/a_old"),
+            path_of(b"/tmp/a_new"),
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let second = sub
+        .push_link(PreparedLink::symlink_cwd(
+            path_of(b"/tmp/b_old"),
+            path_of(b"/tmp/b_new"),
+        ))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let foreign = Receipt {
+        ring: second.ring(),
+        id: second.id(),
+        result: 0,
+        flags: crate::types::CqeFlags::default(),
+    };
+    assert!(!first.matches(&foreign));
+    let Err((first, _)) = first.redeem(foreign) else {
+        panic!("a foreign receipt must not redeem");
+    };
+    drop((first, second));
 }

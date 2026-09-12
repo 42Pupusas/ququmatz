@@ -4,9 +4,9 @@
 
 use super::{Sqe, ZEROED};
 use crate::types::{
-    DirFd, FadviseAdvice, FallocateMode, FileMode, FsyncFlags, InstallFdFlags, IoVec,
+    DirFd, FadviseAdvice, FallocateMode, FileMode, FsyncFlags, InstallFdFlags, IoVec, LinkFlags,
     MadviseAdvice, Opcode, OpenFlags, OpenHow, RawFd, RenameFlags, SpliceFlags, SqeFlags, Statx,
-    StatxFlags, StatxMask, SyncFileRangeFlags, UnlinkFlags,
+    StatxFlags, StatxMask, SyncFileRangeFlags, UnlinkFlags, XattrFlags,
 };
 
 impl Sqe {
@@ -550,6 +550,332 @@ impl Sqe {
         Self(sqe)
     }
 
+    /// Prepare a `symlinkat` operation.
+    ///
+    /// Creates a symbolic link at `new_path` (relative to `new_dfd`)
+    /// containing the literal text `old_path` -- unlike `renameat` and
+    /// `linkat`, `old_path` is never resolved against any directory, since
+    /// a symlink's target is just a string the kernel stores verbatim.
+    ///
+    /// # Field mapping
+    ///
+    /// The kernel reads the destination directory from `sqe.fd` (not
+    /// `sqe.len`, unlike `renameat`/`linkat`) because a symlink has only
+    /// one directory argument.
+    ///
+    /// # Safety
+    ///
+    /// `old_path` and `new_path` are borrowed only for this call -- the
+    /// returned `Sqe` stores raw pointers derived from them, not the
+    /// borrows themselves. The caller must ensure both remain valid until
+    /// the kernel posts the completion for this operation.
+    #[must_use]
+    pub unsafe fn symlinkat(
+        old_path: &core::ffi::CStr,
+        new_dfd: DirFd,
+        new_path: &core::ffi::CStr,
+    ) -> Self {
+        unsafe {
+            Self::symlinkat_ptr(
+                old_path.as_ptr().cast(),
+                new_dfd.as_raw(),
+                new_path.as_ptr().cast(),
+            )
+        }
+    }
+
+    /// Prepare a `symlinkat` operation from raw pointers.
+    ///
+    /// # Safety
+    ///
+    /// `old_path` and `new_path` must be valid, null-terminated C strings
+    /// that remain valid until the operation completes.
+    #[must_use]
+    pub unsafe fn symlinkat_ptr(old_path: *const u8, new_dfd: i32, new_path: *const u8) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Symlinkat.into();
+        sqe.fd = new_dfd;
+        sqe.addr = old_path as u64;
+        sqe.off = new_path as u64;
+        Self(sqe)
+    }
+
+    /// Prepare a `linkat` operation (hard link).
+    ///
+    /// # Field mapping
+    ///
+    /// Same fd/length layout as `renameat`: the destination directory
+    /// travels in `sqe.len`, reinterpreted by the kernel as `i32`, because
+    /// the SQE has only one `fd` field for two directories.
+    ///
+    /// `flags` accepts [`LinkFlags::SYMLINK_FOLLOW`] to dereference
+    /// `old_path` if it names a symlink -- `linkat`'s default, unlike every
+    /// other `*at` call, is to *not* follow -- and
+    /// [`LinkFlags::EMPTY_PATH`] to hard-link `old_dfd` itself via an
+    /// empty `old_path`.
+    ///
+    /// # Safety
+    ///
+    /// `old_path` and `new_path` are borrowed only for this call -- the
+    /// returned `Sqe` stores raw pointers derived from them, not the
+    /// borrows themselves. The caller must ensure both remain valid until
+    /// the kernel posts the completion for this operation.
+    #[must_use]
+    pub unsafe fn linkat(
+        old_dfd: DirFd,
+        old_path: &core::ffi::CStr,
+        new_dfd: DirFd,
+        new_path: &core::ffi::CStr,
+        flags: LinkFlags,
+    ) -> Self {
+        unsafe {
+            Self::linkat_ptr(
+                old_dfd.as_raw(),
+                old_path.as_ptr().cast(),
+                new_dfd.as_raw(),
+                new_path.as_ptr().cast(),
+                flags,
+            )
+        }
+    }
+
+    /// Prepare a `linkat` operation from raw pointers.
+    ///
+    /// # Safety
+    ///
+    /// `old_path` and `new_path` must be valid, null-terminated C strings
+    /// that remain valid until the operation completes.
+    #[must_use]
+    pub unsafe fn linkat_ptr(
+        old_dfd: i32,
+        old_path: *const u8,
+        new_dfd: i32,
+        new_path: *const u8,
+        flags: LinkFlags,
+    ) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Linkat.into();
+        sqe.fd = old_dfd;
+        sqe.addr = old_path as u64;
+        // Kernel reads sqe.len as the new directory fd (reinterpreted as i32).
+        sqe.len = new_dfd as u32;
+        sqe.off = new_path as u64;
+        sqe.op_flags = flags.bits();
+        Self(sqe)
+    }
+
+    /// Prepare a `getxattr` operation: read a named extended attribute of
+    /// the file at `path` into `value`.
+    ///
+    /// # Field mapping
+    ///
+    /// Unlike every other path-bearing op in this crate, the path lives in
+    /// `addr3` here, not `addr`: `addr`/`addr2` (`off`) are already taken
+    /// by the attribute name and the value destination, since `getxattr`
+    /// has three buffers (name, value, path) and only two ordinary pointer
+    /// fields.
+    ///
+    /// # Safety
+    ///
+    /// `name`, `path`, and `value` are borrowed only for this call -- the
+    /// returned `Sqe` stores raw pointers derived from them, not the
+    /// borrows themselves. `name` and `path` must remain valid,
+    /// null-terminated C strings and `value` must remain valid and
+    /// writable for `value.len()` bytes until the kernel posts the
+    /// completion for this operation.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub unsafe fn getxattr(
+        name: &core::ffi::CStr,
+        path: &core::ffi::CStr,
+        value: &mut [u8],
+    ) -> Self {
+        debug_assert!(value.len() <= u32::MAX as usize);
+        unsafe {
+            Self::getxattr_ptr(
+                name.as_ptr().cast(),
+                path.as_ptr().cast(),
+                value.as_mut_ptr(),
+                value.len() as u32,
+            )
+        }
+    }
+
+    /// Prepare a `getxattr` operation from raw pointers.
+    ///
+    /// # Safety
+    ///
+    /// `name` and `path` must be valid, null-terminated C strings; `value`
+    /// must point to at least `len` bytes of valid, writable memory. All
+    /// three must remain valid until the operation completes.
+    #[must_use]
+    pub unsafe fn getxattr_ptr(
+        name: *const u8,
+        path: *const u8,
+        value: *mut u8,
+        len: u32,
+    ) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Getxattr.into();
+        sqe.addr = name as u64;
+        sqe.off = value as u64;
+        sqe.len = len;
+        sqe.addr3 = path as u64;
+        Self(sqe)
+    }
+
+    /// Prepare an `fgetxattr` operation: read a named extended attribute of
+    /// an already-open file into `value`.
+    ///
+    /// # Safety
+    ///
+    /// `name` and `value` are borrowed only for this call -- the returned
+    /// `Sqe` stores raw pointers derived from them, not the borrows
+    /// themselves. `name` must remain a valid, null-terminated C string
+    /// and `value` must remain valid and writable for `value.len()` bytes
+    /// until the kernel posts the completion for this operation.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub unsafe fn fgetxattr(fd: RawFd, name: &core::ffi::CStr, value: &mut [u8]) -> Self {
+        debug_assert!(value.len() <= u32::MAX as usize);
+        unsafe {
+            Self::fgetxattr_ptr(fd, name.as_ptr().cast(), value.as_mut_ptr(), value.len() as u32)
+        }
+    }
+
+    /// Prepare an `fgetxattr` operation from raw pointers.
+    ///
+    /// # Safety
+    ///
+    /// `name` must be a valid, null-terminated C string; `value` must
+    /// point to at least `len` bytes of valid, writable memory. Both must
+    /// remain valid until the operation completes.
+    #[must_use]
+    pub unsafe fn fgetxattr_ptr(fd: RawFd, name: *const u8, value: *mut u8, len: u32) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Fgetxattr.into();
+        sqe.fd = fd.as_i32();
+        sqe.addr = name as u64;
+        sqe.off = value as u64;
+        sqe.len = len;
+        Self(sqe)
+    }
+
+    /// Prepare a `setxattr` operation: write a named extended attribute of
+    /// the file at `path`.
+    ///
+    /// # Field mapping
+    ///
+    /// Same layout as [`getxattr`](Self::getxattr): the path lives in
+    /// `addr3`, since `addr`/`addr2` already carry the name and value.
+    ///
+    /// # Safety
+    ///
+    /// `name`, `path`, and `value` are borrowed only for this call -- the
+    /// returned `Sqe` stores raw pointers derived from them, not the
+    /// borrows themselves. All three must remain valid -- `name`/`path`
+    /// null-terminated, `value` readable for `value.len()` bytes -- until
+    /// the kernel posts the completion for this operation.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub unsafe fn setxattr(
+        name: &core::ffi::CStr,
+        path: &core::ffi::CStr,
+        value: &[u8],
+        flags: XattrFlags,
+    ) -> Self {
+        debug_assert!(value.len() <= u32::MAX as usize);
+        unsafe {
+            Self::setxattr_ptr(
+                name.as_ptr().cast(),
+                path.as_ptr().cast(),
+                value.as_ptr(),
+                value.len() as u32,
+                flags,
+            )
+        }
+    }
+
+    /// Prepare a `setxattr` operation from raw pointers.
+    ///
+    /// # Safety
+    ///
+    /// `name` and `path` must be valid, null-terminated C strings; `value`
+    /// must point to at least `len` bytes of valid, readable memory. All
+    /// three must remain valid until the operation completes.
+    #[must_use]
+    pub unsafe fn setxattr_ptr(
+        name: *const u8,
+        path: *const u8,
+        value: *const u8,
+        len: u32,
+        flags: XattrFlags,
+    ) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Setxattr.into();
+        sqe.addr = name as u64;
+        sqe.off = value as u64;
+        sqe.len = len;
+        sqe.op_flags = flags.bits();
+        sqe.addr3 = path as u64;
+        Self(sqe)
+    }
+
+    /// Prepare an `fsetxattr` operation: write a named extended attribute
+    /// of an already-open file.
+    ///
+    /// # Safety
+    ///
+    /// `name` and `value` are borrowed only for this call -- the returned
+    /// `Sqe` stores raw pointers derived from them, not the borrows
+    /// themselves. `name` must remain a valid, null-terminated C string
+    /// and `value` must remain valid and readable for `value.len()` bytes
+    /// until the kernel posts the completion for this operation.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub unsafe fn fsetxattr(
+        fd: RawFd,
+        name: &core::ffi::CStr,
+        value: &[u8],
+        flags: XattrFlags,
+    ) -> Self {
+        debug_assert!(value.len() <= u32::MAX as usize);
+        unsafe {
+            Self::fsetxattr_ptr(
+                fd,
+                name.as_ptr().cast(),
+                value.as_ptr(),
+                value.len() as u32,
+                flags,
+            )
+        }
+    }
+
+    /// Prepare an `fsetxattr` operation from raw pointers.
+    ///
+    /// # Safety
+    ///
+    /// `name` must be a valid, null-terminated C string; `value` must
+    /// point to at least `len` bytes of valid, readable memory. Both must
+    /// remain valid until the operation completes.
+    #[must_use]
+    pub unsafe fn fsetxattr_ptr(
+        fd: RawFd,
+        name: *const u8,
+        value: *const u8,
+        len: u32,
+        flags: XattrFlags,
+    ) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Fsetxattr.into();
+        sqe.fd = fd.as_i32();
+        sqe.addr = name as u64;
+        sqe.off = value as u64;
+        sqe.len = len;
+        sqe.op_flags = flags.bits();
+        Self(sqe)
+    }
+
     /// Prepare a fadvise operation.
     ///
     /// Advises the kernel about the expected access pattern for the given
@@ -619,6 +945,23 @@ impl Sqe {
         sqe.splice_fd_in = fd_in.as_i32();
         sqe.len = len;
         sqe.op_flags = flags.bits();
+        Self(sqe)
+    }
+
+    /// Prepare an `ftruncate` operation (Linux 6.9+, opcode 55).
+    ///
+    /// Sets `fd`'s size to `len`, extending with zero bytes or discarding
+    /// the tail exactly like the `ftruncate(2)` syscall. Every field but
+    /// `fd` and the length is forced to zero -- the kernel rejects a
+    /// nonzero `addr`, `len` (the u32 one), `buf_index`, `splice_fd_in`, or
+    /// `addr3` with `EINVAL`, since this op carries only the one 64-bit
+    /// value, placed in `off` because the u32 `len` field cannot hold it.
+    #[must_use]
+    pub fn ftruncate(fd: RawFd, len: u64) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Ftruncate.into();
+        sqe.fd = fd.as_i32();
+        sqe.off = len;
         Self(sqe)
     }
 

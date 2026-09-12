@@ -337,6 +337,33 @@ bitflags! {
     const REMOVEDIR = 0x200;
 }
 
+bitflags! {
+    /// Flags for `linkat` (`IORING_OP_LINKAT`'s `hardlink_flags`).
+    pub struct LinkFlags(u32);
+    /// Dereference `old_path` if it is a symbolic link, hard-linking its
+    /// target instead of the link itself -- `linkat`'s default is the
+    /// opposite of every other `*at` call, refusing to follow.
+    const SYMLINK_FOLLOW = 0x400;
+    /// Treat an empty `old_path` as naming `old_dfd` itself, hard-linking
+    /// the descriptor's own file. Requires `CAP_DAC_READ_SEARCH`.
+    const EMPTY_PATH = 0x1000;
+}
+
+bitflags! {
+    /// Flags for `setxattr` / `fsetxattr` (the SQE's `xattr_flags`).
+    ///
+    /// The two are mutually exclusive preconditions on the destination
+    /// attribute's existence, not combinable options -- the kernel rejects
+    /// both bits set together with `EINVAL`. `default()` (`0`) means
+    /// "create if absent, replace if present", the same as a plain
+    /// `setxattr(2)` call with no flags.
+    pub struct XattrFlags(u32);
+    /// Fail with `EEXIST` if the attribute already exists.
+    const CREATE = 1;
+    /// Fail with `ENODATA` if the attribute does not already exist.
+    const REPLACE = 2;
+}
+
 /// Arguments for `IORING_OP_OPENAT2` (mirrors kernel `struct open_how`).
 ///
 /// Pass to [`Sqe::openat2`](crate::op::Sqe::openat2) / [`Sqe::openat2_ptr`](crate::op::Sqe::openat2_ptr).

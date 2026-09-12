@@ -362,6 +362,7 @@ mod fixedfdinstall;
 mod futex;
 mod futexwaitv;
 mod identity;
+mod link;
 mod msgregion;
 mod msgring;
 mod multishot;
@@ -418,6 +419,7 @@ pub use futexwaitv::{
     FutexWaitvDone, FutexWaitvError, PendingFutexWaitv, PreparedFutexWaitv,
 };
 pub use identity::{RequestId, RingId};
+pub use link::{LinkCompleted, LinkKind, PendingLink, PreparedLink};
 pub use msgregion::{MAX_IOV, MsgRegionError};
 pub use msgring::{MsgRingDone, PendingMsgRing, PreparedMsgRing};
 pub use multishot::{Armed, Arrival, Delivery, Finished, MultishotRecv, PreparedMultishot};
