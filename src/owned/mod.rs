@@ -381,6 +381,7 @@ mod sendmsg;
 mod sendmsg_zc;
 mod slot;
 mod staged_addr;
+mod staged_value;
 mod statx;
 mod timeout;
 mod vectored;

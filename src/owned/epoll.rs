@@ -26,6 +26,13 @@
 //! something for the array's address to be stable. Rather than special-case
 //! it, the published bytes are simply zero.
 //!
+//! That storage-ownership machinery is not written here at all: `epoll_ctl`
+//! and [`timeout`](super::timeout) need the identical state machine around
+//! one staged, fixed-size, aligned value, so
+//! [`staged_value`](super::staged_value) carries it once and this module
+//! supplies only what tells the two apart — the value to publish, the SQE
+//! builder, and the outcome table below.
+//!
 //! # The interesting failures are about the registration, not the memory
 //!
 //! Measured against a real kernel:
@@ -41,11 +48,9 @@
 //! of racing another thread that touched the same epoll set, so
 //! [`EpollOutcome`] names them rather than folding them into one error.
 
-use core::mem::{ManuallyDrop, align_of, size_of};
-
-use super::buffer::StableBufferMut;
 use super::identity::{RequestId, RingId};
 use super::request::Receipt;
+use super::staged_value::{ValueDone, ValueOp, ValuePending, ValuePrepared};
 use crate::error::Errno;
 use crate::op::Sqe;
 use crate::types::{EpollEvent, EpollEvents, EpollOp, RawFd};
@@ -189,23 +194,56 @@ impl core::fmt::Display for EpollError {
     }
 }
 
-/// An `epoll_ctl` that owns the event storage, not yet queued.
-pub struct PreparedEpollCtl<S> {
-    store: S,
+/// The request's own fields, kept in [`staged_value`](super::staged_value)'s
+/// `ctx` for as long as the request is live.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct EpollCtx {
     epoll: RawFd,
     target: RawFd,
     change: EpollChange,
-    /// Address of the published event, cached where the stability bound is
-    /// in scope and checked for size and alignment before it was formed.
-    addr: *mut EpollEvent,
 }
 
-// SAFETY: the pointer refers into storage this struct exclusively owns, so
-// it stays valid wherever the value goes. The struct adds no thread
-// affinity of its own, leaving `S` to decide.
-unsafe impl<S: Send> Send for PreparedEpollCtl<S> {}
+/// Marker tying [`staged_value`](super::staged_value)'s generic machinery
+/// to `epoll_ctl`'s SQE shape and outcome table.
+pub(super) enum EpollCtlOp {}
 
-impl<S: StableBufferMut> PreparedEpollCtl<S> {
+impl ValueOp for EpollCtlOp {
+    type Context = EpollCtx;
+    type Info = EpollChange;
+    type Value = EpollEvent;
+    type Outcome = EpollOutcome;
+    type Error = EpollError;
+
+    fn too_small(needed: usize, got: usize) -> Self::Error {
+        EpollError::StoreTooSmall { needed, got }
+    }
+
+    fn misaligned(needed: usize) -> Self::Error {
+        EpollError::StoreMisaligned { needed }
+    }
+
+    fn value(ctx: &Self::Context) -> Self::Value {
+        ctx.change.event()
+    }
+
+    unsafe fn build_sqe(ctx: &Self::Context, addr: *const Self::Value) -> Sqe {
+        // SAFETY: forwarded from the caller, who requires the same of us.
+        unsafe { Sqe::epoll_ctl_ptr(ctx.epoll, ctx.change.op(), ctx.target, addr) }
+    }
+
+    fn info(ctx: &Self::Context) -> Self::Info {
+        ctx.change
+    }
+
+    fn classify(result: i32) -> Self::Outcome {
+        EpollOutcome::from_raw(result)
+    }
+}
+
+/// An `epoll_ctl` that owns the event storage, not yet queued.
+pub struct PreparedEpollCtl<S>(ValuePrepared<S, EpollCtlOp>);
+
+impl<S: super::buffer::StableBufferMut> PreparedEpollCtl<S> {
     /// Prepare a change to `target`'s registration in the `epoll` set.
     ///
     /// Takes ownership of `store`, which the kernel reads the event from
@@ -220,65 +258,34 @@ impl<S: StableBufferMut> PreparedEpollCtl<S> {
         epoll: RawFd,
         target: RawFd,
         change: EpollChange,
-        mut store: S,
+        store: S,
     ) -> Result<Self, (S, EpollError)> {
-        let needed = size_of::<EpollEvent>();
-        let got = store.stable_len();
-        if got < needed {
-            return Err((store, EpollError::StoreTooSmall { needed, got }));
-        }
-        let base = store.stable_mut_ptr();
-        let align = align_of::<EpollEvent>();
-        // Checked on the address rather than by casting first: the cast is
-        // only sound once this has passed.
-        if !base.addr().is_multiple_of(align) {
-            return Err((store, EpollError::StoreMisaligned { needed: align }));
-        }
-        // The alignment check above is what makes this cast well-defined.
-        #[allow(clippy::cast_ptr_alignment)]
-        let addr = base.cast::<EpollEvent>();
-        let mut prepared = Self {
-            store,
+        let ctx = EpollCtx {
             epoll,
             target,
             change,
-            addr,
         };
-        prepared.publish();
-        Ok(prepared)
+        ValuePrepared::new(ctx, store).map(Self)
     }
 }
 
 impl<S> PreparedEpollCtl<S> {
-    /// Write the event into the storage the kernel will read.
-    ///
-    /// Done at construction so the bytes are in place before any SQE can
-    /// name them. A `Del` publishes a zeroed event, which the kernel does
-    /// not read.
-    const fn publish(&mut self) {
-        // SAFETY: `addr` was checked for size and alignment against
-        // `EpollEvent` and points into storage this request owns
-        // exclusively, so nothing else can observe the write. No SQE
-        // naming it exists yet, so the kernel is not reading concurrently.
-        unsafe { self.addr.write(self.change.event()) }
-    }
-
     /// The epoll set this request changes.
     #[must_use]
     pub const fn epoll(&self) -> RawFd {
-        self.epoll
+        self.0.ctx().epoll
     }
 
     /// The descriptor whose registration changes.
     #[must_use]
     pub const fn target(&self) -> RawFd {
-        self.target
+        self.0.ctx().target
     }
 
     /// What this request changes.
     #[must_use]
     pub const fn change(&self) -> EpollChange {
-        self.change
+        self.0.ctx().change
     }
 
     /// The event exactly as the kernel will read it.
@@ -287,43 +294,19 @@ impl<S> PreparedEpollCtl<S> {
     /// shows what was actually written.
     #[must_use]
     pub const fn published(&self) -> EpollEvent {
-        // SAFETY: `addr` points into storage this request owns and was
-        // written by `publish` at construction, so it holds an initialised
-        // `EpollEvent` at a properly aligned address.
-        unsafe { self.addr.read() }
+        self.0.published()
     }
 
     /// Give the storage back, abandoning the request.
     #[must_use]
     pub fn into_store(self) -> S {
-        self.store
+        self.0.into_store()
     }
 
     /// Build the SQE and move to the pending state.
     pub(crate) fn into_pending(self, ring: RingId, id: RequestId) -> (Sqe, PendingEpollCtl<S>) {
-        // SAFETY: `addr` was checked for size and alignment against
-        // `EpollEvent`, written by `publish`, and points into storage this
-        // request owns exclusively. The storage moves into
-        // `PendingEpollCtl`, whose destructor is suppressed unless a
-        // receipt proves the kernel finished.
-        let sqe = unsafe {
-            Sqe::epoll_ctl_ptr(
-                self.epoll,
-                self.change.op(),
-                self.target,
-                self.addr.cast_const(),
-            )
-        };
-        let pending = PendingEpollCtl {
-            store: ManuallyDrop::new(self.store),
-            ring,
-            id,
-            epoll: self.epoll,
-            target: self.target,
-            change: self.change,
-            addr: self.addr,
-        };
-        (sqe.user_data(id.raw()), pending)
+        let (sqe, pending) = self.0.into_pending(ring, id);
+        (sqe, PendingEpollCtl(pending))
     }
 }
 
@@ -339,44 +322,31 @@ impl<S> PreparedEpollCtl<S> {
 /// No descriptor goes with it: `epoll_ctl` borrows both descriptors rather
 /// than taking them, so only the storage is at stake.
 #[must_use = "dropping the ticket leaks the event storage"]
-pub struct PendingEpollCtl<S> {
-    store: ManuallyDrop<S>,
-    ring: RingId,
-    id: RequestId,
-    epoll: RawFd,
-    target: RawFd,
-    change: EpollChange,
-    addr: *mut EpollEvent,
-}
-
-// SAFETY: the pointer refers into storage this ticket exclusively owns and
-// keeps alive at a fixed address, so moving the ticket to another thread
-// keeps it valid; `S` decides whether that move is allowed.
-unsafe impl<S: Send> Send for PendingEpollCtl<S> {}
+pub struct PendingEpollCtl<S>(ValuePending<S, EpollCtlOp>);
 
 impl<S> PendingEpollCtl<S> {
     /// Identity the kernel echoes back in this request's CQE.
     #[must_use]
     pub const fn id(&self) -> RequestId {
-        self.id
+        self.0.id()
     }
 
     /// Identity of the queue that accepted this request.
     #[must_use]
     pub const fn ring(&self) -> RingId {
-        self.ring
+        self.0.ring()
     }
 
     /// What this request changes.
     #[must_use]
     pub const fn change(&self) -> EpollChange {
-        self.change
+        self.0.ctx().change
     }
 
     /// Whether `receipt` authenticates this exact request.
     #[must_use]
     pub const fn matches(&self, receipt: &Receipt) -> bool {
-        receipt.id().raw() == self.id.raw() && receipt.ring().raw() == self.ring.raw()
+        self.0.matches(receipt)
     }
 
     /// Take the storage back without a receipt, undoing a failed push.
@@ -386,18 +356,8 @@ impl<S> PendingEpollCtl<S> {
     /// The kernel must never have seen this request's SQE. Calling this
     /// after publication hands back storage the kernel may still read.
     pub(crate) unsafe fn reclaim_unsubmitted(self) -> PreparedEpollCtl<S> {
-        let mut this = ManuallyDrop::new(self);
-        // SAFETY: `this` is wrapped in `ManuallyDrop` so the no-op `Drop`
-        // cannot observe the moved-out field. The caller guarantees no
-        // kernel-visible pointer to the storage exists.
-        let store = unsafe { ManuallyDrop::take(&mut this.store) };
-        PreparedEpollCtl {
-            store,
-            epoll: this.epoll,
-            target: this.target,
-            change: this.change,
-            addr: this.addr,
-        }
+        // SAFETY: forwarded from the caller, who requires the same of us.
+        PreparedEpollCtl(unsafe { self.0.reclaim_unsubmitted() })
     }
 
     /// Trade a matching receipt for the outcome and the storage.
@@ -407,73 +367,50 @@ impl<S> PendingEpollCtl<S> {
     /// Returns the ticket and receipt unchanged if the receipt belongs to
     /// another request or another ring.
     pub fn redeem(self, receipt: Receipt) -> Result<EpollCtlDone<S>, (Self, Receipt)> {
-        if !self.matches(&receipt) {
-            return Err((self, receipt));
-        }
-        let mut this = ManuallyDrop::new(self);
-        // SAFETY: `this` is wrapped in `ManuallyDrop`, so `Drop` will not
-        // run and cannot observe the moved-out field. The receipt proves
-        // the kernel finished with these bytes.
-        let store = unsafe { ManuallyDrop::take(&mut this.store) };
-        Ok(EpollCtlDone {
-            store,
-            change: this.change,
-            id: this.id,
-            result: receipt.raw_result(),
-        })
-    }
-}
-
-impl<S> Drop for PendingEpollCtl<S> {
-    fn drop(&mut self) {
-        // Intentionally no `ManuallyDrop::drop`. See the type docs: the
-        // kernel may still be reading the event, so the storage leaks
-        // rather than being freed underneath an in-flight request.
+        self.0
+            .redeem(receipt)
+            .map(EpollCtlDone)
+            .map_err(|(pending, receipt)| (Self(pending), receipt))
     }
 }
 
 /// A finished `epoll_ctl`: how it ended, and the storage back.
-pub struct EpollCtlDone<S> {
-    store: S,
-    change: EpollChange,
-    id: RequestId,
-    result: i32,
-}
+pub struct EpollCtlDone<S>(ValueDone<S, EpollCtlOp>);
 
 impl<S> EpollCtlDone<S> {
     /// Identity of the request this completes.
     #[must_use]
     pub const fn id(&self) -> RequestId {
-        self.id
+        self.0.id()
     }
 
     /// Raw CQE result: `0` on success, `-errno` otherwise.
     #[must_use]
     pub const fn raw_result(&self) -> i32 {
-        self.result
+        self.0.raw_result()
     }
 
     /// How the request ended.
     #[must_use]
-    pub const fn outcome(&self) -> EpollOutcome {
-        EpollOutcome::from_raw(self.result)
+    pub fn outcome(&self) -> EpollOutcome {
+        self.0.outcome()
     }
 
     /// What this request changed.
     #[must_use]
     pub const fn change(&self) -> EpollChange {
-        self.change
+        *self.0.info()
     }
 
     /// Take the storage back for reuse.
     #[must_use]
     pub fn into_store(self) -> S {
-        self.store
+        self.0.into_store()
     }
 
     /// Take the outcome and the storage together.
     #[must_use]
     pub fn into_parts(self) -> (EpollOutcome, S) {
-        (self.outcome(), self.store)
+        self.0.into_parts()
     }
 }

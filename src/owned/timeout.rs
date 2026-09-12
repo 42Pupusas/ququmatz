@@ -40,6 +40,13 @@
 //! have to end somewhere has nowhere safe to end. The storage is owned
 //! until the completion, like every other request.
 //!
+//! That storage-ownership machinery is not written here at all: a timeout
+//! and [`epoll_ctl`](super::epoll) need the identical state machine around
+//! one staged, fixed-size, aligned value, so
+//! [`staged_value`](super::staged_value) carries it once and this module
+//! supplies only what tells the two apart — the value to publish, the SQE
+//! builder, and the outcome table below.
+//!
 //! # `count` makes a timeout a barrier
 //!
 //! With `count == 0` this is a pure timer. With `count == n` it completes
@@ -58,11 +65,9 @@
 //! pair rather than a request, so it stays on the
 //! [`Sqe`](crate::Sqe) surface.
 
-use core::mem::{ManuallyDrop, align_of, size_of};
-
-use super::buffer::StableBufferMut;
 use super::identity::{RequestId, RingId};
 use super::request::Receipt;
+use super::staged_value::{ValueDone, ValueOp, ValuePending, ValuePrepared};
 use crate::error::Errno;
 use crate::op::Sqe;
 use crate::types::{TimeoutFlags, Timespec};
@@ -205,24 +210,58 @@ impl core::fmt::Display for TimeoutError {
     }
 }
 
-/// A timeout that owns the storage its `Timespec` lives in, not yet queued.
-pub struct PreparedTimeout<S> {
-    store: S,
+/// The request's own fields, kept in [`staged_value`](super::staged_value)'s
+/// `ctx` for as long as the timeout is live.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct TimeoutCtx {
     duration: Timespec,
     count: Count,
     flags: TimeoutFlags,
-    /// Address of the published `Timespec`, cached where the stability
-    /// bound is in scope and checked for size and alignment before it was
-    /// formed.
-    addr: *mut Timespec,
 }
 
-// SAFETY: the pointer refers into storage this struct exclusively owns, so
-// it stays valid wherever the value goes. The struct adds no thread
-// affinity of its own, leaving `S` to decide.
-unsafe impl<S: Send> Send for PreparedTimeout<S> {}
+/// Marker tying [`staged_value`](super::staged_value)'s generic machinery
+/// to a timeout's SQE shape and outcome table.
+pub(super) enum TimeoutOp {}
 
-impl<S: StableBufferMut> PreparedTimeout<S> {
+impl ValueOp for TimeoutOp {
+    type Context = TimeoutCtx;
+    type Info = Count;
+    type Value = Timespec;
+    type Outcome = Expiry;
+    type Error = TimeoutError;
+
+    fn too_small(needed: usize, got: usize) -> Self::Error {
+        TimeoutError::StoreTooSmall { needed, got }
+    }
+
+    fn misaligned(needed: usize) -> Self::Error {
+        TimeoutError::StoreMisaligned { needed }
+    }
+
+    fn value(ctx: &Self::Context) -> Self::Value {
+        ctx.duration
+    }
+
+    unsafe fn build_sqe(ctx: &Self::Context, addr: *const Self::Value) -> Sqe {
+        #[allow(clippy::cast_possible_truncation)]
+        let count = ctx.count.raw() as u32;
+        // SAFETY: forwarded from the caller, who requires the same of us.
+        unsafe { Sqe::timeout_ptr(addr, count, ctx.flags) }
+    }
+
+    fn info(ctx: &Self::Context) -> Self::Info {
+        ctx.count
+    }
+
+    fn classify(result: i32) -> Self::Outcome {
+        Expiry::from_raw(result)
+    }
+}
+
+/// A timeout that owns the storage its `Timespec` lives in, not yet queued.
+pub struct PreparedTimeout<S>(ValuePrepared<S, TimeoutOp>);
+
+impl<S: super::buffer::StableBufferMut> PreparedTimeout<S> {
     /// Prepare a timeout of `duration`, relative to now.
     ///
     /// Takes ownership of `store`, which the kernel reads the duration
@@ -253,64 +292,34 @@ impl<S: StableBufferMut> PreparedTimeout<S> {
         duration: Timespec,
         count: Count,
         flags: TimeoutFlags,
-        mut store: S,
+        store: S,
     ) -> Result<Self, (S, TimeoutError)> {
-        let needed = size_of::<Timespec>();
-        let got = store.stable_len();
-        if got < needed {
-            return Err((store, TimeoutError::StoreTooSmall { needed, got }));
-        }
-        let base = store.stable_mut_ptr();
-        let align = align_of::<Timespec>();
-        // Checked on the address rather than by casting first: the cast is
-        // only sound once this has passed.
-        if !base.addr().is_multiple_of(align) {
-            return Err((store, TimeoutError::StoreMisaligned { needed: align }));
-        }
-        // The alignment check above is what makes this cast well-defined.
-        #[allow(clippy::cast_ptr_alignment)]
-        let addr = base.cast::<Timespec>();
-        let mut prepared = Self {
-            store,
+        let ctx = TimeoutCtx {
             duration,
             count,
             flags,
-            addr,
         };
-        prepared.publish();
-        Ok(prepared)
+        ValuePrepared::new(ctx, store).map(Self)
     }
 }
 
 impl<S> PreparedTimeout<S> {
-    /// Write the duration into the storage the kernel will read.
-    ///
-    /// Done at construction so the bytes are in place before any SQE can
-    /// name them.
-    const fn publish(&mut self) {
-        // SAFETY: `addr` was checked for size and alignment against
-        // `Timespec` and points into storage this request owns
-        // exclusively, so nothing else can observe the write. No SQE
-        // naming it exists yet, so the kernel is not reading concurrently.
-        unsafe { self.addr.write(self.duration) }
-    }
-
     /// The duration this timeout was prepared with.
     #[must_use]
     pub const fn duration(&self) -> Timespec {
-        self.duration
+        self.0.ctx().duration
     }
 
     /// How many other completions this timeout waits for.
     #[must_use]
     pub const fn count(&self) -> Count {
-        self.count
+        self.0.ctx().count
     }
 
     /// Whether the duration is an absolute clock time rather than a delay.
     #[must_use]
     pub const fn is_absolute(&self) -> bool {
-        self.flags.contains(TimeoutFlags::ABS)
+        self.0.ctx().flags.contains(TimeoutFlags::ABS)
     }
 
     /// The `Timespec` exactly as the kernel will read it.
@@ -319,42 +328,19 @@ impl<S> PreparedTimeout<S> {
     /// so it shows what was actually written.
     #[must_use]
     pub const fn published(&self) -> Timespec {
-        // SAFETY: `addr` points into storage this request owns and was
-        // written by `publish` at construction, so it holds an initialised
-        // `Timespec` at a properly aligned address.
-        unsafe { self.addr.read() }
+        self.0.published()
     }
 
     /// Give the storage back, abandoning the request.
     #[must_use]
     pub fn into_store(self) -> S {
-        self.store
+        self.0.into_store()
     }
 
     /// Build the SQE and move to the pending state.
     pub(crate) fn into_pending(self, ring: RingId, id: RequestId) -> (Sqe, PendingTimeout<S>) {
-        // SAFETY: `addr` was checked for size and alignment against
-        // `Timespec`, written by `publish`, and points into storage this
-        // request owns exclusively. The storage moves into
-        // `PendingTimeout`, whose destructor is suppressed unless a
-        // receipt proves the kernel finished.
-        let sqe = unsafe { Sqe::timeout_ptr(self.addr.cast_const(), self.count_raw(), self.flags) };
-        let pending = PendingTimeout {
-            store: ManuallyDrop::new(self.store),
-            ring,
-            id,
-            duration: self.duration,
-            count: self.count,
-            flags: self.flags,
-            addr: self.addr,
-        };
-        (sqe.user_data(id.raw()), pending)
-    }
-
-    /// The completion count as the kernel's SQE field wants it.
-    #[allow(clippy::cast_possible_truncation)]
-    const fn count_raw(&self) -> u32 {
-        self.count.raw() as u32
+        let (sqe, pending) = self.0.into_pending(ring, id);
+        (sqe, PendingTimeout(pending))
     }
 }
 
@@ -372,38 +358,25 @@ impl<S> PreparedTimeout<S> {
 /// and no table slot: the completion carries no resource, so only the
 /// storage is at stake.
 #[must_use = "dropping the ticket leaks the timespec storage"]
-pub struct PendingTimeout<S> {
-    store: ManuallyDrop<S>,
-    ring: RingId,
-    id: RequestId,
-    duration: Timespec,
-    count: Count,
-    flags: TimeoutFlags,
-    addr: *mut Timespec,
-}
-
-// SAFETY: the pointer refers into storage this ticket exclusively owns and
-// keeps alive at a fixed address, so moving the ticket to another thread
-// keeps it valid; `S` decides whether that move is allowed.
-unsafe impl<S: Send> Send for PendingTimeout<S> {}
+pub struct PendingTimeout<S>(ValuePending<S, TimeoutOp>);
 
 impl<S> PendingTimeout<S> {
     /// Identity the kernel echoes back in this request's CQE.
     #[must_use]
     pub const fn id(&self) -> RequestId {
-        self.id
+        self.0.id()
     }
 
     /// Identity of the queue that accepted this request.
     #[must_use]
     pub const fn ring(&self) -> RingId {
-        self.ring
+        self.0.ring()
     }
 
     /// How many other completions this timeout waits for.
     #[must_use]
     pub const fn count(&self) -> Count {
-        self.count
+        self.0.ctx().count
     }
 
     /// The `user_data` a [`Sqe::timeout_remove`] must name to cancel this.
@@ -414,13 +387,13 @@ impl<S> PendingTimeout<S> {
     /// caller build one on the raw surface.
     #[must_use]
     pub const fn cancel_key(&self) -> u64 {
-        self.id.raw()
+        self.0.id().raw()
     }
 
     /// Whether `receipt` authenticates this exact request.
     #[must_use]
     pub const fn matches(&self, receipt: &Receipt) -> bool {
-        receipt.id().raw() == self.id.raw() && receipt.ring().raw() == self.ring.raw()
+        self.0.matches(receipt)
     }
 
     /// Take the storage back without a receipt, undoing a failed push.
@@ -430,18 +403,8 @@ impl<S> PendingTimeout<S> {
     /// The kernel must never have seen this request's SQE. Calling this
     /// after publication hands back storage the kernel may still read.
     pub(crate) unsafe fn reclaim_unsubmitted(self) -> PreparedTimeout<S> {
-        let mut this = ManuallyDrop::new(self);
-        // SAFETY: `this` is wrapped in `ManuallyDrop` so the no-op `Drop`
-        // cannot observe the moved-out field. The caller guarantees no
-        // kernel-visible pointer to the storage exists.
-        let store = unsafe { ManuallyDrop::take(&mut this.store) };
-        PreparedTimeout {
-            store,
-            duration: this.duration,
-            count: this.count,
-            flags: this.flags,
-            addr: this.addr,
-        }
+        // SAFETY: forwarded from the caller, who requires the same of us.
+        PreparedTimeout(unsafe { self.0.reclaim_unsubmitted() })
     }
 
     /// Trade a matching receipt for the outcome and the storage.
@@ -455,44 +418,21 @@ impl<S> PendingTimeout<S> {
     /// Returns the ticket and receipt unchanged if the receipt belongs to
     /// another request or another ring.
     pub fn redeem(self, receipt: Receipt) -> Result<TimeoutCompleted<S>, (Self, Receipt)> {
-        if !self.matches(&receipt) {
-            return Err((self, receipt));
-        }
-        let mut this = ManuallyDrop::new(self);
-        // SAFETY: `this` is wrapped in `ManuallyDrop`, so `Drop` will not
-        // run and cannot observe the moved-out field. The receipt proves
-        // the kernel finished with these bytes.
-        let store = unsafe { ManuallyDrop::take(&mut this.store) };
-        Ok(TimeoutCompleted {
-            store,
-            count: this.count,
-            id: this.id,
-            result: receipt.raw_result(),
-        })
-    }
-}
-
-impl<S> Drop for PendingTimeout<S> {
-    fn drop(&mut self) {
-        // Intentionally no `ManuallyDrop::drop`. See the type docs: the
-        // kernel may not have copied the `Timespec` yet, so the storage
-        // leaks rather than being freed underneath an in-flight request.
+        self.0
+            .redeem(receipt)
+            .map(TimeoutCompleted)
+            .map_err(|(pending, receipt)| (Self(pending), receipt))
     }
 }
 
 /// A finished timeout: how it ended, and the storage back.
-pub struct TimeoutCompleted<S> {
-    store: S,
-    count: Count,
-    id: RequestId,
-    result: i32,
-}
+pub struct TimeoutCompleted<S>(ValueDone<S, TimeoutOp>);
 
 impl<S> TimeoutCompleted<S> {
     /// Identity of the request this completes.
     #[must_use]
     pub const fn id(&self) -> RequestId {
-        self.id
+        self.0.id()
     }
 
     /// Raw CQE result, for callers that want the kernel's own encoding.
@@ -502,30 +442,30 @@ impl<S> TimeoutCompleted<S> {
     /// result would call a failure.
     #[must_use]
     pub const fn raw_result(&self) -> i32 {
-        self.result
+        self.0.raw_result()
     }
 
     /// How the timeout ended.
     #[must_use]
-    pub const fn expiry(&self) -> Expiry {
-        Expiry::from_raw(self.result)
+    pub fn expiry(&self) -> Expiry {
+        self.0.outcome()
     }
 
     /// How many other completions this timeout was waiting for.
     #[must_use]
     pub const fn count(&self) -> Count {
-        self.count
+        *self.0.info()
     }
 
     /// Take the storage back for reuse.
     #[must_use]
     pub fn into_store(self) -> S {
-        self.store
+        self.0.into_store()
     }
 
     /// Take the outcome and the storage together.
     #[must_use]
     pub fn into_parts(self) -> (Expiry, S) {
-        (self.expiry(), self.store)
+        self.0.into_parts()
     }
 }
