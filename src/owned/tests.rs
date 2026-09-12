@@ -4989,6 +4989,22 @@ fn every_outcome_is_named_rather_than_read_as_a_plain_result() {
 }
 
 #[test]
+fn expiry_display_names_every_variant() {
+    use std::{format, string::ToString};
+
+    assert_eq!(Expiry::Expired.to_string(), "timer expired");
+    assert_eq!(
+        Expiry::CountReached.to_string(),
+        "completion count reached first"
+    );
+    assert_eq!(Expiry::Cancelled.to_string(), "timeout cancelled");
+    assert_eq!(
+        Expiry::from_raw_for_test(-22).to_string(),
+        format!("timeout failed: {}", crate::error::Errno::new(22))
+    );
+}
+
+#[test]
 fn a_timeout_receipt_for_another_request_is_rejected() {
     let ring = crate::IoUring::new(8).expect("ring");
     let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
@@ -5897,6 +5913,29 @@ fn each_bind_failure_is_named_rather_than_left_as_an_errno() {
 }
 
 #[test]
+fn bind_outcome_display_names_every_variant() {
+    use std::{format, string::ToString};
+
+    assert_eq!(BindOutcome::Bound.to_string(), "socket bound");
+    assert_eq!(
+        BindOutcome::AddressInUse.to_string(),
+        "address is already in use"
+    );
+    assert_eq!(
+        BindOutcome::AlreadyBound.to_string(),
+        "socket is already bound"
+    );
+    assert_eq!(
+        BindOutcome::PermissionDenied.to_string(),
+        "binding this address requires privilege"
+    );
+    assert_eq!(
+        BindOutcome::from_raw_for_test(-101).to_string(),
+        format!("bind failed: {}", crate::error::Errno::new(101))
+    );
+}
+
+#[test]
 fn a_bind_receipt_for_another_request_is_rejected() {
     let ring = crate::IoUring::new(8).expect("ring");
     let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
@@ -6237,6 +6276,28 @@ fn each_registration_failure_is_named_rather_than_left_as_an_errno() {
     assert!(!EpollOutcome::from_raw_for_test(-17).is_applied());
     let failed = EpollOutcome::from_raw_for_test(-22);
     assert!(matches!(failed, EpollOutcome::Failed(_)));
+}
+
+#[test]
+fn epoll_outcome_display_names_every_variant() {
+    use std::{format, string::ToString};
+
+    assert_eq!(
+        EpollOutcome::Applied.to_string(),
+        "epoll registration updated"
+    );
+    assert_eq!(
+        EpollOutcome::AlreadyRegistered.to_string(),
+        "descriptor is already registered"
+    );
+    assert_eq!(
+        EpollOutcome::NotRegistered.to_string(),
+        "descriptor is not registered"
+    );
+    assert_eq!(
+        EpollOutcome::from_raw_for_test(-22).to_string(),
+        format!("epoll_ctl failed: {}", crate::error::Errno::new(22))
+    );
 }
 
 #[test]
@@ -6850,6 +6911,33 @@ fn each_connect_failure_is_named_rather_than_left_as_an_errno() {
     );
     assert!(ConnectOutcome::from_raw_for_test(0).is_connected());
     assert!(!ConnectOutcome::from_raw_for_test(-111).is_connected());
+}
+
+#[test]
+fn connect_outcome_display_names_every_variant() {
+    use std::{format, string::ToString};
+
+    assert_eq!(ConnectOutcome::Connected.to_string(), "socket connected");
+    assert_eq!(
+        ConnectOutcome::ConnectionRefused.to_string(),
+        "connection refused"
+    );
+    assert_eq!(
+        ConnectOutcome::AlreadyConnected.to_string(),
+        "socket is already connected"
+    );
+    assert_eq!(
+        ConnectOutcome::TimedOut.to_string(),
+        "connection timed out"
+    );
+    assert_eq!(
+        ConnectOutcome::NetworkUnreachable.to_string(),
+        "network is unreachable"
+    );
+    assert_eq!(
+        ConnectOutcome::from_raw_for_test(-97).to_string(),
+        format!("connect failed: {}", crate::error::Errno::new(97))
+    );
 }
 
 #[test]

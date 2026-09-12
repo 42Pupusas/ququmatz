@@ -726,6 +726,30 @@ fn cancel_outcome_classifies_raw_results() {
 }
 
 #[test]
+fn cancel_outcome_display_names_every_variant() {
+    extern crate std;
+    use std::{format, string::ToString};
+
+    assert_eq!(CancelOutcome::Applied(0).to_string(), "cancelled");
+    assert_eq!(
+        CancelOutcome::Applied(3).to_string(),
+        "cancelled 3 request(s)"
+    );
+    assert_eq!(
+        CancelOutcome::NotFound.to_string(),
+        "no matching request found"
+    );
+    assert_eq!(
+        CancelOutcome::AlreadyCompleting.to_string(),
+        "matching request was already completing"
+    );
+    assert_eq!(
+        CancelOutcome::from_raw(-22).to_string(),
+        format!("cancel failed: {}", crate::error::Errno::new(22))
+    );
+}
+
+#[test]
 fn sync_cancel_reg_layout_matches_the_kernel_struct() {
     use crate::types::RawSyncCancelReg;
 
