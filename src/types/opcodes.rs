@@ -62,6 +62,8 @@ pub enum Opcode {
     Ftruncate = 55,
     Bind = 56,
     Listen = 57,
+    ReadvFixed = 60,
+    WritevFixed = 61,
 }
 
 impl PartialEq<u8> for Opcode {

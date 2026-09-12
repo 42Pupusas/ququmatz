@@ -425,6 +425,40 @@ fn sqe_builder_readv_places_fields_correctly() {
 }
 
 #[test]
+fn sqe_builder_readv_fixed_places_fields_correctly() {
+    let mut buf = [0u8; 8];
+    let vecs = [unsafe { IoVec::new(buf.as_mut_ptr(), buf.len()) }];
+    let sqe = unsafe { Sqe::readv_fixed(RawFd::from_raw(3), vecs.as_ptr(), 1, 50, 7) }
+        .user_data(10);
+    let inner = sqe.0;
+
+    assert_eq!(Opcode::ReadvFixed, inner.opcode);
+    assert_eq!(inner.fd, 3);
+    assert_eq!(inner.addr, vecs.as_ptr() as u64);
+    assert_eq!(inner.len, 1);
+    assert_eq!(inner.off, 50);
+    assert_eq!(inner.buf_index, 7);
+    assert_eq!(inner.user_data, 10);
+}
+
+#[test]
+fn sqe_builder_writev_fixed_places_fields_correctly() {
+    let buf = [1u8; 8];
+    let vecs = [unsafe { IoVec::new(buf.as_ptr().cast_mut(), buf.len()) }];
+    let sqe = unsafe { Sqe::writev_fixed(RawFd::from_raw(4), vecs.as_ptr(), 1, 20, 3) }
+        .user_data(11);
+    let inner = sqe.0;
+
+    assert_eq!(Opcode::WritevFixed, inner.opcode);
+    assert_eq!(inner.fd, 4);
+    assert_eq!(inner.addr, vecs.as_ptr() as u64);
+    assert_eq!(inner.len, 1);
+    assert_eq!(inner.off, 20);
+    assert_eq!(inner.buf_index, 3);
+    assert_eq!(inner.user_data, 11);
+}
+
+#[test]
 fn sqe_builder_openat_places_fields_correctly() {
     use crate::types::DirFd;
     let path = c"/tmp/test";
@@ -1635,6 +1669,61 @@ fn registered_buffers_read_write() {
     assert_eq!(&buf[..msg.len()], msg);
 
     ring.unregister_buffers().expect("unregister");
+    let _ = syscall::close(RawFd::from_raw(fd as usize));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_readv_fixed_writev_fixed_gathers_and_scatters_within_a_registered_buffer() {
+    let mut ring = IoUring::new(4).expect("setup");
+    let fd = open_tmpfile(&mut ring);
+
+    let mut buf = vec![0u8; 4096];
+    let iov = [unsafe { IoVec::new(buf.as_mut_ptr(), buf.len()) }];
+    ring.register_buffers(&iov).expect("register_buffers");
+
+    let first = b"hello, ";
+    let second = b"fixed vector!";
+    buf[0..first.len()].copy_from_slice(first);
+    buf[64..64 + second.len()].copy_from_slice(second);
+
+    let vecs = [
+        unsafe { IoVec::new(buf.as_mut_ptr(), first.len()) },
+        unsafe { IoVec::new(buf.as_mut_ptr().add(64), second.len()) },
+    ];
+    ring.push(
+        unsafe { Sqe::writev_fixed(RawFd::from_raw(fd as usize), vecs.as_ptr(), 2, 0, 0) }
+            .user_data(1),
+    )
+    .expect("push writev_fixed");
+    ring.submit_and_wait(1).expect("submit");
+    let cqe = ring.complete().expect("writev cqe");
+    assert_eq!(cqe.user_data, 1);
+    assert_eq!(cqe.result, (first.len() + second.len()) as i32);
+
+    let mut dest = vec![0u8; 4096];
+    let dest_iov = [unsafe { IoVec::new(dest.as_mut_ptr(), dest.len()) }];
+    ring.unregister_buffers().expect("unregister source");
+    ring.register_buffers(&dest_iov)
+        .expect("register destination buffer");
+
+    let read_vecs = [
+        unsafe { IoVec::new(dest.as_mut_ptr(), first.len()) },
+        unsafe { IoVec::new(dest.as_mut_ptr().add(64), second.len()) },
+    ];
+    ring.push(
+        unsafe { Sqe::readv_fixed(RawFd::from_raw(fd as usize), read_vecs.as_ptr(), 2, 0, 0) }
+            .user_data(2),
+    )
+    .expect("push readv_fixed");
+    ring.submit_and_wait(1).expect("submit");
+    let cqe = ring.complete().expect("readv cqe");
+    assert_eq!(cqe.user_data, 2);
+    assert_eq!(cqe.result, (first.len() + second.len()) as i32);
+    assert_eq!(&dest[0..first.len()], first);
+    assert_eq!(&dest[64..64 + second.len()], second);
+
+    ring.unregister_buffers().expect("unregister destination");
     let _ = syscall::close(RawFd::from_raw(fd as usize));
 }
 

@@ -268,6 +268,64 @@ impl Sqe {
         Self(sqe)
     }
 
+    /// Prepare a vectored read against a registered buffer.
+    ///
+    /// Combines `readv`'s scatter list with `read_fixed`'s zero-copy path:
+    /// each `IoVec` names a range of the registered buffer at `buf_index`
+    /// by the same absolute address that buffer was registered under (as
+    /// `read_fixed`'s `buf` is), and every range must fall inside it.
+    ///
+    /// # Safety
+    ///
+    /// `iovecs` must point to `nr_vecs` valid `IoVec`s and remain valid
+    /// until the operation completes; each entry's address/length must lie
+    /// within the buffer registered at `buf_index`.
+    #[must_use]
+    pub unsafe fn readv_fixed(
+        fd: RawFd,
+        iovecs: *const IoVec,
+        nr_vecs: u32,
+        offset: u64,
+        buf_index: u16,
+    ) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::ReadvFixed.into();
+        sqe.fd = fd.as_i32();
+        sqe.addr = iovecs as u64;
+        sqe.len = nr_vecs;
+        sqe.off = offset;
+        sqe.buf_index = buf_index;
+        Self(sqe)
+    }
+
+    /// Prepare a vectored write against a registered buffer.
+    ///
+    /// See [`readv_fixed`](Self::readv_fixed) for how the `IoVec`s address
+    /// ranges of the registered buffer.
+    ///
+    /// # Safety
+    ///
+    /// `iovecs` must point to `nr_vecs` valid `IoVec`s and remain valid
+    /// until the operation completes; each entry's address/length must lie
+    /// within the buffer registered at `buf_index`.
+    #[must_use]
+    pub unsafe fn writev_fixed(
+        fd: RawFd,
+        iovecs: *const IoVec,
+        nr_vecs: u32,
+        offset: u64,
+        buf_index: u16,
+    ) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::WritevFixed.into();
+        sqe.fd = fd.as_i32();
+        sqe.addr = iovecs as u64;
+        sqe.len = nr_vecs;
+        sqe.off = offset;
+        sqe.buf_index = buf_index;
+        Self(sqe)
+    }
+
     /// Prepare an `openat` operation.
     ///
     /// Opens a file relative to `dfd`. Use [`DirFd::Cwd`] to resolve the
