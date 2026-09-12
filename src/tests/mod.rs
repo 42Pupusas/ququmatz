@@ -1131,6 +1131,57 @@ fn a_real_ftruncate_grows_and_shrinks_a_files_reported_size() {
 }
 
 #[test]
+fn sqe_builder_pipe_places_fields_correctly() {
+    use crate::types::PipeFlags;
+
+    let mut fds = [0i32; 2];
+    let sqe = unsafe { Sqe::pipe(&mut fds, PipeFlags::NONBLOCK) };
+    let inner = sqe.0;
+    assert_eq!(Opcode::Pipe, inner.opcode);
+    assert_eq!(inner.fd, 0);
+    assert_eq!(inner.off, 0);
+    assert_eq!(inner.addr, fds.as_ptr() as u64);
+    assert_eq!(inner.op_flags, PipeFlags::NONBLOCK.bits());
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_pipe_creates_a_working_pair() {
+    use crate::types::PipeFlags;
+
+    let mut ring = IoUring::new(4).expect("setup");
+    let mut fds = [0i32; 2];
+    ring.push(unsafe { Sqe::pipe(&mut fds, PipeFlags::default()) }.user_data(1))
+        .expect("push pipe");
+    ring.submit_and_wait(1).expect("submit pipe");
+    let cqe = ring.complete().expect("pipe cqe");
+    assert_eq!(cqe.result, 0, "pipe creation failed");
+    assert_ne!(fds[0], 0, "read end must be a real descriptor");
+    assert_ne!(fds[1], 0, "write end must be a real descriptor");
+    assert_ne!(fds[0], fds[1], "the two ends are distinct descriptors");
+
+    let read_fd = RawFd::from_raw(fds[0] as usize);
+    let write_fd = RawFd::from_raw(fds[1] as usize);
+
+    ring.push(unsafe { Sqe::write(write_fd, b"hi", 0) }.user_data(2))
+        .expect("push write");
+    ring.submit_and_wait(1).expect("submit write");
+    let cqe = ring.complete().expect("write cqe");
+    assert_eq!(cqe.result, 2, "wrote 2 bytes into the pipe");
+
+    let mut buf = [0u8; 2];
+    ring.push(unsafe { Sqe::read(read_fd, &mut buf, 0) }.user_data(3))
+        .expect("push read");
+    ring.submit_and_wait(1).expect("submit read");
+    let cqe = ring.complete().expect("read cqe");
+    assert_eq!(cqe.result, 2, "read back 2 bytes from the pipe");
+    assert_eq!(&buf, b"hi");
+
+    let _ = syscall::close(read_fd);
+    let _ = syscall::close(write_fd);
+}
+
+#[test]
 fn sqe_builder_symlinkat_places_fields_correctly() {
     let sqe = unsafe { Sqe::symlinkat(c"target", crate::types::DirFd::Cwd, c"link") };
     let inner = sqe.0;

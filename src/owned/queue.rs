@@ -23,6 +23,7 @@ use super::open::{PendingOpen, PreparedOpen};
 use super::readmultishot::{MultishotRead, PreparedReadMultishot};
 use super::openat2::{PendingOpenat2, PreparedOpenat2};
 use super::pathop::{PendingPathOp, PreparedPathOp};
+use super::pipe::{PendingPipe, PreparedPipe};
 use super::recvmsg::{PendingRecvmsg, PreparedRecvmsg};
 use super::rename::{PendingRename, PreparedRename};
 use super::request::{Pending, Prepared, Receipt};
@@ -735,6 +736,37 @@ impl OwnedSubmitter {
     fn reclaim_epoll_wait<D: StableBufferMut>(
         pending: PendingEpollWait<D>,
     ) -> PreparedEpollWait<D> {
+        // SAFETY: only reached when `Submitter::push` reported the queue was
+        // full, which happens before the SQE is written or the tail is
+        // advanced. No kernel-visible pointer to the storage exists.
+        unsafe { pending.reclaim_unsubmitted() }
+    }
+
+    /// Queue a `pipe`, taking ownership of the destination storage.
+    ///
+    /// The kernel writes both descriptors into the destination after
+    /// submission, so the storage is owned by the ticket until redeemed.
+    ///
+    /// # Errors
+    ///
+    /// If the submission queue is full the request is handed back intact,
+    /// still owning its storage.
+    pub fn push_pipe<D: StableBufferMut>(
+        &mut self,
+        request: PreparedPipe<D>,
+    ) -> Result<PendingPipe<D>, (PreparedPipe<D>, Error)> {
+        let id = self.ids.next();
+        let (sqe, pending) = request.into_pending(self.ring, id);
+        match self.inner.push(sqe) {
+            Ok(()) => Ok(pending),
+            // The SQE never became kernel-visible, so the kernel never saw
+            // the destination pointer and reclaiming the storage is sound.
+            Err(e) => Err((Self::reclaim_pipe(pending), e)),
+        }
+    }
+
+    /// Undo a `pipe` push that the kernel never observed.
+    fn reclaim_pipe<D: StableBufferMut>(pending: PendingPipe<D>) -> PreparedPipe<D> {
         // SAFETY: only reached when `Submitter::push` reported the queue was
         // full, which happens before the SQE is written or the tail is
         // advanced. No kernel-visible pointer to the storage exists.

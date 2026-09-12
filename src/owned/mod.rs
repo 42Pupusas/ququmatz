@@ -371,6 +371,7 @@ mod open;
 mod openat2;
 mod path;
 mod pathop;
+mod pipe;
 mod queue;
 mod readmultishot;
 mod recvmsg;
@@ -430,6 +431,7 @@ pub use open::{Opened, PendingOpen, PreparedOpen};
 pub use openat2::{Openat2Error, Openat2Mode, Opened2, PendingOpenat2, PreparedOpenat2};
 pub use path::{OwnedPath, PathError};
 pub use pathop::{PathOpCompleted, PathOpKind, PendingPathOp, PreparedPathOp};
+pub use pipe::{PendingPipe, PipeCreated, PipeError, PreparedPipe};
 pub use queue::{OwnedCompleter, OwnedSubmitter};
 pub use readmultishot::{MultishotRead, PreparedReadMultishot};
 pub use recvmsg::{

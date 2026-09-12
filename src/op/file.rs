@@ -5,8 +5,8 @@
 use super::{Sqe, ZEROED};
 use crate::types::{
     DirFd, FadviseAdvice, FallocateMode, FileMode, FsyncFlags, InstallFdFlags, IoVec, LinkFlags,
-    MadviseAdvice, Opcode, OpenFlags, OpenHow, RawFd, RenameFlags, SpliceFlags, SqeFlags, Statx,
-    StatxFlags, StatxMask, SyncFileRangeFlags, UnlinkFlags, XattrFlags,
+    MadviseAdvice, Opcode, OpenFlags, OpenHow, PipeFlags, RawFd, RenameFlags, SpliceFlags,
+    SqeFlags, Statx, StatxFlags, StatxMask, SyncFileRangeFlags, UnlinkFlags, XattrFlags,
 };
 
 impl Sqe {
@@ -1044,6 +1044,76 @@ impl Sqe {
         sqe.fd = fd.as_i32();
         sqe.off = len;
         Self(sqe)
+    }
+
+    /// Prepare a `IORING_OP_PIPE` (Linux 6.9+, opcode 62).
+    ///
+    /// Creates a pipe, writing the read and write descriptors to `fds[0]`
+    /// and `fds[1]` respectively -- the same order and meaning as
+    /// `pipe2(2)`. Unlike `openat`, the CQE result is not the descriptor:
+    /// both ends land in `fds` instead, and the CQE result is plain `0` on
+    /// success or `-errno` on failure.
+    ///
+    /// # Field mapping
+    ///
+    /// The kernel rejects a nonzero `fd`, `off`, or `addr3` with `EINVAL` --
+    /// this op carries only the destination pointer (`addr`) and the flags
+    /// (`pipe_flags`, the `op_flags` field), so every other field is
+    /// meaningless and the kernel refuses to guess what a nonzero one
+    /// might mean.
+    ///
+    /// # Safety
+    ///
+    /// `fds` is borrowed only for this call -- the returned `Sqe` stores a
+    /// raw pointer derived from it, not the borrow itself. The caller must
+    /// ensure the memory `fds` points to remains valid, writable, and
+    /// exclusively accessible until the kernel posts the completion for
+    /// this operation.
+    #[must_use]
+    pub unsafe fn pipe(fds: &mut [i32; 2], flags: PipeFlags) -> Self {
+        unsafe { Self::pipe_ptr(fds.as_mut_ptr(), flags) }
+    }
+
+    /// Prepare a `IORING_OP_PIPE` from a raw pointer.
+    ///
+    /// # Safety
+    ///
+    /// `fds` must point to two consecutive, valid, writable `i32`s that
+    /// remain valid until the operation completes.
+    #[must_use]
+    pub unsafe fn pipe_ptr(fds: *mut i32, flags: PipeFlags) -> Self {
+        let mut sqe = ZEROED;
+        sqe.opcode = Opcode::Pipe.into();
+        sqe.addr = fds as u64;
+        sqe.op_flags = flags.bits();
+        Self(sqe)
+    }
+
+    /// Prepare a `IORING_OP_PIPE` that installs both ends into the ring's
+    /// file table instead of the process.
+    ///
+    /// `fds` still receives both ends, but as *table indices* rather than
+    /// process descriptors -- see
+    /// [`PreparedDirectPipe`](crate::owned::PreparedDirectPipe) for the
+    /// slot-numbering details this raw form leaves to the caller. `slot` is
+    /// the encoded `file_index` value: `IORING_FILE_INDEX_ALLOC` (`-1`)
+    /// asks the kernel to allocate both slots itself, landing the read end
+    /// at the returned index and the write end at the next one; an
+    /// explicit slot is sent as `index + 1` and claims that slot for the
+    /// read end and the slot after it for the write end.
+    ///
+    /// `PipeFlags::CLOEXEC` is rejected by the kernel here with `EINVAL`,
+    /// the same refusal a direct open gets: the flag describes what
+    /// `execve` does to a descriptor, and a table slot is not one.
+    ///
+    /// # Safety
+    ///
+    /// As [`pipe_ptr`](Self::pipe_ptr).
+    #[must_use]
+    pub unsafe fn pipe_direct(fds: *mut i32, flags: PipeFlags, slot: i32) -> Self {
+        let mut sqe = unsafe { Self::pipe_ptr(fds, flags) };
+        sqe.0.splice_fd_in = slot;
+        sqe
     }
 
     /// Prepare a `IORING_OP_FIXED_FD_INSTALL`.

@@ -66,6 +66,7 @@ pub enum Opcode {
     EpollWait = 59,
     ReadvFixed = 60,
     WritevFixed = 61,
+    Pipe = 62,
 }
 
 impl PartialEq<u8> for Opcode {

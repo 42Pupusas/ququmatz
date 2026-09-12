@@ -11,11 +11,11 @@ use super::{
     PreparedConnect, PreparedDirectAccept, PreparedDirectOpen, PreparedDirectSocket,
     EpollWaitError, PreparedEpollCtl, PreparedEpollWait, PreparedFilesUpdate,
     PreparedFixedFdInstall, PreparedLink, PreparedMsgRing,
-    PreparedMultishot, PreparedOpen, PreparedOpenat2, PreparedPathOp, PreparedReadMultishot,
-    PreparedRecvmsg,
+    PreparedMultishot, PreparedOpen, PreparedOpenat2, PreparedPathOp, PreparedPipe,
+    PreparedReadMultishot, PreparedRecvmsg,
     PreparedRename, PreparedSendmsg, PreparedSendmsgZc, PreparedStatx, PreparedTimeout,
-    PreparedVectored, PreparedWaitId, PreparedZc, Receipt, RenameMode, RingId, SendTarget,
-    SlotIndex, SlotTarget, StableBuffer, StatxError, TableEntry, TimeoutError, Update,
+    PreparedVectored, PreparedWaitId, PreparedZc, PipeError, Receipt, RenameMode, RingId,
+    SendTarget, SlotIndex, SlotTarget, StableBuffer, StatxError, TableEntry, TimeoutError, Update,
     VectoredError, WaitIdError, ZcCompleted,
 };
 /// Only the kernel-backed tests name a path-op kind or inspect a peer
@@ -26,8 +26,8 @@ use crate::error::{Error, SubmitError};
 use crate::net::Socket;
 use crate::types::{
     AcceptFlags, AddressFamily, DirFd, EpollEvent, EpollEvents, FileMode, IdType, InstallFdFlags,
-    LinkFlags, MsgFlags, OpenFlags, RawFd, ResolveFlags, SockAddrIn, SocketFlags, SocketType,
-    Statx, StatxFlags, StatxMask, Timespec, WaitOptions, WaitidSiginfo,
+    LinkFlags, MsgFlags, OpenFlags, PipeFlags, RawFd, ResolveFlags, SockAddrIn, SocketFlags,
+    SocketType, Statx, StatxFlags, StatxMask, Timespec, WaitOptions, WaitidSiginfo,
 };
 
 /// Static proof that a ticket crosses a thread boundary. The whole design
@@ -6658,6 +6658,137 @@ fn a_real_epoll_wait_reports_a_pipe_becoming_readable_through_the_owned_path() {
 
     let _ = crate::syscall::close(read_end);
     let _ = crate::syscall::close(write_end);
+}
+
+// ---------------------------------------------------------------
+// pipe
+// ---------------------------------------------------------------
+
+fn pipe_store() -> MmapBuffer {
+    MmapBuffer::with_capacity(8).expect("map")
+}
+
+#[test]
+fn a_pipe_reports_its_flags_before_submission() {
+    let prepared = PreparedPipe::new(PipeFlags::NONBLOCK, pipe_store())
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    assert_eq!(prepared.flags(), PipeFlags::NONBLOCK);
+}
+
+#[test]
+fn storage_too_small_for_a_pipe_destination_is_rejected_with_it_handed_back() {
+    let store = MmapBuffer::with_capacity(core::mem::size_of::<[i32; 2]>() - 1).expect("map");
+    let addr = store.stable_ptr();
+    let Err((returned, e)) = PreparedPipe::new(PipeFlags::default(), store) else {
+        panic!("short storage must be refused");
+    };
+    assert_eq!(
+        e,
+        PipeError::DestTooSmall {
+            needed: core::mem::size_of::<[i32; 2]>(),
+            got: core::mem::size_of::<[i32; 2]>() - 1,
+        }
+    );
+    assert_eq!(returned.stable_ptr(), addr);
+}
+
+#[test]
+fn a_pipe_push_that_does_not_fit_hands_the_storage_back() {
+    let ring = crate::IoUring::new(4).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+    let mut tickets = alloc_tickets(&mut sub);
+
+    let store = pipe_store();
+    let addr = store.stable_ptr();
+    let prepared =
+        PreparedPipe::new(PipeFlags::default(), store).unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let Err((returned, e)) = sub.push_pipe(prepared) else {
+        panic!("a full queue must reject the push");
+    };
+    assert_eq!(e, Error::Submit(SubmitError::QueueFull));
+    assert_eq!(returned.into_dest().stable_ptr(), addr);
+    tickets.clear();
+}
+
+#[test]
+fn a_pipe_receipt_for_another_request_is_rejected() {
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, _comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let mut make = || {
+        let prepared = PreparedPipe::new(PipeFlags::default(), pipe_store())
+            .unwrap_or_else(|(_, e)| panic!("{e}"));
+        sub.push_pipe(prepared)
+            .unwrap_or_else(|(_, e)| panic!("{e}"))
+    };
+    let first = make();
+    let second = make();
+
+    let foreign = Receipt {
+        ring: second.ring(),
+        id: second.id(),
+        result: 0,
+        flags: crate::types::CqeFlags::default(),
+    };
+    assert!(!first.matches(&foreign));
+    let Err((first, _)) = first.redeem(foreign) else {
+        panic!("a foreign receipt must not redeem");
+    };
+    drop((first, second));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_pipe_creates_a_working_pair_through_the_owned_path() {
+    let ring = crate::IoUring::new(8).expect("ring");
+    let (mut sub, mut comp) = ring.split_owned().unwrap_or_else(|(_, e)| panic!("{e}"));
+
+    let prepared = PreparedPipe::new(PipeFlags::default(), pipe_store())
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    let ticket = sub
+        .push_pipe(prepared)
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit pipe");
+    let receipt = comp.wait_one().expect("pipe completion");
+    let done = ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+
+    assert!(done.is_ok());
+    let read_fd = done.read_fd().expect("read end");
+    let write_fd = done.write_fd().expect("write end");
+    assert_ne!(read_fd, write_fd);
+
+    let read_fd = RawFd::from_raw(read_fd as usize);
+    let write_fd = RawFd::from_raw(write_fd as usize);
+
+    let mut write_buf = MmapBuffer::with_capacity(2).expect("map");
+    write_buf.as_mut_slice().copy_from_slice(b"hi");
+    let write_ticket = sub
+        .push(Prepared::write(write_fd, write_buf, 0))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit write");
+    let receipt = comp.wait_one().expect("write completion");
+    let write_done = write_ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(write_done.result().expect("write ok"), 2);
+
+    let read_buf = MmapBuffer::with_capacity(2).expect("map");
+    let read_ticket = sub
+        .push(Prepared::read(read_fd, read_buf, 0))
+        .unwrap_or_else(|(_, e)| panic!("{e}"));
+    sub.submit_and_wait(1).expect("submit read");
+    let receipt = comp.wait_one().expect("read completion");
+    let read_done = read_ticket
+        .redeem(receipt)
+        .unwrap_or_else(|_| panic!("mismatch"));
+    assert_eq!(read_done.result().expect("read ok"), 2);
+    assert_eq!(read_done.into_buffer().as_slice(), b"hi");
+
+    let _ = crate::syscall::close(read_fd);
+    let _ = crate::syscall::close(write_fd);
 }
 
 // ---------------------------------------------------------------

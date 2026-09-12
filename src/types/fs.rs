@@ -324,6 +324,23 @@ bitflags! {
 }
 
 bitflags! {
+    /// Flags for `IORING_OP_PIPE` (Linux 6.9+), carried in the SQE's
+    /// `pipe_flags` (the `op_flags` field). Mirrors the subset of
+    /// `pipe2(2)`'s flags the kernel accepts here -- anything else is
+    /// rejected with `EINVAL`.
+    pub struct PipeFlags(u32);
+    const CLOEXEC = 0o2_000_000;
+    const NONBLOCK = 0o4000;
+    /// Bypass the page cache for the pipe's buffer.
+    const DIRECT = 0o40000;
+    /// Create a notification pipe (`O_NOTIFICATION_PIPE`, kernel
+    /// `watch_queue` support) rather than an ordinary data pipe. Shares its
+    /// bit with `OpenFlags::EXCL` -- the two flag spaces are unrelated, and
+    /// this bit means something only here.
+    const NOTIFICATION_PIPE = 0o200;
+}
+
+bitflags! {
     /// Flags for renameat2.
     pub struct RenameFlags(u32);
     const NOREPLACE = 1 << 0;
