@@ -25,7 +25,6 @@ use core::mem::{ManuallyDrop, align_of};
 use super::buffer::StableBufferMut;
 use super::identity::{RequestId, RingId};
 use super::request::Receipt;
-use crate::error::Errno;
 use crate::op::Sqe;
 use crate::types::{FUTEX_WAITV_MAX, FutexWaitv};
 
@@ -323,12 +322,9 @@ impl<V> FutexWaitvDone<V> {
     /// when the CQE carried a negative errno.
     #[allow(clippy::cast_sign_loss)]
     pub const fn woken_index(&self) -> Result<u32, crate::Error> {
-        if self.result < 0 {
-            Err(crate::Error::Completion(crate::CompletionError::Failed(
-                Errno::new(-self.result),
-            )))
-        } else {
-            Ok(self.result as u32)
+        match crate::Error::from_failed_cqe(self.result) {
+            Some(e) => Err(e),
+            None => Ok(self.result as u32),
         }
     }
 

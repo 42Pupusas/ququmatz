@@ -394,12 +394,9 @@ impl<'pool> Finished<'pool> {
     #[allow(clippy::cast_sign_loss)]
     pub const fn result(&self) -> Result<u32, crate::Error> {
         let raw = self.receipt.raw_result();
-        if raw < 0 {
-            Err(crate::Error::Completion(crate::CompletionError::Failed(
-                crate::Errno::new(-raw),
-            )))
-        } else {
-            Ok(raw as u32)
+        match crate::Error::from_failed_cqe(raw) {
+            Some(e) => Err(e),
+            None => Ok(raw as u32),
         }
     }
 

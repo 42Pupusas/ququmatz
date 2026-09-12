@@ -517,10 +517,8 @@ impl<B, R, const N: usize> RecvmsgCompleted<B, R, N> {
     /// when the CQE carried a negative errno.
     #[allow(clippy::cast_sign_loss)]
     pub const fn received(&self) -> Result<Received, Error> {
-        if self.failed() {
-            return Err(Error::Completion(crate::CompletionError::Failed(
-                crate::Errno::new(-self.result),
-            )));
+        if let Some(e) = Error::from_failed_cqe(self.result) {
+            return Err(e);
         }
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let flags = MsgOutFlags::from_raw(self.header().msg_flags as u32);

@@ -214,3 +214,28 @@ impl From<Errno> for Error {
         Self::Syscall(e)
     }
 }
+
+impl Error {
+    /// Decode a raw CQE result as this crate's error, if it was a failure.
+    ///
+    /// Every owned completion reads its raw result the same way: negative
+    /// is `-errno`, anything else is success. That decoding lives here
+    /// once rather than once per completion type; each caller matches on
+    /// the `None` case to build whatever success value its own request
+    /// produces — `()`, a byte count, or a richer struct.
+    #[must_use]
+    pub const fn from_failed_cqe(result: i32) -> Option<Self> {
+        if result < 0 {
+            Some(Self::Completion(CompletionError::Failed(Errno::new(-result))))
+        } else {
+            None
+        }
+    }
+
+    /// Whether a raw CQE result denotes success, by the same rule
+    /// [`from_failed_cqe`](Self::from_failed_cqe) decodes with.
+    #[must_use]
+    pub const fn cqe_is_ok(result: i32) -> bool {
+        result >= 0
+    }
+}

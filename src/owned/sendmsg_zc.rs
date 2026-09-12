@@ -417,12 +417,9 @@ impl<B, R, const N: usize> SendmsgZcCompleted<B, R, N> {
             Some(sent) => sent,
             None => self.notified,
         };
-        if raw < 0 {
-            Err(Error::Completion(crate::CompletionError::Failed(
-                crate::Errno::new(-raw),
-            )))
-        } else {
-            Ok(raw as u32)
+        match Error::from_failed_cqe(raw) {
+            Some(e) => Err(e),
+            None => Ok(raw as u32),
         }
     }
 

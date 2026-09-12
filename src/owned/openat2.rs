@@ -543,7 +543,7 @@ impl<S, H> Opened2<S, H> {
     /// Whether the open succeeded.
     #[must_use]
     pub const fn is_ok(&self) -> bool {
-        self.result >= 0
+        crate::Error::cqe_is_ok(self.result)
     }
 
     /// Why the open failed, if it did.
@@ -553,12 +553,9 @@ impl<S, H> Opened2<S, H> {
     /// Returns [`CompletionError::Failed`](crate::CompletionError::Failed)
     /// when the CQE carried a negative errno.
     pub const fn result(&self) -> Result<(), crate::Error> {
-        if self.result < 0 {
-            Err(crate::Error::Completion(crate::CompletionError::Failed(
-                crate::Errno::new(-self.result),
-            )))
-        } else {
-            Ok(())
+        match crate::Error::from_failed_cqe(self.result) {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
     }
 

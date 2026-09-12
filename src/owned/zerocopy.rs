@@ -332,12 +332,9 @@ impl<B> ZcCompleted<B> {
             Some(sent) => sent,
             None => self.notified,
         };
-        if raw < 0 {
-            Err(crate::Error::Completion(crate::CompletionError::Failed(
-                crate::Errno::new(-raw),
-            )))
-        } else {
-            Ok(raw as u32)
+        match crate::Error::from_failed_cqe(raw) {
+            Some(e) => Err(e),
+            None => Ok(raw as u32),
         }
     }
 

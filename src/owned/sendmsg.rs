@@ -428,12 +428,9 @@ impl<B, R, const N: usize> SendmsgCompleted<B, R, N> {
     /// when the CQE carried a negative errno.
     #[allow(clippy::cast_sign_loss)]
     pub const fn result(&self) -> Result<u32, Error> {
-        if self.result < 0 {
-            Err(Error::Completion(crate::CompletionError::Failed(
-                crate::Errno::new(-self.result),
-            )))
-        } else {
-            Ok(self.result as u32)
+        match Error::from_failed_cqe(self.result) {
+            Some(e) => Err(e),
+            None => Ok(self.result as u32),
         }
     }
 

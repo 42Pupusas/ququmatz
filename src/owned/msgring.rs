@@ -171,6 +171,6 @@ impl MsgRingDone {
     /// Whether the kernel accepted the message for delivery.
     #[must_use]
     pub const fn is_ok(&self) -> bool {
-        self.result >= 0
+        crate::Error::cqe_is_ok(self.result)
     }
 }
