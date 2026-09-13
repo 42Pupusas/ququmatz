@@ -1286,15 +1286,41 @@ full suite.
 
 ### Q-11 — Integration test uses a predictable truncating `/tmp` path
 
-**Status: confirmed.**
+**Status: fixed for every fixture the original evidence and the promised review both named.**
 
-**Evidence:** `src/tests/mod.rs:2159–2187`, `openat2_basic`, opens `/tmp/ququmatz_openat2_test` with CREAT | TRUNC, no exclusive creation, and `resolve = 0`, then unlinks it.
+The named example was already stale by the time this pass reached it:
+`openat2_basic` had since been rewritten to use `UniqueTestPath`, a helper
+(`src/tests/mod.rs`) that mixes the process id, a monotonically increasing
+counter, and the current time into the generated name, so concurrent runs
+cannot collide and a pre-planted path cannot be guessed in advance. Its
+doc comment is explicit that this guarantees only the name is
+unpredictable and unique -- callers still create the path with an
+exclusive flag, and its `Drop` best-effort removes the path even across a
+panic.
 
-**Impact:** concurrent test runs interfere; a pre-existing symlink can redirect truncation to another file writable by the test runner. Do not run this suite with elevated privileges. Other filesystem fixtures should be reviewed as well.
+The "review other filesystem fixtures as well" half of the remediation
+had not actually happened, though: three more real-kernel tests still
+built a path from nothing but `/tmp/ququmatz_<label>_<pid>` --
+`a_real_symlinkat_creates_a_link_pointing_at_the_literal_text`,
+`a_real_linkat_shares_the_source_inode`, and
+`a_real_setxattr_getxattr_roundtrip_on_a_regular_file` -- with no
+exclusive-creation flag, no counter, and no timestamp. All three now use
+`UniqueTestPath` (`new` for the single-path symlink/xattr cases, two
+separate instances for the two-path link case), matching what
+`openat2_basic` and `owned::tests::Scratch` already did.
 
-**Remediation:** use a Rust-owned private temporary directory with secure unique creation and restrictive permissions, then open relative to its directory fd. Prefer unnamed temporary files where path semantics are not under test. Ensure cleanup is ownership-based and cannot remove a pre-existing object.
+**Evidence (original, now stale):** `src/tests/mod.rs:2159–2187`, `openat2_basic`, opened `/tmp/ququmatz_openat2_test` with CREAT | TRUNC, no exclusive creation, and `resolve = 0`, then unlinked it.
 
-**Acceptance:** concurrent-process test runs do not share paths; a deliberately pre-existing symlink outside the private fixture cannot be followed or modified; cleanup works after test failure.
+**Acceptance met.** Every real-kernel filesystem test in `src/tests/mod.rs`
+and `src/owned/tests.rs` (via its own equivalent `Scratch` helper) now
+builds its path or directory from an unpredictable, counter-and-timestamp
+qualified name rather than a bare pid, so concurrent test runs cannot
+collide on a shared path and a pre-planted symlink cannot be hit by
+guessing it in advance. What remains unverified, because it needs a
+deliberately hostile external actor rather than a source read: that a
+symlink actually pre-planted at one of these generated names before a run
+starts is refused rather than followed (the exclusive-creation flags each
+test already passes should refuse it, but no test plants one to confirm).
 
 ### Q-12 — Safety-critical responsibilities remain coupled and duplicated
 

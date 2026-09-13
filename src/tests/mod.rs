@@ -1245,9 +1245,8 @@ fn sqe_builder_linkat_places_the_new_directory_in_len() {
 #[test]
 fn a_real_symlinkat_creates_a_link_pointing_at_the_literal_text() {
     let mut ring = IoUring::new(4).expect("setup");
-    let path = std::format!("/tmp/ququmatz_symlinkat_{}", std::process::id());
-    let cpath = std::ffi::CString::new(path.clone()).expect("cstring");
-    let _ = std::fs::remove_file(&path);
+    let target = UniqueTestPath::new("symlinkat");
+    let cpath = target.as_cstring();
 
     ring.push(
         unsafe { Sqe::symlinkat(c"/does/not/exist", crate::types::DirFd::Cwd, &cpath) }
@@ -1258,21 +1257,19 @@ fn a_real_symlinkat_creates_a_link_pointing_at_the_literal_text() {
     let cqe = ring.complete().expect("symlinkat cqe");
     assert_eq!(cqe.result, 0, "symlinkat failed: {}", cqe.result);
 
-    let target = std::fs::read_link(&path).expect("read_link");
-    assert_eq!(target.to_str().unwrap(), "/does/not/exist");
-    let _ = std::fs::remove_file(&path);
+    let link = std::fs::read_link(target.as_str()).expect("read_link");
+    assert_eq!(link.to_str().unwrap(), "/does/not/exist");
 }
 
 #[cfg(not(miri))]
 #[test]
 fn a_real_linkat_shares_the_source_inode() {
     let mut ring = IoUring::new(4).expect("setup");
-    let source = std::format!("/tmp/ququmatz_linkat_src_{}", std::process::id());
-    let dest = std::format!("/tmp/ququmatz_linkat_dst_{}", std::process::id());
-    std::fs::write(&source, b"shared").expect("seed");
-    let _ = std::fs::remove_file(&dest);
-    let csource = std::ffi::CString::new(source.clone()).expect("cstring");
-    let cdest = std::ffi::CString::new(dest.clone()).expect("cstring");
+    let source = UniqueTestPath::new("linkat_src");
+    let dest = UniqueTestPath::new("linkat_dst");
+    std::fs::write(source.as_str(), b"shared").expect("seed");
+    let csource = source.as_cstring();
+    let cdest = dest.as_cstring();
 
     ring.push(
         unsafe {
@@ -1292,12 +1289,9 @@ fn a_real_linkat_shares_the_source_inode() {
     assert_eq!(cqe.result, 0, "linkat failed: {}", cqe.result);
 
     use std::os::unix::fs::MetadataExt;
-    let a = std::fs::metadata(&source).expect("metadata");
-    let b = std::fs::metadata(&dest).expect("metadata");
+    let a = std::fs::metadata(source.as_str()).expect("metadata");
+    let b = std::fs::metadata(dest.as_str()).expect("metadata");
     assert_eq!(a.ino(), b.ino());
-
-    let _ = std::fs::remove_file(&source);
-    let _ = std::fs::remove_file(&dest);
 }
 
 #[test]
@@ -1353,9 +1347,9 @@ fn sqe_builder_fsetxattr_and_fgetxattr_place_fields_correctly() {
 #[test]
 fn a_real_setxattr_getxattr_roundtrip_on_a_regular_file() {
     let mut ring = IoUring::new(4).expect("setup");
-    let path = std::format!("/tmp/ququmatz_xattr_{}", std::process::id());
-    std::fs::write(&path, b"body").expect("seed");
-    let cpath = std::ffi::CString::new(path.clone()).expect("cstring");
+    let target = UniqueTestPath::new("xattr");
+    std::fs::write(target.as_str(), b"body").expect("seed");
+    let cpath = target.as_cstring();
     let name = c"user.ququmatz_test";
 
     let value = b"attribute-value";
@@ -1377,8 +1371,6 @@ fn a_real_setxattr_getxattr_roundtrip_on_a_regular_file() {
     #[allow(clippy::cast_sign_loss)]
     let n = cqe.result as usize;
     assert_eq!(&dest[..n], value);
-
-    let _ = std::fs::remove_file(&path);
 }
 
 #[cfg(not(miri))]
