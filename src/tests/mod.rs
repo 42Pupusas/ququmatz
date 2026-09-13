@@ -5590,3 +5590,125 @@ fn split_submit_return_value_tracks_actual_consumption_across_rounds() {
     );
     assert!(comp.complete().is_none());
 }
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_mid_batch_rejection_produces_a_genuine_short_submission() {
+    // AUDIT.md Q-07's remaining gap: every other submit-accounting test in
+    // this suite proves the bookkeeping survives round trips against a
+    // *healthy* kernel that always consumes the whole batch -- none of
+    // them force `io_uring_enter` to actually return less than requested.
+    // This one does, using the kernel's own real behavior rather than a
+    // mock: `io_submit_sqes` stops pulling further SQEs the moment one
+    // entry fails to init (here, an unrecognized opcode -> EINVAL) unless
+    // the ring was built with `SUBMIT_ALL` -- confirmed against
+    // `io_uring/io_uring.c`'s `io_submit_sqes`, which does `left--; break;`
+    // on that condition and returns `entries - left`, leaving the SQEs
+    // after the failure point untouched in the ring (not read, not
+    // consumed, not reflected in `cached_sq_head`).
+    //
+    // Opcode 250 is used because it is far past `IORING_OP_LAST` on any
+    // kernel this crate targets (the highest currently defined opcode is
+    // in the 60s), so `io_init_req` rejects it before it can be confused
+    // with a real, newer operation this crate simply doesn't name yet.
+    let mut ring = IoUring::new(8).expect("setup");
+
+    let mut invalid: IoUringSqe = unsafe { mem::zeroed() };
+    invalid.opcode = 250;
+    invalid.user_data = 2;
+    let invalid_sqe = unsafe { Sqe::from_raw(invalid) };
+
+    ring.push_nop(1).expect("push nop 1");
+    ring.push(invalid_sqe).expect("push invalid opcode sqe");
+    ring.push_nop(3).expect("push nop 3");
+    ring.push_nop(4).expect("push nop 4");
+
+    let submitted = ring.submit().expect("submit");
+    assert!(
+        submitted < 4,
+        "a mid-batch rejection without SUBMIT_ALL must short-submit; got {submitted}"
+    );
+
+    // Only the entries up to and including the failing one were pulled
+    // from the ring; nop(3) and nop(4) were never read by the kernel and
+    // so cannot have completions yet.
+    let mut seen: Vec<(u64, i32)> = core::iter::from_fn(|| {
+        ring.complete().map(|c| (c.user_data, c.result))
+    })
+    .collect();
+    seen.sort_unstable_by_key(|&(ud, _)| ud);
+
+    assert_eq!(
+        seen.iter().map(|&(ud, _)| ud).collect::<Vec<_>>(),
+        vec![1, 2],
+        "only the entries the kernel actually pulled should have completions yet"
+    );
+    assert_eq!(seen[0], (1, 0), "the nop before the failure must succeed normally");
+    assert!(
+        seen[1].1 < 0,
+        "the unrecognized opcode must fail rather than silently succeed, got {}",
+        seen[1].1
+    );
+
+    // The crate's own accounting must have retained nop(3)/nop(4) as
+    // still-queued rather than assuming the whole batch went out with the
+    // first enter() call -- a later submit() must pick them up and they
+    // must complete normally, proving nothing was lost from tracking.
+    let remaining = ring.submit_and_wait(2).expect("submit remaining");
+    assert_eq!(remaining, 2, "the leftover entries must go out in the next submit");
+
+    let mut tail: Vec<(u64, i32)> = core::iter::from_fn(|| {
+        ring.complete().map(|c| (c.user_data, c.result))
+    })
+    .collect();
+    tail.sort_unstable_by_key(|&(ud, _)| ud);
+    assert_eq!(tail, vec![(3, 0), (4, 0)]);
+
+    assert!(ring.complete().is_none());
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_split_mid_batch_rejection_produces_a_genuine_short_submission() {
+    // Split-ring counterpart: `Submitter::submit` runs a separate copy of
+    // the same accounting logic, so this closes the same AUDIT.md Q-07
+    // gap for the `Submitter`/`Completer` halves specifically -- a fix
+    // applied only to the unsplit `IoUring` path would leave this one
+    // unrepaired. See the unsplit version above for why opcode 250 and
+    // the exact kernel behavior it triggers are the right fault to inject.
+    let ring = IoUring::new(8).expect("setup");
+    let (mut sub, mut comp) = ring.split().unwrap_or_else(|(_, e)| panic!("split: {e}"));
+
+    let mut invalid: IoUringSqe = unsafe { mem::zeroed() };
+    invalid.opcode = 250;
+    invalid.user_data = 2;
+    let invalid_sqe = unsafe { Sqe::from_raw(invalid) };
+
+    sub.push_nop(1).expect("push nop 1");
+    sub.push(invalid_sqe).expect("push invalid opcode sqe");
+    sub.push_nop(3).expect("push nop 3");
+    sub.push_nop(4).expect("push nop 4");
+
+    let submitted = sub.submit().expect("submit");
+    assert!(
+        submitted < 4,
+        "a mid-batch rejection without SUBMIT_ALL must short-submit; got {submitted}"
+    );
+    comp.sync_cq();
+
+    let mut seen: Vec<(u64, i32)> =
+        core::iter::from_fn(|| comp.complete().map(|c| (c.user_data, c.result))).collect();
+    seen.sort_unstable_by_key(|&(ud, _)| ud);
+    assert_eq!(seen.iter().map(|&(ud, _)| ud).collect::<Vec<_>>(), vec![1, 2]);
+    assert_eq!(seen[0], (1, 0));
+    assert!(seen[1].1 < 0);
+
+    let remaining = sub.submit_and_wait(2).expect("submit remaining");
+    assert_eq!(remaining, 2);
+
+    let mut tail: Vec<(u64, i32)> =
+        core::iter::from_fn(|| comp.complete().map(|c| (c.user_data, c.result))).collect();
+    tail.sort_unstable_by_key(|&(ud, _)| ud);
+    assert_eq!(tail, vec![(3, 0), (4, 0)]);
+    assert!(comp.complete().is_none());
+}
