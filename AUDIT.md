@@ -812,16 +812,31 @@ this crate exposes that takes a pointer into caller memory: read/write,
 vectored I/O, zero-copy send, `sendmsg`, `recvmsg`, multishot recv and
 accept, `openat`, `openat2`, direct open, direct accept, direct socket,
 `statx`, `renameat`, `unlinkat`, `mkdirat`, `timeout`, `files_update`,
-`epoll_ctl`, and `bind`. The `unsafe` `Sqe` surface remains for
-lock-free users and for the pointer-free operations (`nop`, `cancel`,
-`poll_add`, `timeout_remove`, `listen`), which own nothing and so have
-nothing to model.
+`epoll_ctl`, `bind`, and `connect`. The `unsafe` `Sqe` surface remains
+for lock-free users and for the pointer-free operations (`nop`,
+`cancel`, `poll_add`, `timeout_remove`, `listen`), which own nothing and
+so have nothing to model.
 
-`connect` is the one pointer-bearing operation still reachable only
-through the raw surface. It takes a caller `sockaddr` on exactly the
-terms `bind` does, so the wrapper would be `PreparedBind` with a
-different opcode and a different outcome enum; it is listed here as a
-known gap rather than a decision.
+`connect` was the last pointer-bearing operation reachable only through
+the raw surface, and that gap is now closed too: `PreparedConnect` /
+`PendingConnect` / `ConnectDone` in `src/owned/connect.rs` share the
+generic `staged_addr` machinery `bind` built for the same reason (the
+kernel reads the address inside `io_uring_enter`, and SQPOLL means no
+call's return proves that read has happened, so the storage is owned
+until completion), and supply only the SQE builder and outcome table
+that tell a `connect` apart from a `bind` -- `ConnectionRefused`,
+`AlreadyConnected`, `TimedOut`, and `NetworkUnreachable` as named
+variants rather than raw errnos, with `EINPROGRESS` deliberately absent
+because `io_uring` resolves the handshake internally before posting the
+CQE. Backed by real-kernel tests (a listener actually reached, a second
+connect on the same socket told apart from a refused one, a
+non-blocking socket still reporting a resolved connect) and four Miri
+tests covering the address surviving a move between owners, the kernel
+reading it from owned storage, reclaiming it unpublished, and
+abandonment leaking rather than freeing it.
+`tests/ui/an_in_flight_connect_addr_is_unreachable.rs` and
+`tests/ui/a_connect_ticket_must_be_kept.rs` pin the same compile-fail
+guarantees `bind` has.
 
 Two things are deliberately still raw because they need more than a
 request type. Multishot `recvmsg` prepends an `io_uring_recvmsg_out` to
@@ -835,6 +850,25 @@ anything here.
 
 Neither direct accept nor direct socket has Miri coverage: neither owns
 userspace storage, so there is no pointer lifetime to model.
+
+**Status update: the safe owned layer now covers every pointer-bearing
+operation this crate exposes except the two named above, which need a
+request-pair shape this design does not have.** The original finding's
+literal claim -- that a safe constructor call, with no `unsafe` token
+anywhere at the call site, could retain a pointer past the borrow that
+produced it -- no longer holds anywhere in the owned surface: every
+pointer-taking operation now goes through an owned ticket that holds its
+storage rather than borrowing it, is unreachable and unextractable while
+in flight (pinned by `trybuild` compile-fail fixtures per operation
+family), and is `Send` rather than needing a scoped join. The raw `Sqe`
+surface documented in the original evidence below is unchanged and still
+requires `unsafe` at every pointer-bearing constructor (Phase 0
+containment, described above); using it correctly is still the caller's
+responsibility, which is why it remains `unsafe fn` rather than being
+removed. What remains genuinely open: multishot `recvmsg` and linked
+timeouts have no owned wrapper (documented above, not merely deferred),
+and Q-09's non-x86_64 real-hardware gap applies to every owned
+real-kernel test here the same as everywhere else in the crate.
 
 **Status (original): confirmed.**
 
