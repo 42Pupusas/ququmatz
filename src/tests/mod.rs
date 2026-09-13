@@ -1264,6 +1264,8 @@ fn a_real_symlinkat_creates_a_link_pointing_at_the_literal_text() {
 #[cfg(not(miri))]
 #[test]
 fn a_real_linkat_shares_the_source_inode() {
+    use std::os::unix::fs::MetadataExt;
+
     let mut ring = IoUring::new(4).expect("setup");
     let source = UniqueTestPath::new("linkat_src");
     let dest = UniqueTestPath::new("linkat_dst");
@@ -1288,7 +1290,6 @@ fn a_real_linkat_shares_the_source_inode() {
     let cqe = ring.complete().expect("linkat cqe");
     assert_eq!(cqe.result, 0, "linkat failed: {}", cqe.result);
 
-    use std::os::unix::fs::MetadataExt;
     let a = std::fs::metadata(source.as_str()).expect("metadata");
     let b = std::fs::metadata(dest.as_str()).expect("metadata");
     assert_eq!(a.ino(), b.ino());
@@ -1849,10 +1850,11 @@ fn registered_files() {
 #[cfg(not(miri))]
 #[test]
 fn a_real_tagged_file_table_posts_a_death_cqe_once_unregistered() {
+    const DEATH_TAG: u64 = 0xdead_beef;
+
     let mut ring = IoUring::new(4).expect("setup");
     let fd = open_tmpfile(&mut ring);
 
-    const DEATH_TAG: u64 = 0xdead_beef;
     ring.register_files_tagged(&[fd], &[DEATH_TAG])
         .expect("register_files_tagged");
 
@@ -1884,11 +1886,12 @@ fn a_real_tagged_file_table_posts_a_death_cqe_once_unregistered() {
 #[cfg(not(miri))]
 #[test]
 fn a_real_tagged_file_update_posts_a_death_cqe_for_the_slot_it_replaces() {
+    const REPLACED_TAG: u64 = 0xfeed_face;
+
     let mut ring = IoUring::new(4).expect("setup");
     let fd_a = open_tmpfile(&mut ring);
     let fd_b = open_tmpfile(&mut ring);
 
-    const REPLACED_TAG: u64 = 0xfeed_face;
     ring.register_files_tagged(&[fd_a], &[0])
         .expect("register_files_tagged");
 
@@ -1920,11 +1923,12 @@ fn a_real_tagged_file_update_posts_a_death_cqe_for_the_slot_it_replaces() {
 #[cfg(not(miri))]
 #[test]
 fn a_real_tagged_buffer_table_posts_a_death_cqe_once_unregistered() {
+    const DEATH_TAG: u64 = 0x00c0_ffee;
+
     let mut ring = IoUring::new(4).expect("setup");
     let mut buf = vec![0u8; 64];
     let iov = [unsafe { IoVec::new(buf.as_mut_ptr(), buf.len()) }];
 
-    const DEATH_TAG: u64 = 0xc0ffee;
     ring.register_buffers_tagged(&iov, &[DEATH_TAG])
         .expect("register_buffers_tagged");
 
@@ -2304,32 +2308,7 @@ fn provided_buffer_ring_claim_reads_and_recycles_exactly_once() {
         .register_provided_buffers(5, 1, 64)
         .expect("register_provided_buffers");
 
-    ring.push(Sqe::accept(RawFd::from_raw(listener as usize), AcceptFlags::default()).user_data(1))
-        .expect("push accept");
-    let connect_addr = SockAddrIn {
-        sin_family: types::AF_INET as u16,
-        sin_port: port.to_be(),
-        sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
-        sin_zero: [0; 8],
-    };
-    let addr_bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(
-            (&raw const connect_addr).cast(),
-            core::mem::size_of::<SockAddrIn>(),
-        )
-    };
-    ring.push(unsafe { Sqe::connect(RawFd::from_raw(client as usize), addr_bytes) }.user_data(2))
-        .expect("push connect");
-    ring.submit_and_wait(2).expect("submit");
-
-    let mut server_fd = -1i32;
-    for _ in 0..2 {
-        let cqe = ring.complete().expect("cqe");
-        if cqe.user_data == 1 {
-            server_fd = cqe.result;
-        }
-    }
-    assert!(server_fd >= 0);
+    let server_fd = tcp_handshake(&mut ring, listener, client, port);
 
     let recv_one = |ring: &mut IoUring, tag: u64| {
         let recv_sqe = unsafe {
@@ -2554,32 +2533,7 @@ fn a_real_acknowledge_round_trip_reads_and_recycles_through_the_ledger() {
         .register_provided_buffers(6, 1, 64)
         .expect("register_provided_buffers");
 
-    ring.push(Sqe::accept(RawFd::from_raw(listener as usize), AcceptFlags::default()).user_data(1))
-        .expect("push accept");
-    let connect_addr = SockAddrIn {
-        sin_family: types::AF_INET as u16,
-        sin_port: port.to_be(),
-        sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
-        sin_zero: [0; 8],
-    };
-    let addr_bytes: &[u8] = unsafe {
-        core::slice::from_raw_parts(
-            (&raw const connect_addr).cast(),
-            core::mem::size_of::<SockAddrIn>(),
-        )
-    };
-    ring.push(unsafe { Sqe::connect(RawFd::from_raw(client as usize), addr_bytes) }.user_data(2))
-        .expect("push connect");
-    ring.submit_and_wait(2).expect("submit");
-
-    let mut server_fd = -1i32;
-    for _ in 0..2 {
-        let cqe = ring.complete().expect("cqe");
-        if cqe.user_data == 1 {
-            server_fd = cqe.result;
-        }
-    }
-    assert!(server_fd >= 0);
+    let server_fd = tcp_handshake(&mut ring, listener, client, port);
 
     let recv_one = |ring: &mut IoUring, tag: u64| {
         let recv_sqe = unsafe {
@@ -3061,16 +3015,20 @@ fn a_real_pbuf_status_reports_the_head_the_kernel_advances() {
     ring.push(recv_sqe).expect("push recv");
     ring.submit_and_wait(2).expect("submit send+recv");
 
-    let mut recv_result = None;
+    let mut recv_completion = None;
     for _ in 0..2 {
         let cqe = ring.complete().expect("cqe");
         if cqe.user_data == 3 {
-            recv_result = Some(cqe);
+            recv_completion = Some(cqe);
         }
     }
-    let recv_cqe = recv_result.expect("recv completion");
-    assert!(recv_cqe.result >= 0, "recv failed: {}", recv_cqe.result);
-    let buf_id = recv_cqe.buffer_id().expect("buffer_id present");
+    let recv_completion = recv_completion.expect("recv completion");
+    assert!(
+        recv_completion.result >= 0,
+        "recv failed: {}",
+        recv_completion.result
+    );
+    let buf_id = recv_completion.buffer_id().expect("buffer_id present");
 
     // Consumed but not yet recycled: the kernel's head has advanced past
     // the buffer it handed out.
@@ -5053,10 +5011,7 @@ fn a_real_read_multishot_delivers_two_writes_from_one_armed_request() {
 
     let mut arrivals: Vec<Vec<u8>> = Vec::new();
     let mut saw_more = false;
-    loop {
-        let Some(cqe) = ring.complete() else {
-            break;
-        };
+    while let Some(cqe) = ring.complete() {
         if cqe.user_data == 2 {
             assert_eq!(cqe.result, first.len() as i32);
             continue;
@@ -5082,10 +5037,7 @@ fn a_real_read_multishot_delivers_two_writes_from_one_armed_request() {
         .expect("push write 2");
     ring.submit_and_wait(1).expect("submit write 2");
 
-    loop {
-        let Some(cqe) = ring.complete() else {
-            break;
-        };
+    while let Some(cqe) = ring.complete() {
         if cqe.user_data == 3 {
             assert_eq!(cqe.result, second.len() as i32);
             continue;
@@ -5135,7 +5087,7 @@ fn a_real_epoll_wait_reports_a_pipe_becoming_readable() {
 
     let watch = EpollEvent {
         events: EpollEvents::IN.bits(),
-        data: 0xC0FF_EE,
+        data: 0x00C0_FFEE,
     };
     ring.push(
         unsafe {
@@ -5183,7 +5135,7 @@ fn a_real_epoll_wait_reports_a_pipe_becoming_readable() {
     assert_eq!(n, 1, "exactly one fd became readable");
     let reported = wait_events[0];
     let (events, data) = (reported.events, reported.data);
-    assert_eq!(data, 0xC0FF_EE);
+    assert_eq!(data, 0x00C0_FFEE);
     assert_ne!(events & EpollEvents::IN.bits(), 0);
 
     let _ = syscall::close(RawFd::from_raw(read_end as usize));
@@ -5603,19 +5555,16 @@ fn a_real_napi_registration_reports_dynamic_tracking_and_can_be_undone() {
     use crate::types::NapiTrackingStrategy;
 
     let mut ring = IoUring::new(4).expect("setup");
-    match ring.register_napi(1000, false, NapiTrackingStrategy::Dynamic) {
-        Ok(before) => {
-            // Freshly created ring: no NAPI tracking was configured yet.
-            assert_eq!(before.busy_poll_timeout_usec, 0);
-            let after = ring.unregister_napi().expect("unregister_napi");
-            // Reports what was in effect just before unregistering, i.e.
-            // what register_napi just set.
-            assert_eq!(after.busy_poll_timeout_usec, 1000);
-        }
-        // Kernels built without CONFIG_NET_RX_BUSY_POLL reject this
-        // opcode outright; that is a valid environment for this crate to
-        // run in, not a bug to chase.
-        Err(_) => {}
+    // Kernels built without CONFIG_NET_RX_BUSY_POLL reject this opcode
+    // outright; that is a valid environment for this crate to run in, not
+    // a bug to chase, so only the success path is asserted on.
+    if let Ok(before) = ring.register_napi(1000, false, NapiTrackingStrategy::Dynamic) {
+        // Freshly created ring: no NAPI tracking was configured yet.
+        assert_eq!(before.busy_poll_timeout_usec, 0);
+        let after = ring.unregister_napi().expect("unregister_napi");
+        // Reports what was in effect just before unregistering, i.e.
+        // what register_napi just set.
+        assert_eq!(after.busy_poll_timeout_usec, 1000);
     }
 }
 

@@ -1445,6 +1445,14 @@ impl IoUring {
     /// if the ring's setup flags restrict submission or completion to the
     /// creating thread — see [`can_split`](Self::can_split) for exactly
     /// which combinations that covers.
+    // `Self` genuinely is this large -- it holds every SQ/CQ pointer plus
+    // setup state, since `split` hands both halves their own copies rather
+    // than sharing a smaller indirection. The crate is `no_std` and
+    // allocator-free (see `src/owned/buffer.rs`), so `Box`ing the failure
+    // path is not an available fix; returning `self` by value on the one
+    // rejection path (`can_split() == false`, checked once up front) is an
+    // intentional tradeoff over unconditionally boxing every `IoUring`.
+    #[allow(clippy::result_large_err)]
     pub fn split(self) -> Result<(Submitter, Completer), (Self, Error)> {
         if Self::setup_flags_forbid_split(self.setup_flags) {
             let err =

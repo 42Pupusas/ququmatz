@@ -1197,6 +1197,11 @@ impl IoUring {
     ///
     /// Fails for the same thread-affinity reasons as
     /// [`split`](IoUring::split), returning the ring unchanged.
+    // See `IoUring::split`'s matching `#[allow]`: `Self` is large because
+    // it holds every SQ/CQ pointer, the crate has no allocator to `Box`
+    // the rejection path with, and the ring is handed back by value only
+    // on the single, checked-up-front `can_split() == false` rejection.
+    #[allow(clippy::result_large_err)]
     pub fn split_owned(self) -> Result<(OwnedSubmitter, OwnedCompleter), (Self, Error)> {
         let ring = RingId::next();
         let (submitter, completer) = self.split()?;

@@ -7537,6 +7537,8 @@ fn a_real_symlink_via_the_owned_path_creates_a_link_and_returns_both_paths() {
 #[cfg(not(miri))]
 #[test]
 fn a_real_hardlink_via_the_owned_path_shares_the_source_inode() {
+    use std::os::unix::fs::MetadataExt;
+
     let scratch = Scratch::new("owned_linkat");
     scratch.write("real_file", b"shared");
     let ring = crate::IoUring::new(4).expect("ring");
@@ -7556,7 +7558,6 @@ fn a_real_hardlink_via_the_owned_path_shares_the_source_inode() {
         .unwrap_or_else(|_| panic!("mismatch"));
 
     assert!(done.is_ok(), "linkat failed: {}", done.raw_result());
-    use std::os::unix::fs::MetadataExt;
     let a = std::fs::metadata(scratch.path("real_file")).expect("metadata");
     let b = std::fs::metadata(scratch.path("hardlink")).expect("metadata");
     assert_eq!(a.ino(), b.ino(), "hard link must share the source inode");
