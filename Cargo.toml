@@ -2,6 +2,7 @@
 name = "ququmatz"
 version = "0.15.1"
 edition = "2024"
+rust-version = "1.88"
 description = "Zero-dependency io_uring bindings via raw syscalls, no libc"
 license = "MIT"
 repository = "https://github.com/42Pupusas/ququmatz"

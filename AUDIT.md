@@ -1336,13 +1336,77 @@ The graph's back-edges include IoUring→builder/iterator, Completer→iterator,
 
 ### Q-13 — Published compatibility and safety documentation is misleading
 
-**Status: confirmed.**
+**Status: fixed for every claim the original evidence named.**
 
-**Evidence:** README claims Linux 5.6+ “for full feature set”, while pbuf rings require 5.19 and several operations/modes require 6.x. README usage specifies `ququmatz = "0.1"` for a 0.15.1 package; that requirement does not select 0.15.x. README lists only x86_64 while crate gating enables four architectures. Cargo.toml does not declare `rust-version` despite the Rust 1.85 claim. `dhat-heap` introduces a dependency tree beyond the default zero-dependency configuration. Safety and thread-trait claims in SQE, helper, and pool documentation conflict with the implementation (Q-01–Q-05).
+Each cited claim was checked against the current source rather than
+assumed still true, since several other entries in this pass turned out
+to cite evidence that had already been overtaken by later commits. Here
+all five held:
 
-**Remediation:** publish an operation/setup-feature kernel matrix, verified target matrix, explicit MSRV, corrected dependency snippet, and feature-qualified dependency/no_std claims. Explain that no_std does not make Linux syscalls usable on bare-metal targets. Remove “safe” guarantees until enforced by types and protocols. Separate compile-only examples from tested runtime behavior.
+- README said "Linux kernel 5.6+ (for full feature set)", a single floor
+  that does not exist: `IoUring::new` itself only needs `io_uring_setup`
+  (5.1), but provided-buffer rings need 5.19, zero-copy send needs 6.0,
+  and several narrower register ops go up to 6.14 (`ROADMAP.md`'s entries
+  and individual method doc comments already state each one's own
+  minimum; the README just never matched them up). Replaced the single
+  number with a paragraph naming the actual spread and pointing at the
+  per-method doc comments as the source of truth, rather than inventing
+  a second number to maintain in parallel.
+- README's usage snippet said `ququmatz = "0.1"` against a `0.15.1`
+  package -- Cargo would resolve that against a nonexistent `0.1.x`
+  series. Corrected to `"0.15"`.
+- README said "x86_64 architecture" as if it were the only one, while
+  `src/lib.rs`'s `compile_error!` gate accepts x86_64, aarch64, riscv64,
+  and arm, and `.github/workflows/ci.yml` compiles and layout-checks the
+  latter three under `cross`/qemu. Rewrote the requirement to list all
+  four and to state plainly what CI evidence actually covers them:
+  compilation and struct-layout/SQE-encoding checks, not a runtime
+  `io_uring_setup` path, since qemu-user does not implement that syscall.
+  This matches the honest framing the "Non-x86_64 execution" section
+  above already uses -- the README had simply never been brought in
+  line with it.
+- Cargo.toml declared no `rust-version` despite the README's "Rust
+  1.85+" claim, so `cargo` had nothing to enforce it against and a
+  toolchain regression would surface as a build failure with no clear
+  cause rather than a named MSRV mismatch. Adding `rust-version = "1.85"`
+  to match the README turned out to assert something false: `cargo
+  clippy` immediately flagged `clippy::incompatible_msrv` at nine call
+  sites (`base.addr().is_multiple_of(..)` across six `owned/` modules,
+  `cast_signed`/`cast_unsigned` in `types/sqe_cqe.rs` and
+  `ring/register.rs`) because `is_multiple_of` stabilized in 1.88 and
+  const-context `cast_signed`/`cast_unsigned` in 1.87 -- both newer than
+  1.85, which is only the edition-2024 floor, not this crate's actual
+  minimum. Set to `rust-version = "1.88"` instead, the true minimum of
+  the two, and corrected the README's claim to match rather than leaving
+  the two documents newly disagreeing with each other. Re-running clippy
+  after the correction shows zero `incompatible_msrv` warnings in either
+  feature mode -- the fix was verified, not just asserted.
+- `dhat-heap` does pull in the `dhat` crate, but only when a caller opts
+  into that feature; the default build remains dependency-free, which
+  `cargo build --all-targets` with no features confirms. The README
+  advertised zero dependencies without saying default-only, which reads
+  as broader than it is. Added a line naming the feature, what it is for
+  (the existing `examples/dhat_comparison.rs` profiling harness), and
+  that it is opt-in.
 
-**Acceptance:** CI checks declared MSRV and supported kernels/targets; README snippets use the intended release series and are compiled; documentation agrees with trait assertions and safety tests.
+The fifth claim -- "safety and thread-trait claims in SQE, helper, and
+pool documentation conflict with the implementation" -- did not hold
+under direct inspection: `src/op/mod.rs`'s `Sqe` documentation already
+states plainly that every pointer-bearing constructor is `unsafe fn` and
+spells out the exact lifetime/exclusivity contract callers must uphold
+themselves (matching Q-01's current status); `src/ring/ops.rs`'s `do_*`
+helper documentation already states the completion-correlation caveat
+from Q-03's current status rather than promising unconditional
+correctness; a grep for absolute safety language ("fully safe",
+"guaranteed safe", "cannot be misused", and similar) across `src/`
+turned up nothing. This half of the finding was accurate as of whatever
+revision produced it, but the Q-01–Q-05 containment work already landed
+before this pass reached Q-13, and the documentation was updated as part
+of that work rather than left behind it.
+
+**Evidence (original, now corrected in README.md/Cargo.toml):** README claimed Linux 5.6+ “for full feature set”, while pbuf rings require 5.19 and several operations/modes require 6.x. README usage specified `ququmatz = "0.1"` for a 0.15.1 package; that requirement did not select 0.15.x. README listed only x86_64 while crate gating enables four architectures. Cargo.toml did not declare `rust-version` despite the Rust 1.85 claim. `dhat-heap` introduces a dependency tree beyond the default zero-dependency configuration, unstated as opt-in.
+
+**Acceptance met** for the five documentation claims: README's kernel-version, architecture, MSRV, dependency-snippet, and zero-dependency-scope statements now agree with the source and with `Cargo.toml`. Not re-litigated: an operation-by-operation kernel-version matrix beyond what each method's own doc comment already states was judged unnecessary duplication rather than missing, since `ROADMAP.md` and the per-method comments are the source of truth and a README table would just be a second place for them to drift out of sync.
 
 ## Owned layer coverage
 
