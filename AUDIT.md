@@ -850,7 +850,36 @@ userspace storage, so there is no pointer lifetime to model.
 
 ### Q-02 — Provided-buffer references can outlive memory or alias kernel writes
 
-**Status: confirmed.**
+**Status: partially fixed (unsound lifetime-extending methods removed).**
+`ProvidedBufferRing::buffer_pinned` and `buffer_mut_pinned` (`src/ring/pbuf.rs`)
+are gone. Both took `&'borrow self`/`&'borrow mut self` but returned
+`&'ring [u8]`/`&'ring mut [u8]` under only a `'ring: 'borrow` bound --
+which a caller could satisfy by naming `'ring` as `'static`, producing a
+slice with no compiler-enforced tie to the pool's actual lifetime at all.
+No call site in this crate (including the split-threaded example and every
+test) used either method, so removing them changed no caller.
+
+[`buffer`](Self::buffer) and [`buffer_mut`](Self::buffer_mut) remain: both
+borrow the returned slice from `self` directly (`&self`/`&mut self`, no
+extra lifetime parameter), so the compiler ties the slice's lifetime to an
+actual borrow of the pool rather than to a caller-chosen annotation. That
+fixes the *outliving* half of this entry's failure scenario.
+
+What remains open, and is **not** fixed by this change: nothing tracks
+per-slot state (offered / in-flight / completed / recycled), so
+`buffer`/`buffer_mut`/`recycle` still trust the caller to pass a `buf_id`
+that a completion actually named and not to recycle a slot twice or read
+it before the kernel has written to it -- the remediation's proposed
+`CompletedBuffer` lease model (validating a completion against the
+originating pool and an outstanding operation, modeling offered /
+in-flight / completed / leased / recyclable state, rejecting duplicate
+recycles) has not been built. The `owned::multishot::Arrival` type already
+provides exactly that guarantee for the multishot-recv path specifically
+(a completion-validated, drop-recycles borrow that cannot alias or
+outlive the pool) but the plain `ProvidedBufferRing`/`BufferConsumer`
+surface used outside multishot recv still has none of it.
+
+**Status (original): confirmed.**
 
 **Evidence:** `src/ring/pbuf.rs::buffer_pinned` and `buffer_mut_pinned` return `&'ring [u8]` / `&'ring mut [u8]` from a shorter `&'borrow self`, constrained only by `'ring: 'borrow`. This does not prove the allocation lasts for `'ring`. `buffer`, `buffer_mut`, and `recycle` validate ranges but maintain no per-slot completion/ownership state. Initial registration publishes every buffer to the kernel.
 
