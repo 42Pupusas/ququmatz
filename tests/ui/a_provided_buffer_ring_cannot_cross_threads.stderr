@@ -1,4 +1,4 @@
-error[E0277]: `*mut ququmatz::ring::RingResources` cannot be sent between threads safely
+error[E0277]: `*mut ququmatz::ring::resources::RingResources` cannot be sent between threads safely
   --> tests/ui/a_provided_buffer_ring_cannot_cross_threads.rs:19:24
    |
 19 |       std::thread::spawn(move || {
@@ -9,9 +9,9 @@ error[E0277]: `*mut ququmatz::ring::RingResources` cannot be sent between thread
    | |     required by a bound introduced by this call
 20 | |         let _ = pool.bgid();
 21 | |     })
-   | |_____^ `*mut ququmatz::ring::RingResources` cannot be sent between threads safely
+   | |_____^ `*mut ququmatz::ring::resources::RingResources` cannot be sent between threads safely
    |
-   = help: within `{closure@$DIR/tests/ui/a_provided_buffer_ring_cannot_cross_threads.rs:19:24: 19:31}`, the trait `std::marker::Send` is not implemented for `*mut ququmatz::ring::RingResources`
+   = help: within `{closure@$DIR/tests/ui/a_provided_buffer_ring_cannot_cross_threads.rs:19:24: 19:31}`, the trait `std::marker::Send` is not implemented for `*mut ququmatz::ring::resources::RingResources`
 note: required because it appears within the type `ProvidedBufferRing`
   --> src/ring/pbuf.rs
    |

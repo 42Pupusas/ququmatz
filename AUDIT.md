@@ -1274,15 +1274,37 @@ full suite.
 
 ### Q-10 — Setup allocation failure leaks a separately mapped CQ
 
-**Status: confirmed conditional error-path defect.**
+**Status: fixed (984c632).** `IoUring::from_params` no longer disarms
+`SetupGuard` before `RingResources::alloc`. `SetupGuard` is now kept armed
+across that call and is disarmed only once `RingResources` has taken
+ownership; its `Drop` already tracks the CQ mapping correctly in both the
+aliased (`SINGLE_MMAP`) and separate-mapping layouts, since it is the same
+guard `map_rings` populates as it goes. The hand-rolled fallback cleanup
+this entry's original evidence pointed at — which unmapped only the SQ
+ring and SQE array, never the CQ — is gone entirely rather than patched in
+place, so there is only one unwind path to keep correct instead of two
+that could drift apart.
 
-**Evidence:** `src/ring/mod.rs::from_params` disarms `SetupGuard` before `RingResources::alloc`. If allocation fails, its manual cleanup unmaps SQEs and the SQ ring and closes the fd, but does not unmap `cq_ring_region` when SINGLE_MMAP is absent.
+This closes the entry's transactional-transfer remediation ask by
+construction: resource ownership has exactly one arm/disarm transition
+now (`SetupGuard` owns everything until `RingResources::alloc` succeeds,
+at which point ownership moves as a single unit), rather than the guard
+being disarmed early and a second manual cleanup trying to reconstruct
+its bookkeeping.
 
-**Impact:** a CQ mapping leaks in that fallback layout under allocation failure. The path is less relevant to the README's modern kernel baseline, where SINGLE_MMAP is generally available, but the implemented fallback is still incorrect.
+**Evidence (original, now stale):** `src/ring/mod.rs::from_params` disarmed `SetupGuard` before `RingResources::alloc`. If allocation failed, its manual cleanup unmapped SQEs and the SQ ring and closed the fd, but did not unmap `cq_ring_region` when SINGLE_MMAP was absent.
 
-**Remediation:** transfer resources transactionally; keep cleanup ownership armed until the shared owner is successfully installed. Give mapped regions their own RAII owner in a dedicated module and eliminate duplicate manual unwind code.
-
-**Acceptance:** inject failure at every allocation/map stage in single- and dual-mapping layouts; assert each successfully acquired fd/mapping is released exactly once.
+**Acceptance status:** the leak itself is closed by construction (there is
+no longer a code path that owns the CQ mapping without a guard tracking
+it), verified by the full suite (154 tests at the time of the fix, now
+581) passing in both feature modes plus clippy and fmt clean. What the
+original acceptance criterion asked for and this fix does not supply is
+deterministic failure *injection* at each allocation/map stage — that
+still needs the backend-trait syscall-mocking infrastructure Phase 1
+calls for, since none of `mmap`/`io_uring_setup`/the anonymous-page
+`mmap` in `RingResources::alloc` can be made to fail on demand against a
+real kernel. Recorded as a Phase 1 follow-up, not as still-open work on
+this specific leak.
 
 ### Q-11 — Integration test uses a predictable truncating `/tmp` path
 
@@ -1324,15 +1346,21 @@ test already passes should refuse it, but no test plants one to confirm).
 
 ### Q-12 — Safety-critical responsibilities remain coupled and duplicated
 
-**Status: confirmed structural finding; graph output is a diagnostic, not proof of a runtime cycle.**
+**Status: confirmed structural finding; first extraction done, the rest still open.**
 
-**Evidence:** `src/ring/mod.rs` is 1297 lines and combines shared resource ownership, mapped regions, partial setup, SQ/CQ parsing, submission, completion, splitting, and iterators. `src/ring/pbuf.rs` is 756 lines and combines allocation/registration, producer protocol, consumer wrappers, raw slicing, and tests. `src/tests/mod.rs` is 2590 lines. Split and unsplit submission logic is duplicated and already differs in CQ synchronization/backpressure handling. Free functions remain in syscall, ring mapping/parsing, and pbuf logic.
+**Evidence (original):** `src/ring/mod.rs` was 1297 lines (now 1372, after the doc-comment additions from Q-01/Q-03/Q-08 and the `do_tag_next` field Q-03 added -- it grew before this pass could shrink it) and combined shared resource ownership, mapped regions, partial setup, SQ/CQ parsing, submission, completion, splitting, and iterators. `src/ring/pbuf.rs` is 756 lines and combines allocation/registration, producer protocol, consumer wrappers, raw slicing, and tests. `src/tests/mod.rs` is 2590 lines. Split and unsplit submission logic is duplicated and already differs in CQ synchronization/backpressure handling. Free functions remain in syscall, ring mapping/parsing, and pbuf logic.
 
 The graph's back-edges include IoUring→builder/iterator, Completer→iterator, ProvidedBufferRing→consumer, RecvmsgOut→parts, and Error→Completion. Factory/iterator relationships and documentation-derived references may explain some of these; do not introduce meaningless wrappers solely to make the report green.
 
-**Remediation:** after safety containment, extract one cohesive owner at a time into its own file: `MappedRegion`, shared ring resources, `RingLayout`, `SubmissionQueue`, `CompletionQueue`, buffer registration, buffer leases, and completion dispatch. Put raw syscall operations on backend structs/trait impls. Split test fixtures and test domains into separate files. Keep `IoUring` as orchestration rather than a second implementation of each protocol. Preserve safety contracts in API documentation; avoid explanatory implementation prose where better names/types suffice.
+**First extraction done.** `MappedRegion`, `SetupGuard`, and `RingResources` -- the remediation's own first-named target -- moved out of `src/ring/mod.rs` into a new `src/ring/resources.rs`, unchanged in behavior. This is exactly the "shared ring resources" extraction the remediation calls for: setup-time cleanup (`SetupGuard`, used only inside `from_params` while a ring is partially constructed) and steady-state shared ownership (`RingResources`, refcounted across `Submitter`/`Completer`/`ProvidedBufferRing`) are a cohesive pair with one theme -- who is responsible for unmapping which region and closing the fd, and when -- and now live together in one file with that theme stated in the module doc comment, separate from `mod.rs`'s SQ/CQ parsing, submission, completion, and split logic.
 
-**Acceptance:** after each extraction, build/test/Clippy in both feature modes, build the entire workspace, and rerun the graph report. Record which edges are genuine dependencies versus tool inference and avoid worsening the baseline without an explicit reason.
+One fixture needed updating as a direct consequence: `tests/ui/a_provided_buffer_ring_cannot_cross_threads.stderr` pinned the compiler's exact error text, which names `RingResources`' full path (`ququmatz::ring::RingResources` before the move, `ququmatz::ring::resources::RingResources` after) -- expected, since the type is now `pub(super)` in a different private module, and confirmation that the trybuild fixture is checking the compiler's actual output rather than a loose pattern.
+
+**Still open, in the order the remediation lists them:** `RingLayout` (the SQ/CQ offset and stride computation currently inline in `map_rings`/`parse_sq`/`parse_cq`), `SubmissionQueue`/`CompletionQueue` (the push/submit/complete/wait logic, currently duplicated between the unsplit `IoUring` and the split `Submitter`/`Completer` rather than sharing one implementation), buffer registration and buffer leases (`src/ring/pbuf.rs`'s 756 lines, still combining allocation, producer protocol, consumer wrappers, and raw slicing), and completion dispatch. `src/tests/mod.rs` at 2590 lines is also unsplit. None of these were touched in this pass -- extracting one cohesive owner at a time, verified at each step, is the discipline the remediation asks for, and `resources.rs` is step one of several rather than the whole job.
+
+**Remediation (original):** after safety containment, extract one cohesive owner at a time into its own file: `MappedRegion`, shared ring resources, `RingLayout`, `SubmissionQueue`, `CompletionQueue`, buffer registration, buffer leases, and completion dispatch. Put raw syscall operations on backend structs/trait impls. Split test fixtures and test domains into separate files. Keep `IoUring` as orchestration rather than a second implementation of each protocol. Preserve safety contracts in API documentation; avoid explanatory implementation prose where better names/types suffice.
+
+**Acceptance (partially met):** the `resources.rs` extraction was verified per the checklist this entry asks for -- full test suite (581 unit tests, 23 compile-fail fixtures, 5 doctests) passing in both `--all-features` and `--no-default-features`, clippy `-D warnings --all-targets` clean in default/no-default/all-features, `cargo build --workspace --all-targets` clean in both feature modes, before moving on. The remaining extractions (`RingLayout`, `SubmissionQueue`/`CompletionQueue`, pbuf's internal split, completion dispatch, and the test-file split) are unstarted, and the graph report has not been rerun against this one extraction to see whether it moved the back-edge/skip-edge baseline named in the original evidence.
 
 ### Q-13 — Published compatibility and safety documentation is misleading
 
