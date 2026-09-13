@@ -12,6 +12,14 @@ use crate::types::{
 /// a power of two up to 32768 (2^15) entries.
 const MAX_PBUF_RING_ENTRIES: u32 = 1 << 15;
 
+/// Bytes needed for one ledger bit per possible `buf_id`, at the kernel's
+/// own maximum ring size. Fixed rather than sized to each pool's actual
+/// `entries` so `acknowledge`'s ledger needs no extra mmap, no extra
+/// `Drop` cleanup, and no extra constructor failure path -- it is 4 KiB
+/// of plain memory embedded in the struct, the same way `tail_local` is
+/// a plain field rather than its own allocation.
+const LEDGER_BYTES: usize = (MAX_PBUF_RING_ENTRIES as usize) / 8;
+
 /// Compute `count * elem_size` as a `usize`, rejecting overflow rather than
 /// wrapping.
 ///
@@ -158,6 +166,7 @@ fn register_provided_buffers_on(
         bufs_bytes,
         buf_size,
         tail_local: 0,
+        delivered: [0; LEDGER_BYTES],
     };
 
     // Pre-populate the ring with all `count` buffers.
@@ -373,6 +382,20 @@ pub struct ProvidedBufferRing {
     /// Cached next producer position; published to the ring's `tail`
     /// slot on [`commit`](Self::commit).
     tail_local: u32,
+    /// Per-`buf_id` ledger bit backing [`acknowledge`](Self::acknowledge):
+    /// set when a real completion's delivery has been acknowledged and not
+    /// yet recycled, cleared by [`recycle`](Self::recycle)/[`recycle_and_commit`](Self::recycle_and_commit).
+    /// Unlike [`CompletedBuffer`], this state does not depend on a borrow
+    /// staying alive -- it persists across a `mem::forget`'d
+    /// `AcknowledgedBuffer` exactly as it persists across an ordinary one,
+    /// so `recycle` can reject a double-recycle regardless of how the
+    /// caller got there. Ids never explicitly acknowledged read as clear,
+    /// which is what keeps every pre-existing `buffer`/`buffer_mut`/`claim`/
+    /// `recycle` call site working unchanged -- the ledger only rejects a
+    /// `recycle` for an id `acknowledge` marked and nothing has since
+    /// cleared, it never rejects a `recycle` the ledger simply has no
+    /// opinion about.
+    delivered: [u8; LEDGER_BYTES],
 }
 
 impl ProvidedBufferRing {
@@ -561,6 +584,124 @@ impl ProvidedBufferRing {
         })
     }
 
+    /// Record that a real completion delivered `buf_id`, and return a
+    /// token that is the only way to recycle it back through this method
+    /// pair.
+    ///
+    /// [`claim`](Self::claim)'s [`CompletedBuffer`] rules out double-recycle
+    /// only for as long as its borrow is alive: `mem::forget`ing one skips
+    /// the recycle silently (a leak, the documented degrade-safely
+    /// behavior every lease in this crate shares), and any call site that
+    /// has not adopted `claim` falls straight back to the fully
+    /// trust-based `recycle`, which has no memory of which ids a
+    /// completion actually named at all. `acknowledge` closes the gap a
+    /// borrow cannot: the ledger bit it sets is a plain field on the pool,
+    /// not tied to any borrow's lifetime, so it survives a forgotten
+    /// token exactly as it survives a dropped one.
+    ///
+    /// Call this once per real delivery -- the CQE `result` as `len`, same
+    /// bounds as [`buffer`](Self::buffer) -- and recycle the id only
+    /// through [`recycle_acknowledged`](Self::recycle_acknowledged), passing
+    /// the returned [`AcknowledgedBuffer`] back by value. A second
+    /// `acknowledge` of the same id before that recycle happens is
+    /// rejected: the ledger bit is already set, so there is no way to mint
+    /// a second token for a delivery this pool believes is still
+    /// outstanding, which is exactly the shape of bug this exists to catch.
+    ///
+    /// This is opt-in on purpose. An id this method is never called for is
+    /// one the ledger has no opinion about, so every existing
+    /// `buffer`/`buffer_mut`/`claim`/`recycle` call site -- including the
+    /// common "recv into a buffer I don't need to read, recycle straight
+    /// from the CQE's `buffer_id()`" pattern -- keeps working unchanged.
+    /// `recycle` itself does not consult the ledger at all: mixing
+    /// `acknowledge` with the raw `recycle` on the same id (rather than
+    /// routing through `recycle_acknowledged`) leaves that id's bit stuck
+    /// set, which makes every later `acknowledge` of that id fail loudly
+    /// rather than silently permitting a double-recycle -- a caller who
+    /// mixes the two APIs gets a stuck slot they can diagnose, not silent
+    /// corruption.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcknowledgeError::OutOfRange`] if `buf_id`/`len` are out
+    /// of range (mirrors [`claim`](Self::claim)'s bounds), or
+    /// [`AcknowledgeError::AlreadyAcknowledged`] if `buf_id` was already
+    /// acknowledged and no [`recycle_acknowledged`](Self::recycle_acknowledged)
+    /// has cleared it since.
+    pub fn acknowledge(
+        &mut self,
+        buf_id: u16,
+        len: u32,
+    ) -> Result<AcknowledgedBuffer, AcknowledgeError> {
+        if u32::from(buf_id) >= self.entries || len > self.buf_size {
+            return Err(AcknowledgeError::OutOfRange { buf_id, len });
+        }
+        if self.ledger_get(buf_id) {
+            return Err(AcknowledgeError::AlreadyAcknowledged { buf_id });
+        }
+        self.ledger_set(buf_id, true);
+        Ok(AcknowledgedBuffer { buf_id, len })
+    }
+
+    /// Read the ledger bit for `buf_id`.
+    ///
+    /// `buf_id` is always in `0..MAX_PBUF_RING_ENTRIES` by construction --
+    /// every caller has already passed it through the same `entries`
+    /// bounds check `acknowledge` itself enforces, and `entries` is capped
+    /// at `MAX_PBUF_RING_ENTRIES` at registration -- so the index below
+    /// never reaches past `delivered`.
+    const fn ledger_get(&self, buf_id: u16) -> bool {
+        let byte = (buf_id as usize) / 8;
+        let bit = (buf_id as usize) % 8;
+        self.delivered[byte] & (1 << bit) != 0
+    }
+
+    /// Set or clear the ledger bit for `buf_id`. See [`ledger_get`](Self::ledger_get).
+    const fn ledger_set(&mut self, buf_id: u16, value: bool) {
+        let byte = (buf_id as usize) / 8;
+        let bit = (buf_id as usize) % 8;
+        if value {
+            self.delivered[byte] |= 1 << bit;
+        } else {
+            self.delivered[byte] &= !(1 << bit);
+        }
+    }
+
+    /// Read the bytes an [`acknowledge`](Self::acknowledge)d delivery
+    /// carries, without recycling it yet.
+    ///
+    /// Same bounds as [`buffer`](Self::buffer); cannot fail, since `token`
+    /// can only exist for an id and length `acknowledge` already validated.
+    #[must_use]
+    pub fn acknowledged_bytes(&self, token: &AcknowledgedBuffer) -> &[u8] {
+        self.buffer(token.buf_id, token.len).unwrap_or(&[])
+    }
+
+    /// Recycle an [`acknowledge`](Self::acknowledge)d delivery, consuming
+    /// its token and clearing the ledger bit so the same id can be
+    /// acknowledged again for its next real delivery.
+    ///
+    /// Takes `token` by value rather than a bare `buf_id`: there is no
+    /// `AcknowledgedBuffer` left afterward to pass to a second call, which
+    /// is what rules out recycling the same acknowledged delivery twice
+    /// through this path -- the same reasoning
+    /// [`CompletedBuffer::recycle_and_commit`](CompletedBuffer::recycle_and_commit)
+    /// uses, applied to a token that does not need a live borrow to stay
+    /// valid. Takes the token itself rather than a `&AcknowledgedBuffer`:
+    /// the value is a spent one-time permission, not data to read, so
+    /// nothing calls it by reference.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn recycle_acknowledged(&mut self, token: AcknowledgedBuffer) {
+        self.ledger_set(token.buf_id, false);
+        self.recycle(token.buf_id);
+    }
+
+    /// Recycle an acknowledged delivery and immediately publish the tail.
+    pub fn recycle_acknowledged_and_commit(&mut self, token: AcknowledgedBuffer) {
+        self.recycle_acknowledged(token);
+        self.commit();
+    }
+
     /// Return a buffer to the pool so the kernel can reuse it.
     ///
     /// Call this after you've consumed the bytes the kernel wrote into
@@ -568,10 +709,12 @@ impl ProvidedBufferRing {
     /// appends to the producer ring and, on [`commit`](Self::commit),
     /// publishes the tail with a Release store.
     ///
-    /// Prefer [`claim`](Self::claim) over calling this directly: this
-    /// method trusts the caller not to recycle the same `buf_id` twice,
-    /// which [`claim`](Self::claim)'s returned [`CompletedBuffer`] instead
-    /// makes a borrow-checker error.
+    /// Prefer [`claim`](Self::claim) (or, for a lease that survives being
+    /// forgotten, [`acknowledge`](Self::acknowledge)) over calling this
+    /// directly: this method trusts the caller not to recycle the same
+    /// `buf_id` twice and does not consult the acknowledgment ledger at
+    /// all, so it recycles an id exactly as it always has whether or not
+    /// that id was ever acknowledged.
     ///
     /// # Panics
     ///
@@ -720,6 +863,95 @@ impl Drop for CompletedBuffer<'_> {
         self.pool.recycle_and_commit(self.buf_id);
     }
 }
+
+/// A `buf_id` [`ProvidedBufferRing::acknowledge`] has recorded as
+/// currently outstanding, but not yet recycled.
+///
+/// Unlike [`CompletedBuffer`], this carries no borrow of the pool -- its
+/// validity comes from the pool's own ledger bit, a plain field that
+/// exists independent of this value's lifetime, not from a live
+/// `&mut ProvidedBufferRing`. That is what lets it survive `mem::forget`:
+/// forgetting a `CompletedBuffer` silently loses the pool's only memory
+/// that a recycle is owed, since nothing else records it, while
+/// forgetting an `AcknowledgedBuffer` leaves the ledger bit set exactly
+/// as it would have been with the token still in hand -- the pool still
+/// knows this id is outstanding, and a second
+/// [`acknowledge`](ProvidedBufferRing::acknowledge) of the same id before
+/// a [`recycle_acknowledged`](ProvidedBufferRing::recycle_acknowledged)
+/// clears it is rejected rather than silently accepted.
+///
+/// There is deliberately no `Drop` impl. A dropped or forgotten token
+/// both leak the recycle in the same way every other in-flight ticket in
+/// this crate degrades on abandonment -- the buffer never returns to the
+/// pool -- but neither corrupts the producer ring the way a double
+/// `recycle` would, and the stuck ledger bit is diagnosable (a later
+/// `acknowledge` of that id fails loudly) rather than silent.
+#[must_use = "an unrecycled buffer stays reserved in the pool's ledger"]
+#[derive(Debug)]
+pub struct AcknowledgedBuffer {
+    buf_id: u16,
+    len: u32,
+}
+
+impl AcknowledgedBuffer {
+    /// The pool slot this token names.
+    #[must_use]
+    pub const fn buffer_id(&self) -> u16 {
+        self.buf_id
+    }
+
+    /// How many bytes the kernel wrote.
+    #[must_use]
+    pub const fn len(&self) -> u32 {
+        self.len
+    }
+
+    /// Whether the kernel wrote no bytes.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// Why [`ProvidedBufferRing::acknowledge`] refused to mint an
+/// [`AcknowledgedBuffer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcknowledgeError {
+    /// `buf_id` is outside the pool's entry count, or `len` exceeds
+    /// [`ProvidedBufferRing::buf_size`].
+    OutOfRange {
+        /// The id that was rejected.
+        buf_id: u16,
+        /// The length that was rejected.
+        len: u32,
+    },
+    /// `buf_id` was already acknowledged and no
+    /// [`recycle_acknowledged`](ProvidedBufferRing::recycle_acknowledged)
+    /// has cleared it since -- acknowledging the same delivery twice
+    /// before it is recycled.
+    AlreadyAcknowledged {
+        /// The id that was rejected.
+        buf_id: u16,
+    },
+}
+
+impl core::fmt::Display for AcknowledgeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::OutOfRange { buf_id, len } => {
+                write!(f, "buf_id {buf_id} or len {len} out of range")
+            }
+            Self::AlreadyAcknowledged { buf_id } => {
+                write!(
+                    f,
+                    "buf_id {buf_id} was already acknowledged and not yet recycled"
+                )
+            }
+        }
+    }
+}
+
+impl core::error::Error for AcknowledgeError {}
 
 impl Drop for ProvidedBufferRing {
     fn drop(&mut self) {
@@ -894,6 +1126,39 @@ impl BufferConsumer {
     /// Publish all pending [`recycle`](Self::recycle)s to the kernel.
     pub fn commit(&self) {
         self.inner.commit();
+    }
+
+    /// Record that a real completion delivered `buf_id`. See
+    /// [`ProvidedBufferRing::acknowledge`].
+    ///
+    /// # Errors
+    ///
+    /// See [`ProvidedBufferRing::acknowledge`].
+    pub fn acknowledge(
+        &mut self,
+        buf_id: u16,
+        len: u32,
+    ) -> Result<AcknowledgedBuffer, AcknowledgeError> {
+        self.inner.acknowledge(buf_id, len)
+    }
+
+    /// Read the bytes an acknowledged delivery carries. See
+    /// [`ProvidedBufferRing::acknowledged_bytes`].
+    #[must_use]
+    pub fn acknowledged_bytes(&self, token: &AcknowledgedBuffer) -> &[u8] {
+        self.inner.acknowledged_bytes(token)
+    }
+
+    /// Recycle an acknowledged delivery. See
+    /// [`ProvidedBufferRing::recycle_acknowledged`].
+    pub fn recycle_acknowledged(&mut self, token: AcknowledgedBuffer) {
+        self.inner.recycle_acknowledged(token);
+    }
+
+    /// Recycle an acknowledged delivery and publish the tail. See
+    /// [`ProvidedBufferRing::recycle_acknowledged_and_commit`].
+    pub fn recycle_acknowledged_and_commit(&mut self, token: AcknowledgedBuffer) {
+        self.inner.recycle_acknowledged_and_commit(token);
     }
 }
 

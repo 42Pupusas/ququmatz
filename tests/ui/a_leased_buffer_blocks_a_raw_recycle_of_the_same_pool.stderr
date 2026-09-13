@@ -1,0 +1,10 @@
+error[E0499]: cannot borrow `*pool` as mutable more than once at a time
+  --> tests/ui/a_leased_buffer_blocks_a_raw_recycle_of_the_same_pool.rs:16:5
+   |
+13 |     let leased = pool.claim(buf_id, len);
+   |                  ---- first mutable borrow occurs here
+...
+16 |     pool.recycle(buf_id);
+   |     ^^^^ second mutable borrow occurs here
+17 |     drop(leased);
+   |          ------ first borrow later used here

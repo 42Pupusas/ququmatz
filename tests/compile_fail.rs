@@ -266,3 +266,14 @@ fn a_second_completed_buffer_cannot_be_claimed_while_the_first_is_live() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/ui/two_completed_buffers_cannot_be_held_at_once.rs");
 }
+
+/// Q-02/Q-05 residual: AUDIT.md once claimed a live `CompletedBuffer`
+/// lease did not stop a raw `recycle` call on the same pool from running
+/// underneath it. That was already false -- `CompletedBuffer`'s exclusive
+/// borrow blocks every other call into the pool, `recycle` included --
+/// this pins it down the same way the double-claim fixture above does.
+#[test]
+fn a_leased_buffer_blocks_a_raw_recycle_of_the_same_pool() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/a_leased_buffer_blocks_a_raw_recycle_of_the_same_pool.rs");
+}

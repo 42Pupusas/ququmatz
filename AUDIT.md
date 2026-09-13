@@ -922,21 +922,78 @@ first lease's `Drop` actually recycled it rather than merely compiling.
 `buffer`/`buffer_mut`/`recycle` remain as the lower-level, caller-trusted
 primitives `claim` is built from; they are not deprecated, since existing
 callers (and the `owned::multishot` module internally) still use them
-directly. What `claim` does not yet cover, because it is a per-call lease
-rather than a registration-wide ledger: nothing validates that a `buf_id`
-passed to any of these four methods was ever actually named by a
-completion from *this* pool as opposed to a plausible-looking guess, and
-nothing stops recycling (via the still-available raw `recycle`) a slot a
-live `CompletedBuffer` is currently leasing out from under it -- the type
-system prevents a second `claim` of the same registration state, but nothing
-stops a caller from calling `pool.recycle(buf_id)` directly while a
-`CompletedBuffer` for that same `buf_id` is still alive elsewhere, since
-`recycle` only takes `&mut self` and does not know which ids currently
-have a live lease. A full per-slot ledger (tracking offered vs. leased vs.
-recycled state by id, independent of borrow shape) remains unbuilt; `claim`
-solves the aliasing/double-recycle problem for the common case of "read a
-completion's buffer once, then move on" but not the adversarial case of a
-caller deliberately mixing the lease API with the raw API on the same id.
+directly.
+
+**Correction to a claim this entry previously made.** An earlier revision
+said "nothing stops recycling (via the still-available raw `recycle`) a
+slot a live `CompletedBuffer` is currently leasing out from under it."
+That was already false when written: `CompletedBuffer<'pool>` holds
+`&'pool mut ProvidedBufferRing` for its whole life, so *no* other call
+into the pool -- `recycle` included -- can happen while a lease is alive;
+the same exclusive borrow that already rules out a second `claim` rules
+out a raw `recycle` too. `tests/ui/a_leased_buffer_blocks_a_raw_recycle_of_the_same_pool.rs`
+pins this down with the identical `E0499` shape as the double-claim
+fixture, confirming the compiler -- not caller discipline -- was already
+responsible.
+
+What `claim` genuinely does not cover, because its guarantee lives only as
+long as its borrow does: nothing stops a caller from `mem::forget`ing a
+`CompletedBuffer` and then reading or recycling that same `buf_id` again
+as if no lease had ever existed, and nothing validates that a `buf_id`
+passed to `buffer`/`buffer_mut`/`recycle` directly (bypassing `claim`
+entirely) was ever actually named by a completion from *this* pool as
+opposed to a plausible-looking guess.
+
+**Status: further fixed -- `acknowledge`/`AcknowledgedBuffer` ledger
+added, closing the borrow-scoped gap `claim` left open.**
+[`ProvidedBufferRing::acknowledge`](Self::acknowledge) (and
+[`BufferConsumer::acknowledge`]) records a real delivery in a per-`buf_id`
+ledger bit stored as a plain field on the pool -- 4 KiB embedded in the
+struct, sized to the kernel's own maximum ring entry count rather than to
+any one registration, so it needs no extra mmap, no extra `Drop` cleanup,
+and no extra constructor failure path. Unlike a `CompletedBuffer`'s
+borrow, this state does not end when a value goes out of scope: it ends
+only when [`recycle_acknowledged`](Self::recycle_acknowledged) clears it.
+Calling `acknowledge` on an id already acknowledged and not yet recycled
+is rejected with `AcknowledgeError::AlreadyAcknowledged` -- caught
+regardless of whether the first [`AcknowledgedBuffer`](AcknowledgedBuffer)
+token is still in scope, was dropped, or was `mem::forget`ed, because
+nothing about the ledger bit depends on the token's own lifetime.
+
+This is deliberately opt-in and additive rather than a replacement for
+`claim` or the raw accessors: an id `acknowledge` is never called for is
+one the ledger has no opinion about, so every existing `buffer`/
+`buffer_mut`/`claim`/`recycle` call site -- including the ordinary "recv
+into a buffer I don't need to read, recycle straight from the CQE's
+`buffer_id()`" pattern -- keeps working exactly as before. `recycle`
+itself still does not consult the ledger, so a caller who acknowledges an
+id and then recycles it through the raw `recycle` rather than
+`recycle_acknowledged` leaves that id's bit stuck set; this does not
+corrupt anything (the buffer is genuinely back in the kernel's pool and
+usable), but it does make every later `acknowledge` of that id fail
+loudly rather than the mismatch passing silently -- a caller who mixes
+the two APIs gets a diagnosable stuck slot, not silent corruption.
+
+Five unit tests cover the ledger directly: out-of-range rejection
+mirroring `claim`'s bounds, rejecting a second acknowledge before a
+recycle, a forgotten token still blocking a second acknowledge (the exact
+case a borrow-scoped lease cannot catch), mixing `acknowledge` with the
+raw `recycle` path leaving a diagnosable stuck bit rather than silent
+corruption, and a real-kernel round trip (`a_real_acknowledge_round_trip_reads_and_recycles_through_the_ledger`)
+that drives a single-buffer pool through two real recvs the same way
+`provided_buffer_ring_claim_reads_and_recycles_exactly_once` does for
+`claim`, confirming the one slot is genuinely reused rather than merely
+compiling.
+
+**Still not built:** a full per-slot ledger that also rejects `buffer`/
+`buffer_mut`/`claim` reads of an id no completion ever named (as opposed
+to only catching a double-*acknowledge*), and a ledger entry that
+distinguishes "offered to the kernel, not yet delivered" from "delivered,
+not yet acknowledged" -- `acknowledge` only ever asks "has *this* id been
+acknowledged and not yet recycled," which is enough to catch the
+forgotten-token and double-acknowledge hazards this entry named, but does
+not validate that the `len`/`buf_id` pair a caller supplies actually came
+from a real CQE at all, the same trust boundary `claim` always had.
 
 **Status (original): confirmed.**
 
@@ -1028,11 +1085,13 @@ This closes the fd-reuse failure scenario the entry named: previously, dropping 
 
 A useful side effect: `ProvidedBufferRing` now carries a raw pointer field instead of only integers, so it is genuinely `!Send`/`!Sync` by ordinary auto-trait rules -- the doc comment's claim to that effect used to be aspirational (nothing stopped `ProvidedBufferRing` crossing a thread boundary before this change) and is now compiler-enforced. Pinned by a new trybuild fixture, `tests/ui/a_provided_buffer_ring_cannot_cross_threads.rs`: moving a `ProvidedBufferRing` into `std::thread::spawn` fails to compile with `*mut RingResources cannot be sent between threads safely`. `BufferConsumer`'s explicit `unsafe impl Send` is unaffected -- it was already deliberately overriding the auto-trait rejection on the same grounds `Submitter`/`Completer` do (a `RingResources` share is a refcounted, heap-external allocation moved as a bare pointer, not thread-local state), which clippy's `non_send_fields_in_send_ty` lint now also flags and which is suppressed with a documented `#[allow]` at the impl site.
 
-**Recycle-twice half further fixed:** `ProvidedBufferRing::claim`/`BufferConsumer::claim` (added for Q-02, see that entry) return a `CompletedBuffer` lease that exclusively borrows the pool and recycles exactly once on `Drop`, ruling out double-recycling a `buf_id` for any caller that reads a completion's buffer through `claim` rather than the raw `buffer`/`recycle` pair.
+**Recycle-twice half further fixed:** `ProvidedBufferRing::claim`/`BufferConsumer::claim` (added for Q-02, see that entry) return a `CompletedBuffer` lease that exclusively borrows the pool and recycles exactly once on `Drop`, ruling out double-recycling a `buf_id` for any caller that reads a completion's buffer through `claim` rather than the raw `buffer`/`recycle` pair -- and, contrary to what an earlier revision of this section claimed, that exclusive borrow already blocked a raw `recycle` call on the same pool while a lease was alive too, not only a second `claim`; see Q-02's correction and `tests/ui/a_leased_buffer_blocks_a_raw_recycle_of_the_same_pool.rs`.
 
-**Still open:** nothing tracks whether a specific `buf_id` a completion named is currently "in flight" with the kernel (selected but not yet recycled) versus sitting in the pool ready to be handed out again, independent of any particular caller's borrow pattern -- `claim`'s guarantee holds only while a caller sticks to the lease API; the raw `recycle` remains available and unguarded, so a caller mixing the two APIs on the same id, or a caller who never took a lease at all, can still double-recycle or read stale state. Dropping a pool while a multishot operation using it is still outstanding is also still unaddressed. The manual `unregister_provided_buffers` on `IoUring`/`Submitter` while a `ProvidedBufferRing` object remains alive is also still unguarded against -- it unregisters by `bgid` independently of whether a live pool object still expects that registration to exist.
+**Recycle-twice half further fixed again:** `ProvidedBufferRing::acknowledge`/`recycle_acknowledged` (also added for Q-02, see that entry) close the specific gap `claim` left open -- a `CompletedBuffer` guarantees nothing once its borrow ends, so `mem::forget`ing one (or never adopting `claim` at a call site) silently loses the pool's only memory that a recycle is owed. `acknowledge`'s ledger is a plain field on the pool rather than borrow-scoped state, so it survives exactly that: a second `acknowledge` of an id already acknowledged and not yet recycled is rejected regardless of what happened to the first token.
 
-**Acceptance (partially met):** ring-before-pool drop and fd reuse are now covered by construction (retained share defers the close), further reinforced by `provided_buffer_ring_outlives_the_ring_that_registered_it` in `src/tests/mod.rs`, which drops the parent ring, opens decoy fds to make reuse likely, and confirms the pool still functions. Split-half drop order, active multishot teardown, and unregister-failure semantics remain untested, as does the in-flight quiescence protocol called for above.
+**Still open:** the ledger only tracks "has this id been acknowledged and not yet recycled" for callers who opt into `acknowledge`; it does not validate that a `buf_id`/`len` pair passed to `buffer`/`buffer_mut`/`claim`/`recycle` directly was ever actually named by a real completion from *this* pool, and mixing `acknowledge` with the raw `recycle` (bypassing `recycle_acknowledged`) leaves a diagnosable but still-unresolved stuck ledger bit rather than an outright rejection. Dropping a pool while a multishot operation using it is still outstanding is also still unaddressed. The manual `unregister_provided_buffers` on `IoUring`/`Submitter` while a `ProvidedBufferRing` object remains alive is also still unguarded against -- it unregisters by `bgid` independently of whether a live pool object still expects that registration to exist.
+
+**Acceptance (partially met):** ring-before-pool drop and fd reuse are now covered by construction (retained share defers the close), further reinforced by `provided_buffer_ring_outlives_the_ring_that_registered_it` in `src/tests/mod.rs`, which drops the parent ring, opens decoy fds to make reuse likely, and confirms the pool still functions. The forgotten-lease double-recycle hazard is now covered too, by `acknowledge`'s ledger and its five tests (out-of-range rejection, double-acknowledge rejection, a forgotten token still blocking a second acknowledge, mixing `acknowledge` with raw `recycle`, and a real-kernel round trip). Split-half drop order, active multishot teardown, unregister-failure semantics, and validating a `buf_id`/`len` pair against a real completion (rather than only against a bound check) remain untested or unbuilt.
 
 ### Q-06 — Setup accepts layouts that mapping/parser code does not support
 

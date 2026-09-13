@@ -25,7 +25,9 @@ mod register;
 mod rsrc_tags;
 
 pub use builder::IoUringBuilder;
-pub use pbuf::{BufferConsumer, CompletedBuffer, ProvidedBufferRing};
+pub use pbuf::{
+    AcknowledgeError, AcknowledgedBuffer, BufferConsumer, CompletedBuffer, ProvidedBufferRing,
+};
 pub use probe::Probe;
 
 // ---------------------------------------------------------------------------

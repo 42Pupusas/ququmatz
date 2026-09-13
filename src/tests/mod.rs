@@ -2445,6 +2445,236 @@ fn provided_buffer_ring_register_only() {
 
 #[cfg(not(miri))]
 #[test]
+fn acknowledge_rejects_out_of_range_id_or_len() {
+    let mut ring = IoUring::new(4).expect("setup");
+    let mut pbuf = ring
+        .register_provided_buffers(1, 4, 64)
+        .expect("register_provided_buffers");
+
+    assert_eq!(
+        pbuf.acknowledge(4, 1).unwrap_err(),
+        AcknowledgeError::OutOfRange { buf_id: 4, len: 1 }
+    );
+    assert_eq!(
+        pbuf.acknowledge(0, 65).unwrap_err(),
+        AcknowledgeError::OutOfRange { buf_id: 0, len: 65 }
+    );
+}
+
+#[cfg(not(miri))]
+#[test]
+fn acknowledge_rejects_the_same_id_twice_before_a_recycle() {
+    // Q-02/Q-05 residual: this is the hazard `claim`'s `CompletedBuffer`
+    // cannot catch once its borrow ends -- `acknowledge`'s ledger bit is a
+    // plain field on the pool, not tied to any borrow, so it still
+    // remembers a delivery is outstanding even after the token that named
+    // it has gone out of scope or been forgotten.
+    let mut ring = IoUring::new(4).expect("setup");
+    let mut pbuf = ring
+        .register_provided_buffers(2, 4, 64)
+        .expect("register_provided_buffers");
+
+    let token = pbuf.acknowledge(0, 10).expect("first acknowledge");
+    assert_eq!(
+        pbuf.acknowledge(0, 10).unwrap_err(),
+        AcknowledgeError::AlreadyAcknowledged { buf_id: 0 }
+    );
+    // A different id is unaffected by id 0's outstanding acknowledgment.
+    assert!(pbuf.acknowledge(1, 10).is_ok());
+
+    pbuf.recycle_acknowledged(token);
+    // Recycling cleared the ledger bit, so id 0 can be acknowledged again
+    // for a genuinely new delivery.
+    assert!(pbuf.acknowledge(0, 10).is_ok());
+}
+
+#[cfg(not(miri))]
+#[test]
+fn forgetting_an_acknowledged_token_still_blocks_a_second_acknowledge() {
+    // The whole point of the ledger over a borrow-scoped lease: `claim`'s
+    // guarantee lives only as long as its `CompletedBuffer` borrow does,
+    // so forgetting or dropping one without recycling loses the pool's
+    // only memory that a recycle is owed. `acknowledge`'s state survives
+    // exactly that -- `AcknowledgedBuffer` has no `Drop` at all, so simply
+    // letting `token` fall out of scope unrecycled (rather than routing it
+    // through `recycle_acknowledged`) already exercises the same
+    // abandonment path `mem::forget` would, without clippy flagging a
+    // no-op forget of a non-`Drop` type.
+    let mut ring = IoUring::new(4).expect("setup");
+    let mut pbuf = ring
+        .register_provided_buffers(3, 2, 64)
+        .expect("register_provided_buffers");
+
+    let token = pbuf.acknowledge(0, 10).expect("acknowledge");
+    drop(token);
+
+    assert_eq!(
+        pbuf.acknowledge(0, 10).unwrap_err(),
+        AcknowledgeError::AlreadyAcknowledged { buf_id: 0 }
+    );
+}
+
+#[cfg(not(miri))]
+#[test]
+fn mixing_acknowledge_with_raw_recycle_leaves_a_diagnosable_stuck_bit() {
+    // `recycle` deliberately does not consult the ledger -- every
+    // pre-existing call site keeps working unchanged. A caller who
+    // acknowledges an id but recycles it through the raw path (instead of
+    // `recycle_acknowledged`) leaves that id's bit stuck set. This does
+    // not corrupt anything: the buffer is genuinely back in the kernel's
+    // pool and usable, but this pool object's ledger believes it is still
+    // outstanding, so a later acknowledge of the same id fails loudly
+    // rather than the mismatch passing silently.
+    let mut ring = IoUring::new(4).expect("setup");
+    let mut pbuf = ring
+        .register_provided_buffers(4, 2, 64)
+        .expect("register_provided_buffers");
+
+    let token = pbuf.acknowledge(0, 10).expect("acknowledge");
+    // Recycle through the raw path instead of `recycle_acknowledged`,
+    // abandoning `token` without consuming it via the ledger-aware call.
+    pbuf.recycle_and_commit(token.buffer_id());
+
+    assert_eq!(
+        pbuf.acknowledge(0, 10).unwrap_err(),
+        AcknowledgeError::AlreadyAcknowledged { buf_id: 0 },
+        "raw recycle does not clear the ledger bit acknowledge set"
+    );
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_real_acknowledge_round_trip_reads_and_recycles_through_the_ledger() {
+    // The real-kernel counterpart to the unit tests above: acknowledge a
+    // genuine delivery, read it through the token, recycle it through
+    // `recycle_acknowledged`, and confirm a single-buffer pool's one slot
+    // is actually reused for a second delivery -- the same proof
+    // `provided_buffer_ring_claim_reads_and_recycles_exactly_once` gives
+    // for `claim`, given here for `acknowledge` instead.
+    let mut ring = IoUring::new(8).expect("setup");
+    let (listener, port) = setup_tcp_listener();
+
+    let client = syscall::socket(types::AF_INET, types::SOCK_STREAM | types::SOCK_NONBLOCK, 0)
+        .expect("client socket")
+        .as_i32();
+
+    let mut pbuf = ring
+        .register_provided_buffers(6, 1, 64)
+        .expect("register_provided_buffers");
+
+    ring.push(Sqe::accept(RawFd::from_raw(listener as usize), AcceptFlags::default()).user_data(1))
+        .expect("push accept");
+    let connect_addr = SockAddrIn {
+        sin_family: types::AF_INET as u16,
+        sin_port: port.to_be(),
+        sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+        sin_zero: [0; 8],
+    };
+    let addr_bytes: &[u8] = unsafe {
+        core::slice::from_raw_parts(
+            (&raw const connect_addr).cast(),
+            core::mem::size_of::<SockAddrIn>(),
+        )
+    };
+    ring.push(unsafe { Sqe::connect(RawFd::from_raw(client as usize), addr_bytes) }.user_data(2))
+        .expect("push connect");
+    ring.submit_and_wait(2).expect("submit");
+
+    let mut server_fd = -1i32;
+    for _ in 0..2 {
+        let cqe = ring.complete().expect("cqe");
+        if cqe.user_data == 1 {
+            server_fd = cqe.result;
+        }
+    }
+    assert!(server_fd >= 0);
+
+    let recv_one = |ring: &mut IoUring, tag: u64| {
+        let recv_sqe = unsafe {
+            Sqe::recv_ptr(
+                RawFd::from_raw(server_fd as usize),
+                core::ptr::null_mut(),
+                0,
+                MsgFlags::default(),
+            )
+        }
+        .buffer_select(6)
+        .user_data(tag);
+        ring.push(recv_sqe).expect("push recv");
+        ring.submit_and_wait(1).expect("submit recv");
+        let cqe = ring.complete().expect("recv cqe");
+        assert_eq!(cqe.user_data, tag);
+        assert!(cqe.result >= 0, "recv failed: {}", cqe.result);
+        let buf_id = cqe.buffer_id().expect("buffer_id present");
+        #[allow(clippy::cast_sign_loss)]
+        let len = cqe.result as u32;
+        (buf_id, len)
+    };
+
+    let first_msg = b"first payload";
+    ring.push(
+        unsafe {
+            Sqe::send(
+                RawFd::from_raw(client as usize),
+                first_msg,
+                MsgFlags::default(),
+            )
+        }
+        .user_data(10),
+    )
+    .expect("push send");
+    ring.submit_and_wait(1).expect("submit send");
+    let send_cqe = ring.complete().expect("send cqe");
+    assert_eq!(send_cqe.user_data, 10);
+
+    let (buf_id, len) = recv_one(&mut ring, 20);
+    let token = pbuf.acknowledge(buf_id, len).expect("acknowledge");
+    assert_eq!(pbuf.acknowledged_bytes(&token), first_msg);
+    // A second acknowledge of the same id is rejected while `token` is
+    // still outstanding.
+    assert_eq!(
+        pbuf.acknowledge(buf_id, len).unwrap_err(),
+        AcknowledgeError::AlreadyAcknowledged { buf_id }
+    );
+    pbuf.recycle_acknowledged_and_commit(token);
+
+    let second_msg = b"second payload";
+    ring.push(
+        unsafe {
+            Sqe::send(
+                RawFd::from_raw(client as usize),
+                second_msg,
+                MsgFlags::default(),
+            )
+        }
+        .user_data(11),
+    )
+    .expect("push second send");
+    ring.submit_and_wait(1).expect("submit second send");
+    let send_cqe = ring.complete().expect("second send cqe");
+    assert_eq!(send_cqe.user_data, 11);
+
+    // With only one buffer in the pool, this recv can only complete with
+    // a real buffer id if the earlier token's recycle actually returned
+    // it to the kernel.
+    let (buf_id_2, len_2) = recv_one(&mut ring, 21);
+    assert_eq!(
+        buf_id_2, buf_id,
+        "the single slot in this pool must be reused"
+    );
+    let token_2 = pbuf
+        .acknowledge(buf_id_2, len_2)
+        .expect("acknowledge second delivery");
+    assert_eq!(pbuf.acknowledged_bytes(&token_2), second_msg);
+    pbuf.recycle_acknowledged_and_commit(token_2);
+
+    let _ = syscall::close(RawFd::from_raw(server_fd as usize));
+    let _ = syscall::close(RawFd::from_raw(client as usize));
+    let _ = syscall::close(RawFd::from_raw(listener as usize));
+}
+
+#[cfg(not(miri))]
+#[test]
 fn provided_buffer_ring_outlives_the_ring_that_registered_it() {
     // Q-05: `ProvidedBufferRing` used to carry a bare copied `fd: RawFd`
     // with no tie to the parent ring's actual lifetime. Dropping the
@@ -5632,10 +5862,8 @@ fn a_real_mid_batch_rejection_produces_a_genuine_short_submission() {
     // Only the entries up to and including the failing one were pulled
     // from the ring; nop(3) and nop(4) were never read by the kernel and
     // so cannot have completions yet.
-    let mut seen: Vec<(u64, i32)> = core::iter::from_fn(|| {
-        ring.complete().map(|c| (c.user_data, c.result))
-    })
-    .collect();
+    let mut seen: Vec<(u64, i32)> =
+        core::iter::from_fn(|| ring.complete().map(|c| (c.user_data, c.result))).collect();
     seen.sort_unstable_by_key(|&(ud, _)| ud);
 
     assert_eq!(
@@ -5643,7 +5871,11 @@ fn a_real_mid_batch_rejection_produces_a_genuine_short_submission() {
         vec![1, 2],
         "only the entries the kernel actually pulled should have completions yet"
     );
-    assert_eq!(seen[0], (1, 0), "the nop before the failure must succeed normally");
+    assert_eq!(
+        seen[0],
+        (1, 0),
+        "the nop before the failure must succeed normally"
+    );
     assert!(
         seen[1].1 < 0,
         "the unrecognized opcode must fail rather than silently succeed, got {}",
@@ -5655,12 +5887,13 @@ fn a_real_mid_batch_rejection_produces_a_genuine_short_submission() {
     // first enter() call -- a later submit() must pick them up and they
     // must complete normally, proving nothing was lost from tracking.
     let remaining = ring.submit_and_wait(2).expect("submit remaining");
-    assert_eq!(remaining, 2, "the leftover entries must go out in the next submit");
+    assert_eq!(
+        remaining, 2,
+        "the leftover entries must go out in the next submit"
+    );
 
-    let mut tail: Vec<(u64, i32)> = core::iter::from_fn(|| {
-        ring.complete().map(|c| (c.user_data, c.result))
-    })
-    .collect();
+    let mut tail: Vec<(u64, i32)> =
+        core::iter::from_fn(|| ring.complete().map(|c| (c.user_data, c.result))).collect();
     tail.sort_unstable_by_key(|&(ud, _)| ud);
     assert_eq!(tail, vec![(3, 0), (4, 0)]);
 
@@ -5699,7 +5932,10 @@ fn a_real_split_mid_batch_rejection_produces_a_genuine_short_submission() {
     let mut seen: Vec<(u64, i32)> =
         core::iter::from_fn(|| comp.complete().map(|c| (c.user_data, c.result))).collect();
     seen.sort_unstable_by_key(|&(ud, _)| ud);
-    assert_eq!(seen.iter().map(|&(ud, _)| ud).collect::<Vec<_>>(), vec![1, 2]);
+    assert_eq!(
+        seen.iter().map(|&(ud, _)| ud).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
     assert_eq!(seen[0], (1, 0));
     assert!(seen[1].1 < 0);
 
