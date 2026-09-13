@@ -91,6 +91,14 @@ impl RingResources {
         unsafe { &(*ptr).refcount }.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Returns the ring fd these resources were allocated for.
+    ///
+    /// Reading this does not require holding a reference beyond the
+    /// pointer's own validity: the fd field never changes after `alloc`.
+    const unsafe fn fd(ptr: *const Self) -> RawFd {
+        unsafe { (*ptr).fd }
+    }
+
     /// Decrement the refcount. When it reaches zero, unmaps ring memory,
     /// closes the fd, and finally unmaps the page that holds `self`.
     unsafe fn release(ptr: *mut Self) {

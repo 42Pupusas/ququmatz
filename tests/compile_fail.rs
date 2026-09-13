@@ -241,3 +241,16 @@ fn an_accepted_connection_cannot_be_discarded_unread() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/ui/an_accepted_connection_cannot_be_dropped_silently.rs");
 }
+
+/// Q-05's related auto-trait defect: `ProvidedBufferRing` documents
+/// itself as `!Send`/`!Sync` "like `IoUring`", but every field used to
+/// be a plain integer, so nothing actually blocked it crossing threads.
+/// Retaining a `RingResources` share (a raw pointer) fixes that as a
+/// side effect of fixing Q-05's ownership gap; this pins the auto-trait
+/// consequence down so it cannot silently regress back to all-integer
+/// fields.
+#[test]
+fn a_provided_buffer_ring_cannot_cross_threads() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/a_provided_buffer_ring_cannot_cross_threads.rs");
+}

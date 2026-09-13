@@ -1,0 +1,32 @@
+error[E0277]: `*mut ququmatz::ring::RingResources` cannot be sent between threads safely
+  --> tests/ui/a_provided_buffer_ring_cannot_cross_threads.rs:19:24
+   |
+19 |       std::thread::spawn(move || {
+   |       ------------------ ^------
+   |       |                  |
+   |  _____|__________________within this `{closure@$DIR/tests/ui/a_provided_buffer_ring_cannot_cross_threads.rs:19:24: 19:31}`
+   | |     |
+   | |     required by a bound introduced by this call
+20 | |         let _ = pool.bgid();
+21 | |     })
+   | |_____^ `*mut ququmatz::ring::RingResources` cannot be sent between threads safely
+   |
+   = help: within `{closure@$DIR/tests/ui/a_provided_buffer_ring_cannot_cross_threads.rs:19:24: 19:31}`, the trait `std::marker::Send` is not implemented for `*mut ququmatz::ring::RingResources`
+note: required because it appears within the type `ProvidedBufferRing`
+  --> src/ring/pbuf.rs
+   |
+   | pub struct ProvidedBufferRing {
+   |            ^^^^^^^^^^^^^^^^^^
+note: required because it's used within this closure
+  --> tests/ui/a_provided_buffer_ring_cannot_cross_threads.rs:19:24
+   |
+19 |     std::thread::spawn(move || {
+   |                        ^^^^^^^
+note: required by a bound in `spawn`
+  --> $RUST/std/src/thread/functions.rs
+   |
+   | pub fn spawn<F, T>(f: F) -> JoinHandle<T>
+   |        ----- required by a bound in this function
+...
+   |     F: Send + 'static,
+   |        ^^^^ required by this bound in `spawn`

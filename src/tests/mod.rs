@@ -2308,6 +2308,50 @@ fn provided_buffer_ring_register_only() {
 
 #[cfg(not(miri))]
 #[test]
+fn provided_buffer_ring_outlives_the_ring_that_registered_it() {
+    // Q-05: `ProvidedBufferRing` used to carry a bare copied `fd: RawFd`
+    // with no tie to the parent ring's actual lifetime. Dropping the
+    // parent `IoUring` closed that fd underneath the pool; the kernel is
+    // then free to hand the same fd number to the next thing this
+    // process opens, and the pool's own registration/unmap calls would
+    // silently target whatever now holds that number instead of failing
+    // loudly. Retaining a `RingResources` share defers the fd close
+    // until the pool itself is dropped, so a pool must go on working
+    // (here: `status()`, which issues `io_uring_register` against the
+    // pool's own fd) for as long as it is alive, even after its parent
+    // `IoUring` is gone and something else has taken over lower fd
+    // numbers.
+    let mut ring = IoUring::new(4).expect("setup");
+    let pbuf = ring
+        .register_provided_buffers(3, 4, 64)
+        .expect("register_provided_buffers");
+
+    drop(ring);
+
+    // Open several fresh descriptors: if the parent's fd had actually
+    // been closed here, one of these opens would likely reclaim that
+    // exact number, and the assertions below would then be silently
+    // exercising someone else's descriptor instead of catching the bug.
+    let mut decoys = vec![];
+    for _ in 0..8 {
+        decoys.push(syscall::eventfd2(0, 0).expect("decoy eventfd"));
+    }
+
+    // The pool's own fd must still be live: `status()` round-trips an
+    // `io_uring_register` call against it.
+    let head = pbuf
+        .status()
+        .expect("status survives the parent ring's drop");
+    assert_eq!(head, 0, "a freshly registered pool has consumed nothing");
+
+    for fd in decoys {
+        let _ = syscall::close(fd);
+    }
+    drop(pbuf);
+}
+
+#[cfg(not(miri))]
+#[test]
 fn provided_buffer_ring_rejects_count_above_kernel_max() {
     use crate::error::{Error, InvalidArgKind, SetupError};
 

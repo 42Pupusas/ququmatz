@@ -1,6 +1,6 @@
 //! Provided-buffer ring: kernel-registered buffer pool selectable per-SQE.
 
-use super::{IoUring, Submitter};
+use super::{IoUring, RingResources, Submitter};
 use crate::error::{Error, InvalidArgKind, SetupError};
 use crate::syscall;
 use crate::types::{
@@ -32,20 +32,34 @@ fn checked_ring_bytes(count: u32, elem_size: usize) -> Result<usize, InvalidArgK
         .ok_or(InvalidArgKind::BufferRingSizeOverflow)
 }
 
-/// Allocate, mmap, and register a provided-buffer ring against `fd`.
+/// Allocate, mmap, and register a provided-buffer ring against the ring
+/// whose shared resources `resources` points at.
 ///
 /// Shared by [`IoUring::register_provided_buffers`] and
-/// [`Submitter::register_provided_buffers`] — registration only needs the ring
-/// fd, so both entry points funnel here. See the public wrappers for the
-/// argument contract and error conditions.
+/// [`Submitter::register_provided_buffers`] — registration only needs the
+/// ring fd, so both entry points funnel here. See the public wrappers for
+/// the argument contract and error conditions.
+///
+/// `resources` must be a live `RingResources` allocation (i.e. the parent
+/// `IoUring`/`Submitter`/`Completer` that owns it, or a share of it, has
+/// not yet dropped its last reference). On success the returned pool
+/// retains its own share (see [`RingResources::retain`]), which is what
+/// keeps the ring fd open and the ring's own mmaps alive for as long as
+/// the pool exists — even past the parent ring being dropped — rather
+/// than the pool tracking a copy of the fd that can go stale (Q-05: a
+/// bare copied fd does not stop the kernel from recycling that fd number
+/// for an unrelated open file once the parent ring's own last reference
+/// closes it).
 #[allow(clippy::cast_possible_truncation)]
 fn register_provided_buffers_on(
-    fd: RawFd,
+    resources: *mut RingResources,
     bgid: u16,
     count: u32,
     buf_size: u32,
     flags: PbufRingFlags,
 ) -> Result<ProvidedBufferRing, Error> {
+    // Safety: caller guarantees `resources` is a live allocation.
+    let fd = unsafe { RingResources::fd(resources) };
     if count == 0 {
         return Err(SetupError::InvalidArg(InvalidArgKind::BufferCountZero).into());
     }
@@ -123,7 +137,17 @@ fn register_provided_buffers_on(
         return Err(SetupError::Syscall(e).into());
     }
 
+    // Take our own share of the parent ring's resources so the pool's fd
+    // and the memory it registers against outlive the parent ring's own
+    // handle, rather than the pool tracking a bare copied fd number that
+    // the kernel is free to recycle once the parent's last reference
+    // closes it (Q-05).
+    // Safety: caller guarantees `resources` is a live allocation; this
+    // adds one more owner to its refcount.
+    unsafe { RingResources::retain(resources) };
+
     let mut pbuf = ProvidedBufferRing {
+        resources,
         fd,
         bgid,
         mask: count - 1,
@@ -172,7 +196,13 @@ impl Submitter {
         count: u32,
         buf_size: u32,
     ) -> Result<ProvidedBufferRing, Error> {
-        register_provided_buffers_on(self.raw_fd(), bgid, count, buf_size, PbufRingFlags::empty())
+        register_provided_buffers_on(
+            self.resources,
+            bgid,
+            count,
+            buf_size,
+            PbufRingFlags::empty(),
+        )
     }
 
     /// Register a provided-buffer ring that supports incremental buffer
@@ -193,7 +223,7 @@ impl Submitter {
         count: u32,
         buf_size: u32,
     ) -> Result<ProvidedBufferRing, Error> {
-        register_provided_buffers_on(self.raw_fd(), bgid, count, buf_size, PbufRingFlags::INC)
+        register_provided_buffers_on(self.resources, bgid, count, buf_size, PbufRingFlags::INC)
     }
 }
 
@@ -227,7 +257,13 @@ impl IoUring {
         count: u32,
         buf_size: u32,
     ) -> Result<ProvidedBufferRing, Error> {
-        register_provided_buffers_on(self.fd, bgid, count, buf_size, PbufRingFlags::empty())
+        register_provided_buffers_on(
+            self.resources,
+            bgid,
+            count,
+            buf_size,
+            PbufRingFlags::empty(),
+        )
     }
 
     /// Register a provided-buffer ring that supports incremental buffer
@@ -265,7 +301,7 @@ impl IoUring {
         count: u32,
         buf_size: u32,
     ) -> Result<ProvidedBufferRing, Error> {
-        register_provided_buffers_on(self.fd, bgid, count, buf_size, PbufRingFlags::INC)
+        register_provided_buffers_on(self.resources, bgid, count, buf_size, PbufRingFlags::INC)
     }
 
     /// Unregister a provided-buffer ring by group id.
@@ -309,6 +345,22 @@ impl IoUring {
 /// buffer from a thread other than the one draining completions would
 /// race on `tail_local` and on the kernel-visible tail atomic.
 pub struct ProvidedBufferRing {
+    /// The parent ring's shared resources, retained for as long as this
+    /// pool exists.
+    ///
+    /// A provided-buffer registration is meaningless once the ring fd it
+    /// was registered against is closed -- the kernel drops the
+    /// registration along with the fd. Earlier this struct carried only
+    /// a copied `fd: RawFd`, which kept the pool usable exactly as long
+    /// as the *number* stayed valid: nothing stopped the parent
+    /// `IoUring`/`Submitter`/`Completer` from dropping its own last
+    /// reference, closing that fd, and the kernel recycling the same
+    /// number for an unrelated file, all while this pool object looked
+    /// perfectly fine to its own caller (Q-05). Holding a `RingResources`
+    /// share here instead means the fd close is deferred until this pool
+    /// (or its `BufferConsumer` half) is itself dropped, exactly like the
+    /// `Submitter`/`Completer` split halves already do.
+    resources: *mut RingResources,
     fd: RawFd,
     bgid: u16,
     mask: u32,
@@ -562,6 +614,14 @@ impl Drop for ProvidedBufferRing {
         // registration, each unmapped exactly once here.
         let _ = unsafe { syscall::munmap(self.bufs_addr, self.bufs_bytes) };
         let _ = unsafe { syscall::munmap(self.ring_addr, self.ring_bytes) };
+        // Release this pool's share of the parent ring's resources,
+        // acquired in `register_provided_buffers_on`. The ring fd (and,
+        // if this was the last share, the parent's own mmaps) is only
+        // actually closed/unmapped once every share -- the parent ring
+        // and every pool registered against it -- has dropped.
+        // Safety: this pool retained exactly one share at construction
+        // and has not released it before now.
+        unsafe { RingResources::release(self.resources) };
     }
 }
 
@@ -587,6 +647,13 @@ pub struct BufferConsumer {
 // SAFETY: after split() exactly one thread owns the producer ring, so the
 // `tail_local` / kernel-tail race that keeps ProvidedBufferRing `!Send` is gone.
 // The backing mmap and ring mmap are plain memory owned solely by this struct.
+// The `resources: *mut RingResources` field this struct carries (through
+// `ProvidedBufferRing`) is exactly the same kind of pointer `Submitter` and
+// `Completer` already send across threads: `RingResources` is a refcounted,
+// heap-external allocation whose fields are only ever touched through its
+// own atomic refcount and (for the mmap regions it tracks) plain integers,
+// so moving the pointer itself carries no thread-local state.
+#[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl Send for BufferConsumer {}
 
 impl BufferConsumer {
