@@ -865,19 +865,44 @@ extra lifetime parameter), so the compiler ties the slice's lifetime to an
 actual borrow of the pool rather than to a caller-chosen annotation. That
 fixes the *outliving* half of this entry's failure scenario.
 
-What remains open, and is **not** fixed by this change: nothing tracks
-per-slot state (offered / in-flight / completed / recycled), so
-`buffer`/`buffer_mut`/`recycle` still trust the caller to pass a `buf_id`
-that a completion actually named and not to recycle a slot twice or read
-it before the kernel has written to it -- the remediation's proposed
-`CompletedBuffer` lease model (validating a completion against the
-originating pool and an outstanding operation, modeling offered /
-in-flight / completed / leased / recyclable state, rejecting duplicate
-recycles) has not been built. The `owned::multishot::Arrival` type already
-provides exactly that guarantee for the multishot-recv path specifically
-(a completion-validated, drop-recycles borrow that cannot alias or
-outlive the pool) but the plain `ProvidedBufferRing`/`BufferConsumer`
-surface used outside multishot recv still has none of it.
+**Status: further fixed -- `CompletedBuffer` lease type added.**
+[`ProvidedBufferRing::claim`](Self::claim) (and
+[`BufferConsumer::claim`]) is now the primary way to read a completed
+buffer: it returns a [`CompletedBuffer`], which exclusively borrows the
+pool (`&'pool mut ProvidedBufferRing`) for its whole life and recycles
+the slot on `Drop`. That closes the gap the paragraph above left open --
+two claims cannot be held over the same pool at once (the borrow checker
+rejects a second `claim` while a `CompletedBuffer` is still alive, exactly
+as it already does for `owned::multishot::Arrival`, which this type
+mirrors), and a slot cannot be recycled twice, because there is no second
+call path that could do it: `Drop` is the only caller of `recycle_and_commit`
+for a given lease, and consuming `self` in the eagerly-recycling variant
+(`CompletedBuffer::recycle_and_commit(self)`) leaves nothing behind to
+call it again. Pinned by `tests/ui/two_completed_buffers_cannot_be_held_at_once.rs`
+(a second `claim` while the first lease is live is a compile error, not a
+runtime check) and by `provided_buffer_ring_claim_reads_and_recycles_exactly_once`
+in `src/tests/mod.rs`, which drives a real single-buffer pool through two
+real recvs and asserts the second recv reuses the same slot -- proof the
+first lease's `Drop` actually recycled it rather than merely compiling.
+
+`buffer`/`buffer_mut`/`recycle` remain as the lower-level, caller-trusted
+primitives `claim` is built from; they are not deprecated, since existing
+callers (and the `owned::multishot` module internally) still use them
+directly. What `claim` does not yet cover, because it is a per-call lease
+rather than a registration-wide ledger: nothing validates that a `buf_id`
+passed to any of these four methods was ever actually named by a
+completion from *this* pool as opposed to a plausible-looking guess, and
+nothing stops recycling (via the still-available raw `recycle`) a slot a
+live `CompletedBuffer` is currently leasing out from under it -- the type
+system prevents a second `claim` of the same registration state, but nothing
+stops a caller from calling `pool.recycle(buf_id)` directly while a
+`CompletedBuffer` for that same `buf_id` is still alive elsewhere, since
+`recycle` only takes `&mut self` and does not know which ids currently
+have a live lease. A full per-slot ledger (tracking offered vs. leased vs.
+recycled state by id, independent of borrow shape) remains unbuilt; `claim`
+solves the aliasing/double-recycle problem for the common case of "read a
+completion's buffer once, then move on" but not the adversarial case of a
+caller deliberately mixing the lease API with the raw API on the same id.
 
 **Status (original): confirmed.**
 
@@ -969,9 +994,11 @@ This closes the fd-reuse failure scenario the entry named: previously, dropping 
 
 A useful side effect: `ProvidedBufferRing` now carries a raw pointer field instead of only integers, so it is genuinely `!Send`/`!Sync` by ordinary auto-trait rules -- the doc comment's claim to that effect used to be aspirational (nothing stopped `ProvidedBufferRing` crossing a thread boundary before this change) and is now compiler-enforced. Pinned by a new trybuild fixture, `tests/ui/a_provided_buffer_ring_cannot_cross_threads.rs`: moving a `ProvidedBufferRing` into `std::thread::spawn` fails to compile with `*mut RingResources cannot be sent between threads safely`. `BufferConsumer`'s explicit `unsafe impl Send` is unaffected -- it was already deliberately overriding the auto-trait rejection on the same grounds `Submitter`/`Completer` do (a `RingResources` share is a refcounted, heap-external allocation moved as a bare pointer, not thread-local state), which clippy's `non_send_fields_in_send_ty` lint now also flags and which is suppressed with a documented `#[allow]` at the impl site.
 
-**Still open:** nothing tracks whether a specific `buf_id` a completion named is currently "in flight" with the kernel (selected but not yet recycled) versus sitting in the pool ready to be handed out again. The failure scenarios this entry originally raised around *that* -- recycling the same id twice, or dropping a pool while a multishot operation using it is still outstanding -- are unaddressed; they belong to the same `CompletedBuffer`-lease/state-machine redesign Q-02 still needs, not to the ownership gap fixed here. The manual `unregister_provided_buffers` on `IoUring`/`Submitter` while a `ProvidedBufferRing` object remains alive is also still unguarded against -- it unregisters by `bgid` independently of whether a live pool object still expects that registration to exist.
+**Recycle-twice half further fixed:** `ProvidedBufferRing::claim`/`BufferConsumer::claim` (added for Q-02, see that entry) return a `CompletedBuffer` lease that exclusively borrows the pool and recycles exactly once on `Drop`, ruling out double-recycling a `buf_id` for any caller that reads a completion's buffer through `claim` rather than the raw `buffer`/`recycle` pair.
 
-**Acceptance (partially met):** ring-before-pool drop and fd reuse are now covered by construction (retained share defers the close) rather than by a targeted regression test; a dedicated test exercising the actual sequence (drop `IoUring`, open something else, observe the pool still functions) would still strengthen this further. Split-half drop order, active multishot teardown, and unregister-failure semantics remain untested, as does the in-flight quiescence protocol called for above.
+**Still open:** nothing tracks whether a specific `buf_id` a completion named is currently "in flight" with the kernel (selected but not yet recycled) versus sitting in the pool ready to be handed out again, independent of any particular caller's borrow pattern -- `claim`'s guarantee holds only while a caller sticks to the lease API; the raw `recycle` remains available and unguarded, so a caller mixing the two APIs on the same id, or a caller who never took a lease at all, can still double-recycle or read stale state. Dropping a pool while a multishot operation using it is still outstanding is also still unaddressed. The manual `unregister_provided_buffers` on `IoUring`/`Submitter` while a `ProvidedBufferRing` object remains alive is also still unguarded against -- it unregisters by `bgid` independently of whether a live pool object still expects that registration to exist.
+
+**Acceptance (partially met):** ring-before-pool drop and fd reuse are now covered by construction (retained share defers the close), further reinforced by `provided_buffer_ring_outlives_the_ring_that_registered_it` in `src/tests/mod.rs`, which drops the parent ring, opens decoy fds to make reuse likely, and confirms the pool still functions. Split-half drop order, active multishot teardown, and unregister-failure semantics remain untested, as does the in-flight quiescence protocol called for above.
 
 ### Q-06 — Setup accepts layouts that mapping/parser code does not support
 

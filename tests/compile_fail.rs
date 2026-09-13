@@ -254,3 +254,15 @@ fn a_provided_buffer_ring_cannot_cross_threads() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/ui/a_provided_buffer_ring_cannot_cross_threads.rs");
 }
+
+/// Q-02/Q-05 residual: `ProvidedBufferRing::claim` returns a `CompletedBuffer`
+/// that exclusively borrows the pool, the same pattern
+/// `MultishotRecv::record`/`Arrival` already uses. Two claims live at once
+/// would let either one recycle a slot the other still expects to read
+/// from; this fixture pins that the borrow checker, not caller discipline,
+/// is what rules it out.
+#[test]
+fn a_second_completed_buffer_cannot_be_claimed_while_the_first_is_live() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/ui/two_completed_buffers_cannot_be_held_at_once.rs");
+}

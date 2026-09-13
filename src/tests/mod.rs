@@ -2289,6 +2289,143 @@ fn provided_buffer_ring_buffer_mut_allows_inplace_edit() {
 
 #[cfg(not(miri))]
 #[test]
+fn provided_buffer_ring_claim_reads_and_recycles_exactly_once() {
+    // Q-02/Q-05 residual: `claim` is the lease-based alternative to
+    // `buffer`/`buffer_mut`/`recycle`, which trust the caller not to
+    // recycle a `buf_id` twice or read one no completion actually named.
+    // `claim` returns a `CompletedBuffer` that exclusively borrows the
+    // pool and recycles on drop -- there is no second call that could
+    // recycle the same slot again. This proves the whole round trip: a
+    // real kernel-delivered buffer is read through the lease, dropping it
+    // returns the slot to the pool, and a second recv actually reuses
+    // that same slot rather than stalling for want of a free buffer.
+    let mut ring = IoUring::new(8).expect("setup");
+    let (listener, port) = setup_tcp_listener();
+
+    let client = syscall::socket(types::AF_INET, types::SOCK_STREAM | types::SOCK_NONBLOCK, 0)
+        .expect("client socket")
+        .as_i32();
+
+    // A single-entry pool: the second recv below can only succeed if the
+    // first claim's Drop actually recycled the one slot that exists.
+    let mut pbuf = ring
+        .register_provided_buffers(5, 1, 64)
+        .expect("register_provided_buffers");
+
+    ring.push(Sqe::accept(RawFd::from_raw(listener as usize), AcceptFlags::default()).user_data(1))
+        .expect("push accept");
+    let connect_addr = SockAddrIn {
+        sin_family: types::AF_INET as u16,
+        sin_port: port.to_be(),
+        sin_addr: u32::from_ne_bytes([127, 0, 0, 1]),
+        sin_zero: [0; 8],
+    };
+    let addr_bytes: &[u8] = unsafe {
+        core::slice::from_raw_parts(
+            (&raw const connect_addr).cast(),
+            core::mem::size_of::<SockAddrIn>(),
+        )
+    };
+    ring.push(unsafe { Sqe::connect(RawFd::from_raw(client as usize), addr_bytes) }.user_data(2))
+        .expect("push connect");
+    ring.submit_and_wait(2).expect("submit");
+
+    let mut server_fd = -1i32;
+    for _ in 0..2 {
+        let cqe = ring.complete().expect("cqe");
+        if cqe.user_data == 1 {
+            server_fd = cqe.result;
+        }
+    }
+    assert!(server_fd >= 0);
+
+    let recv_one = |ring: &mut IoUring, tag: u64| {
+        let recv_sqe = unsafe {
+            Sqe::recv_ptr(
+                RawFd::from_raw(server_fd as usize),
+                core::ptr::null_mut(),
+                0,
+                MsgFlags::default(),
+            )
+        }
+        .buffer_select(5)
+        .user_data(tag);
+        ring.push(recv_sqe).expect("push recv");
+        ring.submit_and_wait(1).expect("submit recv");
+        let cqe = ring.complete().expect("recv cqe");
+        assert_eq!(cqe.user_data, tag);
+        assert!(cqe.result >= 0, "recv failed: {}", cqe.result);
+        let buf_id = cqe.buffer_id().expect("buffer_id present");
+        #[allow(clippy::cast_sign_loss)]
+        let len = cqe.result as u32;
+        (buf_id, len)
+    };
+
+    let first_msg = b"first payload";
+    ring.push(
+        unsafe {
+            Sqe::send(
+                RawFd::from_raw(client as usize),
+                first_msg,
+                MsgFlags::default(),
+            )
+        }
+        .user_data(10),
+    )
+    .expect("push send");
+    ring.submit_and_wait(1).expect("submit send");
+    let send_cqe = ring.complete().expect("send cqe");
+    assert_eq!(send_cqe.user_data, 10);
+
+    let (buf_id, len) = recv_one(&mut ring, 20);
+    {
+        let leased = pbuf.claim(buf_id, len).expect("claim");
+        assert_eq!(leased.buffer_id(), buf_id);
+        assert_eq!(leased.len(), len);
+        assert!(!leased.is_empty());
+        assert_eq!(leased.bytes(), first_msg);
+        // Dropping `leased` here recycles the slot back to the pool.
+    }
+
+    // Out-of-range claims still return None rather than panicking or
+    // fabricating a lease over memory the pool does not own.
+    assert!(pbuf.claim(999, 1).is_none());
+    assert!(pbuf.claim(0, pbuf.buf_size() + 1).is_none());
+
+    let second_msg = b"second payload";
+    ring.push(
+        unsafe {
+            Sqe::send(
+                RawFd::from_raw(client as usize),
+                second_msg,
+                MsgFlags::default(),
+            )
+        }
+        .user_data(11),
+    )
+    .expect("push second send");
+    ring.submit_and_wait(1).expect("submit second send");
+    let send_cqe = ring.complete().expect("second send cqe");
+    assert_eq!(send_cqe.user_data, 11);
+
+    // With only one buffer in the pool, this recv can only complete with
+    // a real buffer id if the earlier claim's Drop actually recycled it.
+    let (buf_id_2, len_2) = recv_one(&mut ring, 21);
+    assert_eq!(
+        buf_id_2, buf_id,
+        "the single slot in this pool must be reused"
+    );
+    let leased = pbuf.claim(buf_id_2, len_2).expect("claim second delivery");
+    assert_eq!(leased.bytes(), second_msg);
+    leased.recycle_and_commit();
+
+    let _ = syscall::close(RawFd::from_raw(server_fd as usize));
+    let _ = syscall::close(RawFd::from_raw(client as usize));
+    let _ = syscall::close(RawFd::from_raw(listener as usize));
+}
+
+#[cfg(not(miri))]
+#[test]
 fn provided_buffer_ring_register_only() {
     let mut ring = IoUring::new(4).expect("setup");
     let pbuf = ring

@@ -526,12 +526,52 @@ impl ProvidedBufferRing {
         }
     }
 
+    /// Borrow a completed buffer as a lease that recycles itself exactly
+    /// once, rather than a bare `buf_id` the caller must remember to hand
+    /// back.
+    ///
+    /// [`buffer`](Self::buffer)/[`buffer_mut`](Self::buffer_mut)/[`recycle`](Self::recycle)
+    /// trust the caller to pass a `buf_id` a completion actually named and
+    /// to recycle it exactly once; nothing stops calling `recycle` twice on
+    /// the same id, which hands the kernel a buffer it already believes it
+    /// owns, or reading a `buf_id` a completion never chose. [`claim`] closes
+    /// that gap the same way [`Arrival`](crate::owned::multishot::Arrival)
+    /// already does for multishot receive: the returned [`CompletedBuffer`]
+    /// holds `self` by exclusive borrow, so no other call into this pool
+    /// (including a second `claim`) can happen while it is alive, and its
+    /// `Drop` recycles the slot exactly once — there is no path that skips
+    /// the recycle or repeats it.
+    ///
+    /// Pass the CQE `result` (byte count) as `len`. Returns `None` if
+    /// `buf_id` is out of range or `len` exceeds
+    /// [`buf_size`](Self::buf_size) — the same bounds
+    /// [`buffer`](Self::buffer) checks, since a completion that failed
+    /// those checks did not hand back a slot this pool actually owns.
+    ///
+    /// [`claim`]: Self::claim
+    #[must_use]
+    pub fn claim(&mut self, buf_id: u16, len: u32) -> Option<CompletedBuffer<'_>> {
+        if u32::from(buf_id) >= self.entries || len > self.buf_size {
+            return None;
+        }
+        Some(CompletedBuffer {
+            pool: self,
+            buf_id,
+            len,
+        })
+    }
+
     /// Return a buffer to the pool so the kernel can reuse it.
     ///
     /// Call this after you've consumed the bytes the kernel wrote into
     /// the buffer. The recycle does not issue a syscall — it just
     /// appends to the producer ring and, on [`commit`](Self::commit),
     /// publishes the tail with a Release store.
+    ///
+    /// Prefer [`claim`](Self::claim) over calling this directly: this
+    /// method trusts the caller not to recycle the same `buf_id` twice,
+    /// which [`claim`](Self::claim)'s returned [`CompletedBuffer`] instead
+    /// makes a borrow-checker error.
     ///
     /// # Panics
     ///
@@ -591,6 +631,93 @@ impl ProvidedBufferRing {
         // aliases `bufs[0].resv`.
         const TAIL_OFFSET: usize = 14;
         (self.ring_addr + TAIL_OFFSET) as *const core::sync::atomic::AtomicU16
+    }
+}
+
+/// A completed buffer borrowed from a [`ProvidedBufferRing`] until it is
+/// read, recycling itself on drop.
+///
+/// Produced by [`ProvidedBufferRing::claim`]. Exclusively borrows the pool
+/// for its whole life, so no other claim, recycle, or raw `buffer`/`recycle`
+/// call on the same pool can happen while it is alive — the compiler, not
+/// caller discipline, is what rules out reading a slot that has already
+/// been handed back to the kernel or recycling one twice. Mirrors
+/// [`Arrival`](crate::owned::multishot::Arrival), which solves the same
+/// problem for multishot receive specifically; this is the same guard for
+/// the plain provided-buffer surface any other operation using
+/// [`Sqe::buffer_select`](crate::op::Sqe::buffer_select) draws from.
+pub struct CompletedBuffer<'pool> {
+    pool: &'pool mut ProvidedBufferRing,
+    buf_id: u16,
+    len: u32,
+}
+
+impl core::fmt::Debug for CompletedBuffer<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CompletedBuffer")
+            .field("buffer_id", &self.buf_id)
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CompletedBuffer<'_> {
+    /// The bytes the kernel wrote into this slot.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        self.pool.buffer(self.buf_id, self.len).unwrap_or(&[])
+    }
+
+    /// Mutably borrow this slot's bytes, e.g. to consume them in place
+    /// before the lease drops and recycles the slot.
+    #[must_use]
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        self.pool
+            .buffer_mut(self.buf_id, self.len)
+            .unwrap_or(&mut [])
+    }
+
+    /// The pool slot this lease occupies.
+    #[must_use]
+    pub const fn buffer_id(&self) -> u16 {
+        self.buf_id
+    }
+
+    /// How many bytes the kernel wrote.
+    #[must_use]
+    pub const fn len(&self) -> u32 {
+        self.len
+    }
+
+    /// Whether the kernel wrote no bytes.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Recycle the slot now instead of waiting for `Drop`, and publish the
+    /// tail immediately.
+    ///
+    /// Equivalent to letting the lease drop except for the timing: useful
+    /// when the caller wants the kernel to see the buffer back in the pool
+    /// before doing more work in the same scope, rather than only at scope
+    /// exit.
+    pub fn recycle_and_commit(self) {
+        // `drop` runs the recycle; consuming `self` here (rather than
+        // exposing a `&mut self` recycle-without-consuming method) is what
+        // keeps a second recycle of the same slot unreachable -- there is
+        // no `self` left to call it on afterwards.
+        drop(self);
+    }
+}
+
+impl Drop for CompletedBuffer<'_> {
+    fn drop(&mut self) {
+        // The slot goes back to the kernel exactly once: this is the only
+        // place a `CompletedBuffer` ever calls `recycle_and_commit`, and
+        // exclusive ownership of `pool` for this lease's whole life is what
+        // stops a second lease on the same id existing to recycle it again.
+        self.pool.recycle_and_commit(self.buf_id);
     }
 }
 
@@ -702,6 +829,13 @@ impl BufferConsumer {
     #[must_use]
     pub fn buffer_mut(&mut self, buf_id: u16, len: u32) -> Option<&mut [u8]> {
         self.inner.buffer_mut(buf_id, len)
+    }
+
+    /// Borrow a completed buffer as a self-recycling lease. See
+    /// [`ProvidedBufferRing::claim`].
+    #[must_use]
+    pub fn claim(&mut self, buf_id: u16, len: u32) -> Option<CompletedBuffer<'_>> {
+        self.inner.claim(buf_id, len)
     }
 
     /// Parse a buffer delivered by
