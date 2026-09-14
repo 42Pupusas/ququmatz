@@ -4673,6 +4673,15 @@ fn a_real_iopoll_ring_writes_and_reads_back_through_o_direct() {
         return;
     };
     assert_eq!(cqe.user_data, 2);
+    // The write above already ran the pollable round trip to completion,
+    // but IOPOLL support is not guaranteed uniform across opcodes on every
+    // driver: a read can still come back `-EOPNOTSUPP` even after a write
+    // on the same fd succeeded. Tolerate it here for the same reason as
+    // the write path above.
+    if cqe.result == -libc_eopnotsupp() {
+        drop(file);
+        return;
+    }
     assert_eq!(cqe.result, 4096);
     assert_eq!(&read_buf.as_slice()[..5], b"iouri");
 
