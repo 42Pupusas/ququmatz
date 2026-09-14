@@ -53,26 +53,55 @@ impl IoUring {
     /// borrow prevents concurrent submissions and ensures any referenced
     /// data in the `Sqe` remains valid for the duration.
     ///
+    /// `min_complete` on the first `submit_and_wait` is satisfied by *any*
+    /// CQE already sitting in the ring, not necessarily this call's own —
+    /// a stray leftover completion (or a still-armed multishot arrival)
+    /// can wake the kernel call before this SQE has actually finished.
+    /// Bailing out on that first mismatch, the way a single `push` +
+    /// `submit_and_wait(1)` + `complete()` would, returns while the
+    /// pushed SQE is still in flight against the caller's borrowed
+    /// buffer — exactly the unsoundness this method exists to close, not
+    /// something it can reproduce. So this loops: every mismatched CQE is
+    /// drained and discarded (this crate keeps no stash that could hold
+    /// one for later redelivery), and only the first tag seen wrong is
+    /// kept for the eventual diagnostic, until the tagged completion this
+    /// call minted is actually reaped. Only then is it safe to say the
+    /// borrow has ended.
+    ///
     /// # Errors
     ///
-    /// Returns [`CompletionError::UnexpectedCompletion`] if the CQE reaped
-    /// after submission does not carry this call's own tag — see the
-    /// module documentation for what that means and why the mismatched CQE
-    /// cannot be recovered afterward.
+    /// Returns [`CompletionError::UnexpectedCompletion`] once this call's
+    /// own completion has been reaped, if any other CQE was drained along
+    /// the way — see the module documentation for what that means and why
+    /// the mismatched CQEs cannot be recovered afterward.
     fn run_one(&mut self, sqe: Sqe) -> Result<u32, Error> {
         let tag = self.next_do_tag();
         self.push(sqe.user_data(tag))?;
         self.submit_and_wait(1)?;
-        let completion = self
-            .complete()
-            .ok_or(Error::Completion(CompletionError::NoCompletion))?;
-        if completion.user_data != tag {
-            return Err(Error::Completion(CompletionError::UnexpectedCompletion {
-                expected: tag,
-                found: completion.user_data,
-            }));
+
+        let mut stray = None;
+        loop {
+            let completion = self
+                .complete()
+                .ok_or(Error::Completion(CompletionError::NoCompletion))?;
+            if completion.user_data == tag {
+                return stray.map_or_else(
+                    || completion.into_result(),
+                    |found| {
+                        Err(Error::Completion(CompletionError::UnexpectedCompletion {
+                            expected: tag,
+                            found,
+                        }))
+                    },
+                );
+            }
+            stray.get_or_insert(completion.user_data);
+            // No new SQE to push here -- this call already pushed the one
+            // it is waiting on. `submit_and_wait` with nothing queued is
+            // a pure wait: `to_submit` computes to 0 and the syscall just
+            // blocks for `min_complete` more completions.
+            self.submit_and_wait(1)?;
         }
-        completion.into_result()
     }
 
     /// Read from `fd` into `buf` at `offset`. Returns the byte count.

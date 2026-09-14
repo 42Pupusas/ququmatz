@@ -1009,26 +1009,42 @@ from a real CQE at all, the same trust boundary `claim` always had.
 
 ### Q-03 — `run_one` does not wait for its own operation on all paths
 
-**Status: fixed (identity correlation).** `IoUring` now carries a private
-per-ring `do_tag_next: u64` counter (`src/ring/mod.rs`). `run_one` in
-`src/ring/ops.rs` mints a fresh tag from it, stamps it onto the SQE's
-`user_data` before pushing, and after `submit_and_wait(1)` checks the
-reaped CQE's `user_data` against that exact tag before trusting its
-result. A mismatch returns
-`Error::Completion(CompletionError::UnexpectedCompletion { expected,
-found })` instead of returning the foreign CQE's result as if it were
-this call's own -- closing the failure scenario this entry described
-(a stale NOP completion, or a still-armed multishot arrival, being
-mistaken for a `do_recv`'s own result).
+**Status: fixed (identity correlation, then closed for real: drain-and-retry).**
+`IoUring` carries a private per-ring `do_tag_next: u64` counter
+(`src/ring/mod.rs`). `run_one` in `src/ring/ops.rs` mints a fresh tag
+from it, stamps it onto the SQE's `user_data` before pushing, and
+checks the reaped CQE's `user_data` against that exact tag before
+trusting its result. A mismatch is never returned as this call's own
+result.
 
-The mismatched CQE itself is consumed and cannot be recovered: this
-crate keeps no stash that could hold a foreign CQE for later
-redelivery to whatever actually submitted it, so `UnexpectedCompletion`
-is documented as meaning "resubmit whatever produced `found`," not as
-a retry signal for the current call. `run_one`'s own `?` after
-`submit_and_wait` continues to propagate a syscall failure immediately,
-as before -- that half of the original finding was never in question,
-only the identity gap was.
+The first cut of this fix (tag-check-and-bail on the very next CQE)
+turned out to still expose the gap it was meant to close, caught by
+CI flaking on `a_stray_leftover_completion_is_not_mistaken_for_do_reads_own_result`:
+`submit_and_wait(1)`'s `min_complete` is satisfied by *any* CQE
+already in the ring, not necessarily this call's own. Bailing out on
+the first mismatch could return `Err(UnexpectedCompletion)` while the
+SQE this call just pushed was still in flight against the caller's
+borrowed buffer -- exactly the "premature release of a borrow while
+kernel work is still active" failure scenario this entry names, not
+something the tag check alone prevented. Under CI's virtualized/
+shared kernel timing this surfaced as `do_close` right afterward
+reaping the read's own late-arriving completion instead of its own,
+because the read's real CQE was still outstanding when the caller
+moved on.
+
+`run_one` now loops: every CQE that does not carry this call's tag is
+drained and discarded (this crate keeps no stash that could hold a
+foreign CQE for later redelivery to whatever actually submitted it),
+and only the first stray tag seen is kept for the eventual
+diagnostic, until the tagged completion this call minted is actually
+reaped via repeated `submit_and_wait(1)` calls (each with nothing new
+queued, so they are pure waits). Only once this call's own operation
+has genuinely completed does it return -- as
+`Err(Error::Completion(CompletionError::UnexpectedCompletion {
+expected, found }))` if any stray was drained along the way, or the
+real result otherwise. `run_one`'s own `?` after each
+`submit_and_wait` continues to propagate a syscall failure
+immediately.
 
 **Status (original): confirmed.**
 
