@@ -3052,6 +3052,14 @@ fn a_real_pbuf_status_reports_the_head_the_kernel_advances() {
 /// Exercises the split-concurrency path: `Submitter::register_provided_buffers`,
 /// `ProvidedBufferRing::split`, and `BufferConsumer` (read + recycle) on a
 /// thread distinct from the one that submits.
+/// Tells `provided_buffer_ring_recv_split_threads`'s submit thread whether
+/// its outstanding recv landed or must be resubmitted.
+#[cfg(not(miri))]
+enum RecvAck {
+    Delivered,
+    Retry,
+}
+
 #[cfg(not(miri))]
 #[test]
 fn provided_buffer_ring_recv_split_threads() {
@@ -3084,13 +3092,26 @@ fn provided_buffer_ring_recv_split_threads() {
     let mut consumer = pool.split(); // Send → moves to the completion thread
 
     // --- Completion thread: read each recv'd buffer, verify, recycle ---------
+    //
+    // A single-shot recv can spuriously complete with -ECANCELED under CI's
+    // resource contention -- the request is aborted before it ever touches
+    // the socket, not because the data isn't there. That's retryable, not a
+    // real failure: the driver's write already landed in the socket buffer,
+    // so resubmitting the identical recv against the same fd picks it right
+    // back up. RecvAck::Retry tells the submit thread to do exactly that
+    // instead of waiting for the next driver-write signal.
     let (got_tx, got_rx) = mpsc::channel::<(usize, std::vec::Vec<u8>)>();
+    let (ack_tx, ack_rx) = mpsc::channel::<RecvAck>();
     let complete = thread::spawn(move || {
         let mut received = 0usize;
         while received < MESSAGES {
             completer.wait(1).expect("wait");
             for cqe in completer.completions() {
                 if cqe.user_data != RECV_UD {
+                    continue;
+                }
+                if cqe.result == -libc_ecanceled() {
+                    ack_tx.send(RecvAck::Retry).expect("submit thread alive");
                     continue;
                 }
                 assert!(!cqe.is_err(), "recv failed: errno {}", -cqe.result);
@@ -3103,6 +3124,9 @@ fn provided_buffer_ring_recv_split_threads() {
                     .expect("main alive");
                 consumer.recycle_and_commit(buf_id);
                 received += 1;
+                ack_tx
+                    .send(RecvAck::Delivered)
+                    .expect("submit thread alive");
             }
         }
         completer
@@ -3114,9 +3138,7 @@ fn provided_buffer_ring_recv_split_threads() {
     // previous completion has recycled, so the 4-buffer pool serves all 8.
     let (send_next_tx, send_next_rx) = mpsc::channel::<()>();
     let submit = thread::spawn(move || {
-        for _ in 0..MESSAGES {
-            // Wait until the driver has written a message to recv.
-            send_next_rx.recv().expect("driver alive");
+        let push_and_submit = |submitter: &mut Submitter| {
             let recv_sqe = unsafe {
                 Sqe::recv_ptr(
                     RawFd::from_raw(server_fd as usize),
@@ -3129,6 +3151,18 @@ fn provided_buffer_ring_recv_split_threads() {
             .user_data(RECV_UD);
             submitter.push(recv_sqe).expect("push recv");
             submitter.submit().expect("submit recv");
+        };
+
+        for _ in 0..MESSAGES {
+            // Wait until the driver has written a message to recv.
+            send_next_rx.recv().expect("driver alive");
+            loop {
+                push_and_submit(&mut submitter);
+                match ack_rx.recv().expect("complete thread alive") {
+                    RecvAck::Delivered => break,
+                    RecvAck::Retry => {}
+                }
+            }
         }
         submitter
     });
@@ -4691,6 +4725,11 @@ fn a_real_iopoll_ring_writes_and_reads_back_through_o_direct() {
 #[cfg(not(miri))]
 const fn libc_eopnotsupp() -> i32 {
     95
+}
+
+#[cfg(not(miri))]
+const fn libc_ecanceled() -> i32 {
+    125
 }
 
 /// Reap one completion from an IOPOLL ring, retrying the wait a bounded
